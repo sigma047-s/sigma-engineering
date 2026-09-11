@@ -488,7 +488,7 @@ Write-Host " $($installed.Count) entries." -ForegroundColor Green
 # 4. System inventory
 # -----------------------------------------------------------------------------
 Write-Stage "Capturing system inventory..."
-$sys = (function {
+$sys = & {
     $os   = Get-CimInstance Win32_OperatingSystem
     $cs   = Get-CimInstance Win32_ComputerSystem
     $cpu  = Get-CimInstance Win32_Processor | Select-Object -First 1
@@ -553,7 +553,7 @@ $sys = (function {
         PageFile     = $pf
         IsAdmin      = (Test-IsAdmin)
     }
-}) 
+}
 Write-Ok
 
 # -----------------------------------------------------------------------------
