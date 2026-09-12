@@ -599,6 +599,14 @@ $Script:RawCatalog = @(
     @{N='Capella';              D=@('Systems');                          P=@('Capella*');                                           K='MBSE';       RAM=8;  Disk=15;  Lic='None'}
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
+
+# -----------------------------------------------------------------------------
+# FIX: Convert every catalog hashtable into a PSCustomObject so that
+#      Sort-Object N, Where-Object N, -Unique, and -Property all work
+#      reliably. Without this, the installer collapses every discipline
+#      bucket to a single product.
+# -----------------------------------------------------------------------------
+$Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
 $Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
 
@@ -1722,7 +1730,7 @@ if ($Install) {
 # =============================================================================
 function Get-ProductStatus {
     param(
-        [hashtable]$Entry,
+        [object]$Entry,
         [array]$Installed,
         [pscustomobject]$System,
         [string]$NetFx,
