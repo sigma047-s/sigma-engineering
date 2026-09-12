@@ -6,8 +6,8 @@
     Read-only diagnostic pass over every engineering discipline.
     Detects installed software, checks prerequisites, writes a report.
     Includes health scoring, structured findings, preflight, project guardian,
-    Windows/Network health, License Center, live GPU sampling, and a software
-    installer that leverages winget/choco with manual download fallbacks.
+    Windows/Network health, License Center, live GPU sampling, and a winget-based
+    software installer with manual download fallbacks.
 .PARAMETER Disciplines
     Optional filter. If set, only products relevant to these disciplines are
     fully evaluated. Others are marked NotApplicable.
@@ -47,9 +47,9 @@ Write-Host "`n========== SIGMA ENGINEER TOOLKIT ==========" -ForegroundColor Gre
 Write-Host ""
 Write-Host "[INFO] Scans every engineering discipline on this workstation." -ForegroundColor Cyan
 Write-Host "[INFO] Detects installed software, checks prerequisites, writes a report." -ForegroundColor Cyan
+Write-Host "[INFO] The tool can install engineering software." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
-Write-Host "[INFO] Use -Install to install missing engineering software via winget/choco." -ForegroundColor Cyan
 if ($Disciplines.Count -gt 0) {
     Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan
 }
@@ -599,6 +599,7 @@ $Script:RawCatalog = @(
     @{N='Capella';              D=@('Systems');                          P=@('Capella*');                                           K='MBSE';       RAM=8;  Disk=15;  Lic='None'}
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
+$Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
 
 # =============================================================================
@@ -1212,59 +1213,76 @@ if ($WhySlow) {
 }
 
 # =============================================================================
-# 5g. SOFTWARE INSTALLER DISPATCH
+# 5g. SOFTWARE INSTALLER
 # =============================================================================
-if ($Install) {
-    Invoke-Installer -Disciplines $Disciplines -InstallList $InstallList
-    exit 0
+
+# --- winget-only mapping for products that support silent auto-install ---
+$Script:WingetMap = @{
+    # --- developer / general tools present in the catalog ---
+    'Python'             = 'Python.Python.3.12'
+    'Anaconda'           = 'Anaconda.Anaconda3'
+    'Git'                = 'Git.Git'
+    'Visual Studio Code' = 'Microsoft.VisualStudioCode'
+    'Visual Studio'      = 'Microsoft.VisualStudio.2022.Community'
+    'Docker Desktop'     = 'Docker.DockerDesktop'
+    'Wireshark'          = 'WiresharkFoundation.Wireshark'
+
+    # --- engineering / free tools ---
+    'KiCad'              = 'KiCad.KiCad'
+    'QGIS'               = 'QGIS.QGIS'
+    'CloudCompare'       = 'CloudCompare.CloudCompare'
+    'Arduino IDE'        = 'ArduinoSA.IDE.stable'
+    'R'                  = 'RProject.R'
+    'LTspice'            = 'AnalogDevices.LTspice'
+    'ImageJ'             = 'ImageJ.ImageJ'
+    'DWSIM'              = 'DWSIM.DWSIM'
+    '3D Slicer'          = 'Slicer.Slicer'
+    'PlatformIO'         = 'PlatformIO.PlatformIO'
+
+    # --- useful adjacent tools sometimes searched by engineers ---
+    'FreeCAD'            = 'FreeCAD.FreeCAD'
+    'OpenSCAD'           = 'OpenSCAD.OpenSCAD'
+    'Blender'            = 'BlenderFoundation.Blender'
+    'ParaView'           = 'Kitware.ParaView'
+    'GNU Octave'         = 'GNU.Octave'
+    'CMake'              = 'Kitware.CMake'
+    'Notepad++'          = 'Notepad++.Notepad++'
+    'GIMP'               = 'GIMP.GIMP'
+    'Inkscape'           = 'Inkscape.Inkscape'
+    '7-Zip'              = '7zip.7zip'
 }
 
-# =============================================================================
-# 5h. SOFTWARE INSTALLER (definitions)
-# =============================================================================
-function Test-WingetAvailable { [bool](Get-Command winget -ErrorAction SilentlyContinue) }
-function Test-ChocoAvailable  { [bool](Get-Command choco  -ErrorAction SilentlyContinue) }
-
-# Catalog name -> package manager IDs (extend freely)
-$Script:InstallMap = @{
-    'Python'             = @{ W='Python.Python.3.12';                C='python' }
-    'Anaconda'           = @{ W='Anaconda.Anaconda3';                C='anaconda3' }
-    'Git'                = @{ W='Git.Git';                           C='git' }
-    'Visual Studio Code' = @{ W='Microsoft.VisualStudioCode';        C='vscode' }
-    'Visual Studio'      = @{ W='Microsoft.VisualStudio.2022.Community'; C='visualstudio2022community' }
-    'Docker Desktop'     = @{ W='Docker.DockerDesktop';              C='docker-desktop' }
-    'Wireshark'          = @{ W='WiresharkFoundation.Wireshark';     C='wireshark' }
-    'KiCad'              = @{ W='KiCad.KiCad';                       C='kicad' }
-    'QGIS'               = @{ W='QGIS.QGIS';                         C='qgis' }
-    'CloudCompare'       = @{ W='CloudCompare.CloudCompare';         C='cloudcompare' }
-    'Arduino IDE'        = @{ W='ArduinoSA.IDE.stable';              C='arduino' }
-    'R'                  = @{ W='RProject.R';                        C='r.project' }
-    'LTspice'            = @{ W='AnalogDevices.LTspice';             C='ltspice' }
-    'ImageJ'             = @{ W='ImageJ.ImageJ';                     C='imagej' }
-    'DWSIM'              = @{ W='DWSIM.DWSIM';                       C='dwsim' }
-    'EPANET'             = @{ W='';                                  C='epanet' }
-    'GNU Radio'          = @{ W='';                                  C='gnuradio' }
-    'FreeCAD'            = @{ W='FreeCAD.FreeCAD';                   C='freecad' }
-    'OpenSCAD'           = @{ W='OpenSCAD.OpenSCAD';                 C='openscad' }
-}
-
-# Manual download fallbacks for products with no package manager entry
+# --- Manual download fallbacks for products winget can't install ---
 $Script:ManualUrls = @{
     'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
     'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
     'Civil 3D'            = 'https://www.autodesk.com/products/civil-3d/free-trial'
     'Autodesk Inventor'   = 'https://www.autodesk.com/products/inventor/free-trial'
     'Fusion 360'          = 'https://www.autodesk.com/products/fusion-360/free-trial'
+    'Navisworks'          = 'https://www.autodesk.com/products/navisworks/free-trial'
+    'Advance Steel'       = 'https://www.autodesk.com/products/advance-steel/free-trial'
+    'AutoCAD Electrical'  = 'https://www.autodesk.com/products/autocad-electrical/free-trial'
+    'AutoCAD MEP'         = 'https://www.autodesk.com/products/autocad-mep/free-trial'
+    'Revit MEP'           = 'https://www.autodesk.com/products/revit/free-trial'
+    'Robot Structural'    = 'https://www.autodesk.com/products/robot-structural-analysis/free-trial'
+    'Dynamo'              = 'https://dynamobim.org/download/'
     'SOLIDWORKS'          = 'https://www.solidworks.com/sw/support/downloads.htm'
+    'SOLIDWORKS Electrical' = 'https://www.solidworks.com/sw/support/downloads.htm'
     'CATIA'               = 'https://www.3ds.com/products/catia'
     'Siemens NX'          = 'https://plm.sw.siemens.com/en-US/nx/'
+    'PTC Creo'            = 'https://www.ptc.com/en/products/creo'
+    'Solid Edge'          = 'https://solidedge.siemens.com/'
     'ANSYS'               = 'https://www.ansys.com/products'
+    'ANSYS HFSS'          = 'https://www.ansys.com/products/electronics/ansys-hfss'
+    'ANSYS Fluent'        = 'https://www.ansys.com/products/fluids/ansys-fluent'
+    'ANSYS AQWA'          = 'https://www.ansys.com/products/structures/ansys-aqwa'
     'Abaqus'              = 'https://www.3ds.com/products/simulia/abaqus'
     'COMSOL Multiphysics' = 'https://www.comsol.com/'
     'MATLAB'              = 'https://www.mathworks.com/products/matlab.html'
     'Simulink'            = 'https://www.mathworks.com/products/simulink.html'
     'Altium Designer'     = 'https://www.altium.com/'
     'ArcGIS Pro'          = 'https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview'
+    'ArcGIS Desktop'      = 'https://www.esri.com/en-us/arcgis/products/arcgis-desktop/overview'
     'ETAP'                = 'https://etap.com/'
     'EPLAN Electric P8'   = 'https://www.eplan-software.com/'
     'Siemens TIA Portal'  = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
@@ -1279,90 +1297,234 @@ $Script:ManualUrls = @{
     'PLAXIS 2D'           = 'https://www.bentley.com/software/plaxis-2d/'
     'PLAXIS 3D'           = 'https://www.bentley.com/software/plaxis-3d/'
     'HEC-RAS'             = 'https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
+    'HEC-HMS'             = 'https://www.hec.usace.army.mil/software/hec-hms/downloads.aspx'
     'EnergyPlus'          = 'https://energyplus.net/downloads'
+    'OpenStudio'          = 'https://openstudio.net/downloads'
     'OpenFOAM'            = 'https://openfoam.org/download/'
     'Xilinx Vivado'       = 'https://www.xilinx.com/support/download.html'
     'Intel Quartus Prime' = 'https://www.intel.com/content/www/us/en/software-kit/'
     'DIgSILENT PowerFactory' = 'https://www.digsilent.de/en/downloads.html'
+    'GNU Radio'           = 'https://wiki.gnuradio.org/index.php/InstallingGR'
+    'EPANET'              = 'https://www.epa.gov/water-research/epanet'
+    'EPA SWMM'            = 'https://www.epa.gov/water-research/storm-water-management-model-swmm'
+    'FDS'                 = 'https://pages.nist.gov/fds-smv/downloads.html'
+    'CONTAM'              = 'https://www.nist.gov/services-resources/software/contam'
+    'Siemens Teamcenter'  = 'https://plm.sw.siemens.com/en-US/teamcenter/'
+    'Primavera P6'        = 'https://www.oracle.com/industries/construction-engineering/primavera-p6/'
+    'NI LabVIEW'          = 'https://www.ni.com/en-us/support/downloads/software-products/download.labview.html'
+    'NI Multisim'         = 'https://www.ni.com/en-us/support/downloads/software-products/download.multisim.html'
+    'Keysight ADS'        = 'https://www.keysight.com/us/en/products/software/pathwave-design-software/pathwave-advanced-design-system.html'
+    'CST Studio Suite'    = 'https://www.3ds.com/products/simulia/cst-studio-suite'
+    'Wolfram Mathematica' = 'https://www.wolfram.com/mathematica/'
+    'Maple'               = 'https://www.maplesoft.com/products/Maple/'
+    'Mathcad Prime'       = 'https://www.ptc.com/en/products/mathcad'
+    'OriginPro'           = 'https://www.originlab.com/'
+    'BricsCAD'            = 'https://www.bricsys.com/en-intl/bricscad/'
+    'Archicad'            = 'https://www.graphisoft.com/archicad/'
+    'Bluebeam Revu'       = 'https://www.bluebeam.com/'
+    'Deswik'              = 'https://www.deswik.com/'
+    'Leapfrog Geo'        = 'https://www.seequent.com/products-solutions/leapfrog-geo/'
+    'GeoStudio'           = 'https://www.geoslope.com/'
+    'Global Mapper'       = 'https://www.bluemarblegeo.com/global-mapper/'
+    'Agisoft Metashape'   = 'https://www.agisoft.com/downloads/installer/'
+    'Pix4Dmapper'         = 'https://www.pix4d.com/product/pix4dmapper-photogrammetry-software'
+    'Maxsurf'             = 'https://www.bentley.com/software/maxsurf/'
+    'MSC Nastran'         = 'https://www.mscsoftware.com/product/msc-nastran'
+    'LS-DYNA'             = 'https://www.ansys.com/products/structures/ansys-ls-dyna'
+    'Altair HyperWorks'   = 'https://altair.com/hyperworks'
+    'Altair HyperMesh'    = 'https://altair.com/hypermesh'
+    'HyperMesh'           = 'https://altair.com/hypermesh'
+    'Simcenter STAR-CCM+' = 'https://plm.sw.siemens.com/en-US/simcenter/fluids-thermal-simulation/star-ccm/'
+    'MSC Adams'           = 'https://www.mscsoftware.com/product/adams'
+    'Materials Studio'    = 'https://www.3ds.com/products/biovia/materials-studio'
+    'Thermo-Calc'         = 'https://thermocalc.com/'
+    'JMatPro'             = 'https://www.sentesoftware.co.uk/jmatpro'
+    'CODESYS'             = 'https://www.codesys.com/download.html'
+    'Ignition'            = 'https://inductiveautomation.com/downloads/'
+    'Factory I/O'         = 'https://factoryio.com/downloads/'
+    'MPLAB X'             = 'https://www.microchip.com/en-us/development-tools-tools-and-software/mplab-x-ide'
+    'STM32CubeIDE'        = 'https://www.st.com/en/development-tools/stm32cubeide.html'
+    'IAR Embedded Workbench' = 'https://www.iar.com/products/architectures/arm/iar-embedded-workbench-for-arm/'
+    'RISA-3D'             = 'https://risa.com/products/risa-3d'
+    'IDEA StatiCa'        = 'https://www.ideastatica.com/'
+    'RFEM'                = 'https://www.dlubal.com/en'
+    'Maptek Vulcan'       = 'https://www.maptek.com/products/vulcan/'
+    'Datamine Studio'     = 'https://www.dataminesoftware.com/'
+    'Micromine'           = 'https://www.micromine.com/'
+    'Deswik'              = 'https://www.deswik.com/'
+    'Slide2'              = 'https://www.rocscience.com/software/slide2'
+    'Rocscience RS2'      = 'https://www.rocscience.com/software/rs2'
+    'Rocscience RS3'      = 'https://www.rocscience.com/software/rs3'
+    'FLAC3D'              = 'https://www.itascacg.com/software/flac3d'
+    'GEO5'                = 'https://www.finesoftware.eu/geotechnical-software/'
+    'gINT'                = 'https://www.bentley.com/software/gint/'
+    'SAP2000'             = 'https://www.csiamerica.com/products/sap2000'
+    'ETABS'               = 'https://www.csiamerica.com/products/etabs'
+    'SAFE'                = 'https://www.csiamerica.com/products/safe'
+    'CSiBridge'           = 'https://www.csiamerica.com/products/csibridge'
+    'MIDAS Civil'         = 'https://www.midasuser.com/'
+    'MIDAS Gen'           = 'https://www.midasuser.com/'
+    'SCIA Engineer'       = 'https://www.scia.net/en'
+    'Robot Structural'    = 'https://www.autodesk.com/products/robot-structural-analysis/free-trial'
+    'Tekla Tedds'         = 'https://www.tekla.com/products/tekla-tedds'
+    'Autodesk ReCap'      = 'https://www.autodesk.com/products/recap/free-trial'
+    'Carlson Survey'      = 'https://www.carlsonsw.com/'
+    'Trimble Business Center' = 'https://geospatial.trimble.com/products-and-solutions/trimble-business-center'
+    'Leica Infinity'      = 'https://leica-geosystems.com/products/software/leica-infinity'
+    'Leica Cyclone'       = 'https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
+    'ENVI'                = 'https://www.nv5geospatialsoftware.com/Products/ENVI'
+    'ERDAS Imagine'       = 'https://www.hexagongeospatial.com/products/power-portfolio/erdas-imagine'
+    'SewerGEMS'           = 'https://www.bentley.com/software/sewergems/'
+    'WaterGEMS'           = 'https://www.bentley.com/software/watergems/'
+    'InfoWorks ICM'       = 'https://www.autodesk.com/products/infoworks-icm'
+    'MIKE+'               = 'https://www.dhigroup.com/technologies/mikepoweredbydhi'
+    'MODFLOW'             = 'https://www.usgs.gov/software/modflow-6-usgs-modular-hydrologic-model'
+    'AERMOD'              = 'https://www.epa.gov/scram/air-quality-dispersion-modeling-preferred-and-recommended-models#aermod'
+    'CALPUFF'             = 'https://www.epa.gov/scram/air-quality-dispersion-modeling-preferred-and-recommended-models#calpuff'
+    'AVEVA Marine'        = 'https://www.aveva.com/en/products/'
+    'ShipConstructor'     = 'https://www.ssi-corporate.com/'
+    'NAPA'                = 'https://www.napa.fi/'
+    'MOSES'               = 'https://www.bentley.com/software/moses/'
+    'Bentley OpenRail'    = 'https://www.bentley.com/software/openrail-designer/'
+    'RailSys'             = 'https://www.rmcon.de/en/'
+    'AutoSPRINK'          = 'https://www.autosprink.com/'
+    'HydraCALC'           = 'https://www.hydratec.com/'
+    'PyroSim'             = 'https://www.thunderheadeng.com/pyrosim/'
+    'Pathfinder'          = 'https://www.thunderheadeng.com/pathfinder/'
+    'Carrier HAP'         = 'https://www.carrier.com/commercial/en/us/software/hvac-system-design/'
+    'TRACE 3D Plus'       = 'https://www.trane.com/commercial/north-america/us/en/products-systems/design-and-analysis-tools/trace-3d-plus.html'
+    'IES VE'              = 'https://www.iesve.com/'
+    'DesignBuilder'       = 'https://designbuilder.co.uk/'
+    'DIALux evo'          = 'https://www.dialux.com/en-GB/download'
+    'AGi32'               = 'https://lightinganalysts.com/software-products/agi32/'
+    'MCNP'                = 'https://mcnp.lanl.gov/'
+    'SCALE'               = 'https://www.ornl.gov/scale'
+    'RELAP5'              = 'https://www.nrc.gov/about-nrc/regulatory/research/safetycodes.html'
+    'OpenMC'              = 'https://docs.openmc.org/'
+    'Mimics Innovation Suite' = 'https://www.materialise.com/en/medical/mimics-innovation-suite'
+    'Simpleware'          = 'https://www.synopsys.com/simpleware.html'
+    'FactSage'            = 'https://www.factsage.com/'
+    'PVsyst'              = 'https://www.pvsyst.com/'
+    'HOMER Pro'           = 'https://www.homerenergy.com/products/pro/'
+    'SAM'                 = 'https://sam.nrel.gov/download'
+    'RETScreen Expert'    = 'https://www.nrcan.gc.ca/maps-tools-and-publications/tools/modelling-tools/retscreen/7465'
+    'WindPRO'             = 'https://www.emdt.co.uk/product/windpro'
+    'WAsP'                = 'https://www.wasp.dk/'
+    'Microsoft Project'   = 'https://www.microsoft.com/en-us/microsoft-365/project/project-management-software'
+    'Procore'             = 'https://www.procore.com/'
+    'Autodesk Construction Cloud' = 'https://construction.autodesk.com/'
+    'Oracle Aconex'       = 'https://www.oracle.com/construction-engineering/aconex/'
+    'CostX'               = 'https://www.exactal.com/'
+    'PlanSwift'           = 'https://www.planswift.com/'
+    'SolidCAM'            = 'https://www.solidcam.com/'
+    'PowerMill'           = 'https://www.autodesk.com/products/powermill/overview'
+    'VERICUT'             = 'https://www.cgtech.com/'
+    'ESPRIT'              = 'https://www.espritcam.com/'
+    'PC-DMIS'             = 'https://www.hexagonmi.com/products/software/pc-dmis'
+    'PolyWorks'           = 'https://www.innovmetric.com/'
+    'IBM Engineering DOORS' = 'https://www.ibm.com/products/requirements-management-doors'
+    'Cameo Systems Modeler' = 'https://www.3ds.com/products/catia/no-magic/cameo-systems-modeler'
+    'Capella'             = 'https://www.eclipse.org/capella/'
+    'Enterprise Architect'= 'https://sparxsystems.com/products/ea/'
+    'Siemens Xpedition'   = 'https://eda.sw.siemens.com/en-US/pcb/xpedition/'
+    'PADS Professional'   = 'https://eda.sw.siemens.com/en-US/pcb/pads/'
+    'Cadence Allegro'     = 'https://www.cadence.com/en_US/home/tools/pcb-design-and-analysis/allegro.html'
+    'OrCAD'               = 'https://www.orcad.com/'
+    'PSpice'              = 'https://www.orcad.com/products/orcad-pspice-designer/overview'
+    'Proteus'             = 'https://www.labcenter.com/'
+    'EasyEDA'             = 'https://easyeda.com/'
+    'DipTrace'            = 'https://diptrace.com/'
+    'DesignSpark PCB'     = 'https://www.rs-online.com/designspark/pcb-software'
+    'SKM PowerTools'      = 'https://www.skm.com/'
+    'EasyPower'           = 'https://www.easypower.com/'
+    'PSS/E'               = 'https://www.siemens.com/global/en/products/energy/services/transmission-distribution-smart-grid/consulting-and-planning/pss-software/pss-e.html'
+    'PSCAD'               = 'https://www.pscad.com/'
+    'STEP 7'              = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
+    'WinCC'               = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
+    'Rockwell Studio 5000' = 'https://www.rockwellautomation.com/en-us/products/software/factorytalk/designsuite/studio-5000.html'
+    'FactoryTalk View'    = 'https://www.rockwellautomation.com/en-us/products/software/factorytalk/operationsuite/view.html'
+    'Beckhoff TwinCAT 3'  = 'https://www.beckhoff.com/en-en/products/automation/twincat/'
+    'Schneider EcoStruxure' = 'https://www.se.com/ww/en/product-range/65878856-ecostruxure-control-expert/'
+    'Mitsubishi GX Works' = 'https://www.mitsubishielectric.com/fa/products/cnt/plceng/smerit/gx_works3/index.html'
+    'Omron Sysmac Studio' = 'https://automation.omron.com/en/us/products/family/sysmac-studio'
+    'AVEVA System Platform' = 'https://www.aveva.com/en/products/system-platform/'
+    'ModelSim'            = 'https://www.intel.com/content/www/us/en/software/programmable/quartus-prime/model-sim.html'
+    'Keil uVision'        = 'https://www.keil.com/demo/eval/arm.htm'
+    'Dynamo'              = 'https://dynamobim.org/download/'
+    'Aqua'                = ''
 }
 
-function Get-InstallMethod {
-    param([string]$Name, [bool]$HasWinget, [bool]$HasChoco)
-    $map = $Script:InstallMap[$Name]
-    if (-not $map) { return $null }
-    if ($HasWinget -and $map.W) { return @{ Mgr='winget'; Id=$map.W } }
-    if ($HasChoco  -and $map.C) { return @{ Mgr='choco';  Id=$map.C } }
-    return $null
+function Test-WingetAvailable { [bool](Get-Command winget -ErrorAction SilentlyContinue) }
+
+function Get-InstallTag {
+    param([string]$Name)
+    if ($Script:WingetMap.ContainsKey($Name))  { return 'winget' }
+    if ($Script:ManualUrls.ContainsKey($Name)) { return 'manual' }
+    return 'skip'
 }
 
 function Install-OneProduct {
     param(
         [string]$Name,
         [bool]$HasWinget,
-        [bool]$HasChoco,
         [switch]$NonInteractive
     )
 
-    $method = Get-InstallMethod -Name $Name -HasWinget $HasWinget -HasChoco $HasChoco
+    $tag = Get-InstallTag -Name $Name
 
-    if (-not $method) {
+    if ($tag -eq 'winget' -and $HasWinget) {
+        $id = $Script:WingetMap[$Name]
+        Write-Host "  [INSTALL] $Name  via  winget  ($id)" -ForegroundColor Cyan
+        try {
+            & winget install --id $id --exact `
+                --accept-package-agreements --accept-source-agreements `
+                --silent --disable-interactivity
+            $code = $LASTEXITCODE
+            if ($null -eq $code -or $code -eq 0) {
+                Write-Host "  [ OK ]  $Name installed." -ForegroundColor Green
+                return 'installed'
+            } else {
+                Write-Host "  [FAIL]  $Name - winget exit code $code" -ForegroundColor Red
+                Add-Diagnostic 'Install' "$Name winget failed with exit code $code"
+                return 'failed'
+            }
+        } catch {
+            Write-Host "  [FAIL]  $Name - $_" -ForegroundColor Red
+            Add-Diagnostic 'Install' "$Name threw: $_"
+            return 'failed'
+        }
+    }
+
+    if ($tag -eq 'winget' -and -not $HasWinget) {
+        Write-Host "  [SKIP]  $Name - winget not available on this machine." -ForegroundColor Yellow
+        return 'skipped'
+    }
+
+    if ($tag -eq 'manual') {
         $url = $Script:ManualUrls[$Name]
-        Write-Host "  [MANUAL] $Name — no package manager entry." -ForegroundColor Yellow
-        if ($url) {
-            Write-Host "           Download: $url" -ForegroundColor DarkGray
-            if (-not $NonInteractive) {
-                $open = Read-Host "  Open the download page now? (Y/N)"
-                if ($open -match '^[Yy]') {
-                    try { Start-Process $url } catch {
-                        Write-Host "  [FAIL] Could not open browser: $_" -ForegroundColor Red
-                    }
+        Write-Host "  [MANUAL] $Name - no winget entry, opening vendor page." -ForegroundColor Yellow
+        Write-Host "           $url" -ForegroundColor DarkGray
+        if (-not $NonInteractive) {
+            $open = Read-Host "  Open the download page now? (Y/N)"
+            if ($open -match '^[Yy]') {
+                try { Start-Process $url } catch {
+                    Write-Host "  [FAIL] Could not open browser: $_" -ForegroundColor Red
                 }
             }
-        } else {
-            Write-Host "           No known download URL — search the vendor site." -ForegroundColor DarkGray
         }
         return 'manual'
     }
 
-    Write-Host "  [INSTALL] $Name  via  $($method.Mgr)  ($($method.Id))" -ForegroundColor Cyan
-
-    try {
-        if ($method.Mgr -eq 'winget') {
-            $wargs = @(
-                'install','--id',$method.Id,'--exact',
-                '--accept-package-agreements','--accept-source-agreements',
-                '--silent','--disable-interactivity'
-            )
-            & winget @wargs
-        } else {
-            & choco install $method.Id -y --no-progress
-        }
-
-        $code = $LASTEXITCODE
-        if ($null -eq $code -or $code -eq 0) {
-            Write-Host "  [ OK ]  $Name installed." -ForegroundColor Green
-            return 'installed'
-        } else {
-            Write-Host "  [FAIL]  $Name — exit code $code" -ForegroundColor Red
-            Add-Diagnostic 'Install' "$Name failed via $($method.Mgr) with exit code $code"
-            return 'failed'
-        }
-    } catch {
-        Write-Host "  [FAIL]  $Name — $_" -ForegroundColor Red
-        Add-Diagnostic 'Install' "$Name threw: $_"
-        return 'failed'
-    }
+    Write-Host "  [SKIP]  $Name - not installable automatically (no winget ID, no download URL)." -ForegroundColor DarkGray
+    return 'skipped'
 }
 
 function Show-DisciplineInstaller {
-    param([bool]$HasWinget, [bool]$HasChoco)
+    param([bool]$HasWinget)
 
-    # Build installable discipline index
+    # Index every catalog product by every discipline it belongs to
     $byDisc = @{}
     foreach ($e in $Script:RawCatalog) {
-        $hasAuto   = $Script:InstallMap.ContainsKey($e.N)
-        $hasManual = $Script:ManualUrls.ContainsKey($e.N)
-        if (-not $hasAuto -and -not $hasManual) { continue }
         foreach ($d in $e.D) {
             if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
             $byDisc[$d] += $e
@@ -1371,7 +1533,7 @@ function Show-DisciplineInstaller {
 
     $disc = @($byDisc.Keys | Sort-Object)
     if ($disc.Count -eq 0) {
-        Write-Host "  No installable products mapped." -ForegroundColor Yellow
+        Write-Host "  No disciplines available." -ForegroundColor Yellow
         return
     }
 
@@ -1380,9 +1542,10 @@ function Show-DisciplineInstaller {
     for ($i = 0; $i -lt $disc.Count; $i++) {
         $d = $disc[$i]
         $products = @($byDisc[$d] | Sort-Object N -Unique)
-        $autoCount = @($products | Where-Object { $Script:InstallMap.ContainsKey($_.N) }).Count
-        Write-Host ("    {0,2}. {1,-22}  {2} product(s)  ({3} auto)" -f `
-                    ($i+1), $d, $products.Count, $autoCount)
+        $auto = @($products | Where-Object { (Get-InstallTag -Name $_.N) -eq 'winget' }).Count
+        $man  = @($products | Where-Object { (Get-InstallTag -Name $_.N) -eq 'manual' }).Count
+        Write-Host ("    {0,2}. {1,-22}  {2} product(s)  ({3} winget, {4} manual)" -f `
+                    ($i+1), $d, $products.Count, $auto, $man)
     }
     Write-Host "     0. Cancel"
 
@@ -1398,16 +1561,21 @@ function Show-DisciplineInstaller {
     $products   = @($byDisc[$pickedDisc] | Sort-Object N -Unique)
 
     Write-Host ""
-    Write-Host "  Products in $pickedDisc :" -ForegroundColor Cyan
+    Write-Host "  Products in $pickedDisc  ($($products.Count) total):" -ForegroundColor Cyan
+    Write-Host "    Tags: [winget] = auto-install  [manual] = opens download page  [skip] = not installable" -ForegroundColor DarkGray
+    Write-Host ""
     for ($i = 0; $i -lt $products.Count; $i++) {
-        $p = $products[$i]
-        $map = $Script:InstallMap[$p.N]
-        $tag = if ($map) {
-            if ($HasWinget -and $map.W)     { '[winget]' }
-            elseif ($HasChoco -and $map.C)  { '[choco] ' }
-            else                            { '[pkg?]  ' }
-        } else { '[manual]' }
-        Write-Host ("    {0,2}. {1,-26} {2}" -f ($i+1), $p.N, $tag)
+        $p   = $products[$i]
+        $tag = Get-InstallTag -Name $p.N
+        $tagStr = "[$tag]".PadRight(9)
+        $col = switch ($tag) {
+            'winget' { 'Green' }
+            'manual' { 'Yellow' }
+            default  { 'DarkGray' }
+        }
+        Write-Host ("    {0,2}. " -f ($i+1)) -NoNewline
+        Write-Host $tagStr -ForegroundColor $col -NoNewline
+        Write-Host $p.N
     }
 
     Write-Host ""
@@ -1429,24 +1597,29 @@ function Show-DisciplineInstaller {
 
     Write-Host ""
     Write-Host "  Install plan:" -ForegroundColor Cyan
-    foreach ($i in $indices) { Write-Host ("    - {0}" -f $products[$i-1].N) }
-    $confirm = Read-Host "  Proceed with installation? (Y/N)"
-    if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
-
-    $ok = 0; $fail = 0; $manual = 0
     foreach ($i in $indices) {
         $p = $products[$i-1]
-        $res = Install-OneProduct -Name $p.N -HasWinget $HasWinget -HasChoco $HasChoco
+        $tag = Get-InstallTag -Name $p.N
+        Write-Host ("    - {0,-32} [{1}]" -f $p.N, $tag)
+    }
+    $confirm = Read-Host "  Proceed? (Y/N)"
+    if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
+
+    $ok = 0; $fail = 0; $manual = 0; $skipped = 0
+    foreach ($i in $indices) {
+        $p = $products[$i-1]
+        $res = Install-OneProduct -Name $p.N -HasWinget $HasWinget
         switch ($res) {
             'installed' { $ok++ }
             'failed'    { $fail++ }
             'manual'    { $manual++ }
+            'skipped'   { $skipped++ }
         }
     }
 
     Write-Host ""
-    Write-Host ("  Summary: {0} installed, {1} failed, {2} need manual download." -f $ok, $fail, $manual) `
-        -ForegroundColor Cyan
+    Write-Host ("  Summary: {0} installed, {1} failed, {2} manual download, {3} skipped." -f `
+                $ok, $fail, $manual, $skipped) -ForegroundColor Cyan
 }
 
 function Invoke-Installer {
@@ -1459,28 +1632,25 @@ function Invoke-Installer {
     Write-Host ("=" * 78) -ForegroundColor DarkCyan
     Write-Host "  SIGMA SOFTWARE INSTALLER" -ForegroundColor Cyan
     Write-Host ("=" * 78) -ForegroundColor DarkCyan
+    Write-Host ""
+    Write-Host ("  Catalog products: {0}" -f $Script:CatalogCount) -ForegroundColor DarkGray
 
     $hasWinget = Test-WingetAvailable
-    $hasChoco  = Test-ChocoAvailable
+    Write-Host ("  winget          : {0}" -f $(if ($hasWinget) { 'available' } else { 'not found' })) `
+        -ForegroundColor $(if ($hasWinget) { 'Green' } else { 'Yellow' })
 
-    Write-Host ""
-    Write-Host ("  winget : {0}" -f $(if ($hasWinget) { 'available' } else { 'not found' })) `
-        -ForegroundColor $(if ($hasWinget) { 'Green' } else { 'DarkGray' })
-    Write-Host ("  choco  : {0}" -f $(if ($hasChoco) { 'available' } else { 'not found' })) `
-        -ForegroundColor $(if ($hasChoco) { 'Green' } else { 'DarkGray' })
-
-    if (-not $hasWinget -and -not $hasChoco) {
+    if (-not $hasWinget) {
         Write-Host ""
-        Write-Host "  [WARN] No package manager available." -ForegroundColor Yellow
-        Write-Host "  [INFO] Install App Installer (winget) or Chocolatey to enable automatic installs." -ForegroundColor Yellow
-        Write-Host "  [INFO] Manual download links will still be offered." -ForegroundColor Yellow
+        Write-Host "  [WARN] winget is not available." -ForegroundColor Yellow
+        Write-Host "  [INFO] Install 'App Installer' from the Microsoft Store to enable silent installs." -ForegroundColor Yellow
+        Write-Host "  [INFO] Manual download pages will still be offered." -ForegroundColor Yellow
     }
 
     # ---- Non-interactive batch ----
     if ($InstallList.Count -gt 0) {
         Write-Host ""
         Write-Host "  Batch mode: $($InstallList -join ', ')" -ForegroundColor Cyan
-        $ok = 0; $fail = 0; $manual = 0
+        $ok = 0; $fail = 0; $manual = 0; $skipped = 0
         foreach ($name in $InstallList) {
             $entry = $Script:RawCatalog | Where-Object {
                 $_.N -eq $name -or $_.N -like "*$name*"
@@ -1488,28 +1658,38 @@ function Invoke-Installer {
 
             if (-not $entry) {
                 Write-Host "  [SKIP] Unknown product: $name" -ForegroundColor Yellow
+                $skipped++
                 continue
             }
-            $res = Install-OneProduct -Name $entry.N -HasWinget $hasWinget -HasChoco $hasChoco -NonInteractive
+            $res = Install-OneProduct -Name $entry.N -HasWinget $hasWinget -NonInteractive
             switch ($res) {
                 'installed' { $ok++ }
                 'failed'    { $fail++ }
                 'manual'    { $manual++ }
+                'skipped'   { $skipped++ }
             }
         }
         Write-Host ""
-        Write-Host ("  Batch summary: {0} installed, {1} failed, {2} manual." -f $ok, $fail, $manual) `
-            -ForegroundColor Cyan
+        Write-Host ("  Batch summary: {0} installed, {1} failed, {2} manual, {3} skipped." -f `
+                    $ok, $fail, $manual, $skipped) -ForegroundColor Cyan
         return
     }
 
     # ---- Interactive loop ----
     while ($true) {
-        Show-DisciplineInstaller -HasWinget $hasWinget -HasChoco $hasChoco
+        Show-DisciplineInstaller -HasWinget $hasWinget
         Write-Host ""
         $again = Read-Host "  Install something else? (Y/N)"
         if ($again -notmatch '^[Yy]') { break }
     }
+}
+
+# =============================================================================
+# 5h. SOFTWARE INSTALLER DISPATCH
+# =============================================================================
+if ($Install) {
+    Invoke-Installer -Disciplines $Disciplines -InstallList $InstallList
+    exit 0
 }
 
 # =============================================================================
