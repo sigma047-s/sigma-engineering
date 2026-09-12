@@ -1,12 +1,13 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Sigma Engineer Toolkit — engineering workstation diagnostic.
+    Sigma Engineer Toolkit — engineering workstation diagnostic + software installer.
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
     Detects installed software, checks prerequisites, writes a report.
     Includes health scoring, structured findings, preflight, project guardian,
-    Windows/Network health, License Center, and live GPU sampling.
+    Windows/Network health, License Center, live GPU sampling, and a software
+    installer that leverages winget/choco with manual download fallbacks.
 .PARAMETER Disciplines
     Optional filter. If set, only products relevant to these disciplines are
     fully evaluated. Others are marked NotApplicable.
@@ -23,6 +24,11 @@
     Sample GPU engine utilization via performance counters during the scan.
 .PARAMETER NonInteractive
     Skip confirmation prompts.
+.PARAMETER Install
+    Enter interactive software installer (choose discipline, then products).
+.PARAMETER InstallList
+    Non-interactive batch install by product name(s), e.g.
+    -Install -InstallList "Python","Git","KiCad".
 #>
 [CmdletBinding()]
 param(
@@ -32,7 +38,9 @@ param(
     [switch]$DeepScan,
     [switch]$WhySlow,
     [switch]$LiveGpuSample,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$Install,
+    [string[]]$InstallList = @()
 )
 
 Write-Host "`n========== SIGMA ENGINEER TOOLKIT ==========" -ForegroundColor Green
@@ -41,12 +49,13 @@ Write-Host "[INFO] Scans every engineering discipline on this workstation." -For
 Write-Host "[INFO] Detects installed software, checks prerequisites, writes a report." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
+Write-Host "[INFO] Use -Install to install missing engineering software via winget/choco." -ForegroundColor Cyan
 if ($Disciplines.Count -gt 0) {
     Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan
 }
 Write-Host ""
 
-if (-not $NonInteractive -and -not $Preflight -and -not $WhySlow) {
+if (-not $NonInteractive -and -not $Preflight -and -not $WhySlow -and -not $Install) {
     $confirm = Read-Host "Proceed with the engineering diagnostic scan? (Y/N)"
     if ($confirm -ne "Y" -and $confirm -ne "y") {
         Write-Host "Exiting. No scan performed." -ForegroundColor Cyan
@@ -1203,6 +1212,307 @@ if ($WhySlow) {
 }
 
 # =============================================================================
+# 5g. SOFTWARE INSTALLER DISPATCH
+# =============================================================================
+if ($Install) {
+    Invoke-Installer -Disciplines $Disciplines -InstallList $InstallList
+    exit 0
+}
+
+# =============================================================================
+# 5h. SOFTWARE INSTALLER (definitions)
+# =============================================================================
+function Test-WingetAvailable { [bool](Get-Command winget -ErrorAction SilentlyContinue) }
+function Test-ChocoAvailable  { [bool](Get-Command choco  -ErrorAction SilentlyContinue) }
+
+# Catalog name -> package manager IDs (extend freely)
+$Script:InstallMap = @{
+    'Python'             = @{ W='Python.Python.3.12';                C='python' }
+    'Anaconda'           = @{ W='Anaconda.Anaconda3';                C='anaconda3' }
+    'Git'                = @{ W='Git.Git';                           C='git' }
+    'Visual Studio Code' = @{ W='Microsoft.VisualStudioCode';        C='vscode' }
+    'Visual Studio'      = @{ W='Microsoft.VisualStudio.2022.Community'; C='visualstudio2022community' }
+    'Docker Desktop'     = @{ W='Docker.DockerDesktop';              C='docker-desktop' }
+    'Wireshark'          = @{ W='WiresharkFoundation.Wireshark';     C='wireshark' }
+    'KiCad'              = @{ W='KiCad.KiCad';                       C='kicad' }
+    'QGIS'               = @{ W='QGIS.QGIS';                         C='qgis' }
+    'CloudCompare'       = @{ W='CloudCompare.CloudCompare';         C='cloudcompare' }
+    'Arduino IDE'        = @{ W='ArduinoSA.IDE.stable';              C='arduino' }
+    'R'                  = @{ W='RProject.R';                        C='r.project' }
+    'LTspice'            = @{ W='AnalogDevices.LTspice';             C='ltspice' }
+    'ImageJ'             = @{ W='ImageJ.ImageJ';                     C='imagej' }
+    'DWSIM'              = @{ W='DWSIM.DWSIM';                       C='dwsim' }
+    'EPANET'             = @{ W='';                                  C='epanet' }
+    'GNU Radio'          = @{ W='';                                  C='gnuradio' }
+    'FreeCAD'            = @{ W='FreeCAD.FreeCAD';                   C='freecad' }
+    'OpenSCAD'           = @{ W='OpenSCAD.OpenSCAD';                 C='openscad' }
+}
+
+# Manual download fallbacks for products with no package manager entry
+$Script:ManualUrls = @{
+    'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
+    'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
+    'Civil 3D'            = 'https://www.autodesk.com/products/civil-3d/free-trial'
+    'Autodesk Inventor'   = 'https://www.autodesk.com/products/inventor/free-trial'
+    'Fusion 360'          = 'https://www.autodesk.com/products/fusion-360/free-trial'
+    'SOLIDWORKS'          = 'https://www.solidworks.com/sw/support/downloads.htm'
+    'CATIA'               = 'https://www.3ds.com/products/catia'
+    'Siemens NX'          = 'https://plm.sw.siemens.com/en-US/nx/'
+    'ANSYS'               = 'https://www.ansys.com/products'
+    'Abaqus'              = 'https://www.3ds.com/products/simulia/abaqus'
+    'COMSOL Multiphysics' = 'https://www.comsol.com/'
+    'MATLAB'              = 'https://www.mathworks.com/products/matlab.html'
+    'Simulink'            = 'https://www.mathworks.com/products/simulink.html'
+    'Altium Designer'     = 'https://www.altium.com/'
+    'ArcGIS Pro'          = 'https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview'
+    'ETAP'                = 'https://etap.com/'
+    'EPLAN Electric P8'   = 'https://www.eplan-software.com/'
+    'Siemens TIA Portal'  = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
+    'STAAD.Pro'           = 'https://www.bentley.com/software/staad-pro/'
+    'Tekla Structures'    = 'https://www.tekla.com/products/tekla-structures'
+    'Rhino'               = 'https://www.rhino3d.com/download/'
+    'Grasshopper'         = 'https://www.grasshopper3d.com/'
+    'Mastercam'           = 'https://www.mastercam.com/'
+    'Aspen Plus'          = 'https://www.aspentech.com/en/products/engineering/aspen-plus'
+    'Aspen HYSYS'         = 'https://www.aspentech.com/en/products/engineering/aspen-hysys'
+    'Petrel'              = 'https://www.software.slb.com/products/petrel'
+    'PLAXIS 2D'           = 'https://www.bentley.com/software/plaxis-2d/'
+    'PLAXIS 3D'           = 'https://www.bentley.com/software/plaxis-3d/'
+    'HEC-RAS'             = 'https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
+    'EnergyPlus'          = 'https://energyplus.net/downloads'
+    'OpenFOAM'            = 'https://openfoam.org/download/'
+    'Xilinx Vivado'       = 'https://www.xilinx.com/support/download.html'
+    'Intel Quartus Prime' = 'https://www.intel.com/content/www/us/en/software-kit/'
+    'DIgSILENT PowerFactory' = 'https://www.digsilent.de/en/downloads.html'
+}
+
+function Get-InstallMethod {
+    param([string]$Name, [bool]$HasWinget, [bool]$HasChoco)
+    $map = $Script:InstallMap[$Name]
+    if (-not $map) { return $null }
+    if ($HasWinget -and $map.W) { return @{ Mgr='winget'; Id=$map.W } }
+    if ($HasChoco  -and $map.C) { return @{ Mgr='choco';  Id=$map.C } }
+    return $null
+}
+
+function Install-OneProduct {
+    param(
+        [string]$Name,
+        [bool]$HasWinget,
+        [bool]$HasChoco,
+        [switch]$NonInteractive
+    )
+
+    $method = Get-InstallMethod -Name $Name -HasWinget $HasWinget -HasChoco $HasChoco
+
+    if (-not $method) {
+        $url = $Script:ManualUrls[$Name]
+        Write-Host "  [MANUAL] $Name — no package manager entry." -ForegroundColor Yellow
+        if ($url) {
+            Write-Host "           Download: $url" -ForegroundColor DarkGray
+            if (-not $NonInteractive) {
+                $open = Read-Host "  Open the download page now? (Y/N)"
+                if ($open -match '^[Yy]') {
+                    try { Start-Process $url } catch {
+                        Write-Host "  [FAIL] Could not open browser: $_" -ForegroundColor Red
+                    }
+                }
+            }
+        } else {
+            Write-Host "           No known download URL — search the vendor site." -ForegroundColor DarkGray
+        }
+        return 'manual'
+    }
+
+    Write-Host "  [INSTALL] $Name  via  $($method.Mgr)  ($($method.Id))" -ForegroundColor Cyan
+
+    try {
+        if ($method.Mgr -eq 'winget') {
+            $wargs = @(
+                'install','--id',$method.Id,'--exact',
+                '--accept-package-agreements','--accept-source-agreements',
+                '--silent','--disable-interactivity'
+            )
+            & winget @wargs
+        } else {
+            & choco install $method.Id -y --no-progress
+        }
+
+        $code = $LASTEXITCODE
+        if ($null -eq $code -or $code -eq 0) {
+            Write-Host "  [ OK ]  $Name installed." -ForegroundColor Green
+            return 'installed'
+        } else {
+            Write-Host "  [FAIL]  $Name — exit code $code" -ForegroundColor Red
+            Add-Diagnostic 'Install' "$Name failed via $($method.Mgr) with exit code $code"
+            return 'failed'
+        }
+    } catch {
+        Write-Host "  [FAIL]  $Name — $_" -ForegroundColor Red
+        Add-Diagnostic 'Install' "$Name threw: $_"
+        return 'failed'
+    }
+}
+
+function Show-DisciplineInstaller {
+    param([bool]$HasWinget, [bool]$HasChoco)
+
+    # Build installable discipline index
+    $byDisc = @{}
+    foreach ($e in $Script:RawCatalog) {
+        $hasAuto   = $Script:InstallMap.ContainsKey($e.N)
+        $hasManual = $Script:ManualUrls.ContainsKey($e.N)
+        if (-not $hasAuto -and -not $hasManual) { continue }
+        foreach ($d in $e.D) {
+            if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
+            $byDisc[$d] += $e
+        }
+    }
+
+    $disc = @($byDisc.Keys | Sort-Object)
+    if ($disc.Count -eq 0) {
+        Write-Host "  No installable products mapped." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  Choose a discipline:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $disc.Count; $i++) {
+        $d = $disc[$i]
+        $products = @($byDisc[$d] | Sort-Object N -Unique)
+        $autoCount = @($products | Where-Object { $Script:InstallMap.ContainsKey($_.N) }).Count
+        Write-Host ("    {0,2}. {1,-22}  {2} product(s)  ({3} auto)" -f `
+                    ($i+1), $d, $products.Count, $autoCount)
+    }
+    Write-Host "     0. Cancel"
+
+    $sel = Read-Host "`n  Number"
+    if (-not $sel -or $sel -eq '0') { return }
+    $idx = 0
+    if (-not [int]::TryParse($sel, [ref]$idx) -or $idx -lt 1 -or $idx -gt $disc.Count) {
+        Write-Host "  Invalid selection." -ForegroundColor Red
+        return
+    }
+
+    $pickedDisc = $disc[$idx-1]
+    $products   = @($byDisc[$pickedDisc] | Sort-Object N -Unique)
+
+    Write-Host ""
+    Write-Host "  Products in $pickedDisc :" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $products.Count; $i++) {
+        $p = $products[$i]
+        $map = $Script:InstallMap[$p.N]
+        $tag = if ($map) {
+            if ($HasWinget -and $map.W)     { '[winget]' }
+            elseif ($HasChoco -and $map.C)  { '[choco] ' }
+            else                            { '[pkg?]  ' }
+        } else { '[manual]' }
+        Write-Host ("    {0,2}. {1,-26} {2}" -f ($i+1), $p.N, $tag)
+    }
+
+    Write-Host ""
+    Write-Host "  Enter numbers separated by commas (e.g. 1,3,5) or 'all':"
+    $pick = Read-Host "  Selection"
+
+    $indices = @()
+    if ($pick -match '^all$') {
+        $indices = 1..$products.Count
+    } else {
+        foreach ($tok in ($pick -split ',')) {
+            $n = 0
+            if ([int]::TryParse($tok.Trim(), [ref]$n) -and $n -ge 1 -and $n -le $products.Count) {
+                $indices += $n
+            }
+        }
+    }
+    if ($indices.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; return }
+
+    Write-Host ""
+    Write-Host "  Install plan:" -ForegroundColor Cyan
+    foreach ($i in $indices) { Write-Host ("    - {0}" -f $products[$i-1].N) }
+    $confirm = Read-Host "  Proceed with installation? (Y/N)"
+    if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
+
+    $ok = 0; $fail = 0; $manual = 0
+    foreach ($i in $indices) {
+        $p = $products[$i-1]
+        $res = Install-OneProduct -Name $p.N -HasWinget $HasWinget -HasChoco $HasChoco
+        switch ($res) {
+            'installed' { $ok++ }
+            'failed'    { $fail++ }
+            'manual'    { $manual++ }
+        }
+    }
+
+    Write-Host ""
+    Write-Host ("  Summary: {0} installed, {1} failed, {2} need manual download." -f $ok, $fail, $manual) `
+        -ForegroundColor Cyan
+}
+
+function Invoke-Installer {
+    param(
+        [string[]]$Disciplines = @(),
+        [string[]]$InstallList = @()
+    )
+
+    Write-Host ""
+    Write-Host ("=" * 78) -ForegroundColor DarkCyan
+    Write-Host "  SIGMA SOFTWARE INSTALLER" -ForegroundColor Cyan
+    Write-Host ("=" * 78) -ForegroundColor DarkCyan
+
+    $hasWinget = Test-WingetAvailable
+    $hasChoco  = Test-ChocoAvailable
+
+    Write-Host ""
+    Write-Host ("  winget : {0}" -f $(if ($hasWinget) { 'available' } else { 'not found' })) `
+        -ForegroundColor $(if ($hasWinget) { 'Green' } else { 'DarkGray' })
+    Write-Host ("  choco  : {0}" -f $(if ($hasChoco) { 'available' } else { 'not found' })) `
+        -ForegroundColor $(if ($hasChoco) { 'Green' } else { 'DarkGray' })
+
+    if (-not $hasWinget -and -not $hasChoco) {
+        Write-Host ""
+        Write-Host "  [WARN] No package manager available." -ForegroundColor Yellow
+        Write-Host "  [INFO] Install App Installer (winget) or Chocolatey to enable automatic installs." -ForegroundColor Yellow
+        Write-Host "  [INFO] Manual download links will still be offered." -ForegroundColor Yellow
+    }
+
+    # ---- Non-interactive batch ----
+    if ($InstallList.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Batch mode: $($InstallList -join ', ')" -ForegroundColor Cyan
+        $ok = 0; $fail = 0; $manual = 0
+        foreach ($name in $InstallList) {
+            $entry = $Script:RawCatalog | Where-Object {
+                $_.N -eq $name -or $_.N -like "*$name*"
+            } | Select-Object -First 1
+
+            if (-not $entry) {
+                Write-Host "  [SKIP] Unknown product: $name" -ForegroundColor Yellow
+                continue
+            }
+            $res = Install-OneProduct -Name $entry.N -HasWinget $hasWinget -HasChoco $hasChoco -NonInteractive
+            switch ($res) {
+                'installed' { $ok++ }
+                'failed'    { $fail++ }
+                'manual'    { $manual++ }
+            }
+        }
+        Write-Host ""
+        Write-Host ("  Batch summary: {0} installed, {1} failed, {2} manual." -f $ok, $fail, $manual) `
+            -ForegroundColor Cyan
+        return
+    }
+
+    # ---- Interactive loop ----
+    while ($true) {
+        Show-DisciplineInstaller -HasWinget $hasWinget -HasChoco $hasChoco
+        Write-Host ""
+        $again = Read-Host "  Install something else? (Y/N)"
+        if ($again -notmatch '^[Yy]') { break }
+    }
+}
+
+# =============================================================================
 # 6. PER-PRODUCT CHECKS
 # =============================================================================
 function Get-ProductStatus {
@@ -2095,9 +2405,13 @@ Write-Host ""
 
 if ($NonInteractive) { exit 0 }
 
-$finalChoice = Read-Host "Press R to open the report folder, or Q to quit"
-if ($finalChoice -eq "R" -or $finalChoice -eq "r") {
-    Start-Process $exportPath
-} else {
-    exit 0
+$finalChoice = Read-Host "Press R to open report folder, I to install software, or Q to quit"
+switch -Regex ($finalChoice) {
+    '^[Rr]$' {
+        Start-Process $exportPath
+    }
+    '^[Ii]$' {
+        Invoke-Installer -Disciplines $Disciplines -InstallList @()
+    }
+    default { exit 0 }
 }
