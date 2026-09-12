@@ -1,15 +1,39 @@
 #Requires -RunAsAdministrator
-# -----------------------------------------------------------------------------
-# SIGMA ENGINEER TOOLKIT
-# -----------------------------------------------------------------------------
-# One-shot read-only diagnostic pass over every engineering discipline:
-#   - Detects installed software from the master catalog
-#   - Checks per-product prerequisites, license services, license ports, caches
-#   - Captures system inventory (CPU, RAM, GPU, disks, pagefile)
-#   - Produces a colour-coded HTML dashboard + JSON + CSV
-#
-# Makes NO changes to the machine.
-# -----------------------------------------------------------------------------
+<#
+.SYNOPSIS
+    Sigma Engineer Toolkit — engineering workstation diagnostic.
+.DESCRIPTION
+    Read-only diagnostic pass over every engineering discipline.
+    Detects installed software, checks prerequisites, writes a report.
+    Includes health scoring, structured findings, preflight, project guardian,
+    Windows/Network health, License Center, and live GPU sampling.
+.PARAMETER Disciplines
+    Optional filter. If set, only products relevant to these disciplines are
+    fully evaluated. Others are marked NotApplicable.
+.PARAMETER Preflight
+    Run a single-product preflight readiness check (e.g. -Preflight ANSYS).
+    Skips the full report.
+.PARAMETER ProjectGuardian
+    Path to a project folder to inspect for engineering project issues.
+.PARAMETER DeepScan
+    Also measure cache folders. Slower.
+.PARAMETER WhySlow
+    Quick bottleneck snapshot. Skips the full report.
+.PARAMETER LiveGpuSample
+    Sample GPU engine utilization via performance counters during the scan.
+.PARAMETER NonInteractive
+    Skip confirmation prompts.
+#>
+[CmdletBinding()]
+param(
+    [string[]]$Disciplines = @(),
+    [string]$Preflight,
+    [string]$ProjectGuardian,
+    [switch]$DeepScan,
+    [switch]$WhySlow,
+    [switch]$LiveGpuSample,
+    [switch]$NonInteractive
+)
 
 Write-Host "`n========== SIGMA ENGINEER TOOLKIT ==========" -ForegroundColor Green
 Write-Host ""
@@ -17,22 +41,26 @@ Write-Host "[INFO] Scans every engineering discipline on this workstation." -For
 Write-Host "[INFO] Detects installed software, checks prerequisites, writes a report." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
+if ($Disciplines.Count -gt 0) {
+    Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan
+}
 Write-Host ""
 
-$confirm = Read-Host "Proceed with the engineering diagnostic scan? (Y/N)"
-if ($confirm -ne "Y" -and $confirm -ne "y") {
-    Write-Host "Exiting. No scan performed." -ForegroundColor Cyan
-    exit 0
+if (-not $NonInteractive -and -not $Preflight -and -not $WhySlow) {
+    $confirm = Read-Host "Proceed with the engineering diagnostic scan? (Y/N)"
+    if ($confirm -ne "Y" -and $confirm -ne "y") {
+        Write-Host "Exiting. No scan performed." -ForegroundColor Cyan
+        exit 0
+    }
 }
 
 Write-Host ""
 Write-Host "[INFO] Starting Sigma Engineer Toolkit..." -ForegroundColor Cyan
 
-# -----------------------------------------------------------------------------
-# Helper functions
-# -----------------------------------------------------------------------------
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 $errorLog   = "$env:TEMP\sigma_engineer_toolkit_errors.log"
-$deepScan   = $false
 $exportPath = Join-Path $env:USERPROFILE 'Documents\SigmaEngineerToolkit'
 $stamp      = Get-Date -Format 'yyyyMMdd_HHmmss'
 $reportBase = Join-Path $exportPath "SigmaEngineer_$stamp"
@@ -74,6 +102,88 @@ function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-TcpPort {
+    param(
+        [string]$ComputerName = 'localhost',
+        [int]$Port,
+        [int]$TimeoutMs = 1500
+    )
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($iar)
+        return $true
+    } catch { return $false }
+    finally { try { $client.Close() } catch { } }
+}
+
+function Get-GpuKind {
+    param([string]$Name)
+    if (-not $Name) { return 'Unknown' }
+    $n = $Name.ToLower()
+    if ($n -match 'microsoft basic')                { return 'Basic' }
+    if ($n -match 'intel')                          { return 'Integrated' }
+    if ($n -match 'nvidia|geforce|rtx|quadro')      { return 'Discrete' }
+    if ($n -match 'radeon pro|radeon rx|firepro')   { return 'Discrete' }
+    if ($n -match 'radeon|amd')                     { return 'Integrated' }
+    return 'Unknown'
+}
+
+function Get-ThermalInfo {
+    $zones = @()
+    try {
+        $t = Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop
+        $i = 0
+        foreach ($z in $t) {
+            $i++
+            $c = ($z.CurrentTemperature / 10) - 273.15
+            $zones += [pscustomobject]@{
+                Zone    = "Zone$i"
+                Celsius = [math]::Round($c, 1)
+            }
+        }
+    } catch { }
+    return $zones
+}
+
+function Get-PowerState {
+    try {
+        $b = Get-CimInstance Win32_Battery -ErrorAction Stop
+        if (-not $b) {
+            return [pscustomobject]@{
+                HasBattery = $false; OnAC = $true; Percent = $null
+                StatusCode = $null; StatusText = 'Desktop / no battery'
+            }
+        }
+        $b = $b | Select-Object -First 1
+        $acCodes = @(2, 3, 6, 7, 8, 9, 11)
+        $onAc = $acCodes -contains [int]$b.BatteryStatus
+        $text = switch ([int]$b.BatteryStatus) {
+            1  { 'Discharging' }
+            2  { 'On AC' }
+            3  { 'Fully charged' }
+            4  { 'Low' }
+            5  { 'Critical' }
+            6  { 'Charging' }
+            7  { 'Charging (High)' }
+            8  { 'Charging (Low)' }
+            9  { 'Charging (Critical)' }
+            11 { 'Partially charged' }
+            default { "Unknown ($($b.BatteryStatus))" }
+        }
+        return [pscustomobject]@{
+            HasBattery = $true; OnAC = $onAc; Percent = $b.EstimatedChargeRemaining
+            StatusCode = $b.BatteryStatus; StatusText = $text
+        }
+    } catch {
+        return [pscustomobject]@{
+            HasBattery = $false; OnAC = $true; Percent = $null
+            StatusCode = $null; StatusText = 'Unknown'
+        }
+    }
 }
 
 function Get-InstalledSoftware {
@@ -125,9 +235,66 @@ function Get-VCRedist {
     } | Select-Object DisplayName, DisplayVersion
 }
 
-# -----------------------------------------------------------------------------
-# Save baseline
-# -----------------------------------------------------------------------------
+function New-Finding {
+    param(
+        [string]$Id,
+        [string]$Software,
+        [string]$Problem,
+        [string]$Detected,
+        [string]$WhyItMatters,
+        [string]$Recommendation,
+        [string]$Optional = '',
+        [string]$Severity = 'warn',
+        [double]$RecoverableGB = 0
+    )
+    [pscustomobject]@{
+        Id             = $Id
+        Software       = $Software
+        Problem        = $Problem
+        Detected       = $Detected
+        WhyItMatters   = $WhyItMatters
+        Recommendation = $Recommendation
+        Optional       = $Optional
+        Severity       = $Severity
+        RecoverableGB  = $RecoverableGB
+    }
+}
+
+function Get-LiveGpuSample {
+    param([int]$DurationSeconds = 2)
+    try {
+        $samples = Get-Counter '\GPU Engine(*)\Utilization Percentage' `
+                    -SampleInterval 1 -MaxSamples $DurationSeconds -ErrorAction Stop
+        $perInstance = @{}
+        foreach ($s in $samples.CounterSamples) {
+            $key = $s.InstanceName
+            if (-not $perInstance.ContainsKey($key)) { $perInstance[$key] = @() }
+            $perInstance[$key] += $s.CookedValue
+        }
+        $perProc = @{}
+        foreach ($k in $perInstance.Keys) {
+            if ($k -match 'pid_(\d+)') {
+                $pid2 = [int]$Matches[1]
+                $avg = ($perInstance[$k] | Measure-Object -Average).Average
+                if (-not $perProc.ContainsKey($pid2)) { $perProc[$pid2] = 0 }
+                if ($avg -gt $perProc[$pid2]) { $perProc[$pid2] = $avg }
+            }
+        }
+        $top = $perProc.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
+        $out = foreach ($t in $top) {
+            $pname = try { (Get-Process -Id $t.Key -ErrorAction Stop).ProcessName } catch { "pid $($t.Key)" }
+            [pscustomobject]@{ Pid = $t.Key; Process = $pname; GPU = [math]::Round($t.Value, 1) }
+        }
+        return @($out)
+    } catch {
+        Add-Diagnostic 'GPU' "Live GPU sample failed: $_"
+        return @()
+    }
+}
+
+# =============================================================================
+# BASELINE
+# =============================================================================
 $baseline = [pscustomobject]@{
     When       = Get-Date
     Computer   = $env:COMPUTERNAME
@@ -138,9 +305,9 @@ $baseline = [pscustomobject]@{
 }
 Write-Host "[INFO] Baseline: $($baseline.When) on $($baseline.Computer) as $($baseline.User)" -ForegroundColor DarkGray
 
-# -----------------------------------------------------------------------------
-# 1. Master catalog
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 1. MASTER CATALOG
+# =============================================================================
 Write-Stage "Loading master catalog..."
 $Script:RawCatalog = @(
     # ---------- CIVIL / AEC / BIM ----------
@@ -425,9 +592,9 @@ $Script:RawCatalog = @(
 )
 Write-Ok
 
-# -----------------------------------------------------------------------------
-# 2. Discipline profiles
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 2. DISCIPLINE PROFILES
+# =============================================================================
 Write-Stage "Loading discipline profiles..."
 $Script:Profiles = @{
     'Civil'           = @('AutoCAD','Civil 3D','BricsCAD','Revit','Navisworks','HEC-RAS','HEC-HMS','WaterGEMS','SewerGEMS','InfoWorks ICM','Bentley OpenRail','Carlson Survey','Trimble Business Center')
@@ -477,16 +644,16 @@ $Script:Profiles = @{
 }
 Write-Ok
 
-# -----------------------------------------------------------------------------
-# 3. Detect installed software
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 3. INSTALLED SOFTWARE
+# =============================================================================
 Write-Stage "Scanning installed software..."
 $installed = Get-InstalledSoftware
 Write-Host " $($installed.Count) entries." -ForegroundColor Green
 
-# -----------------------------------------------------------------------------
-# 4. System inventory
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 4. SYSTEM INVENTORY
+# =============================================================================
 Write-Stage "Capturing system inventory..."
 $sys = & {
     $os   = Get-CimInstance Win32_OperatingSystem
@@ -498,6 +665,7 @@ $sys = & {
         $mem = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { [math]::Round($g.AdapterRAM / 1GB, 2) } else { $null }
         [pscustomobject]@{
             Name          = $g.Name
+            Kind          = Get-GpuKind -Name $g.Name
             DriverVersion = $g.DriverVersion
             DriverDate    = if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') } else { '' }
             VRAM_GB       = $mem
@@ -536,40 +704,517 @@ $sys = & {
 
     $pf = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue
 
+    $hasDedicated  = @($gpuInfo | Where-Object Kind -eq 'Discrete').Count -gt 0
+    $hasIntegrated = @($gpuInfo | Where-Object Kind -eq 'Integrated').Count -gt 0
+
     [pscustomobject]@{
-        ComputerName = $env:COMPUTERNAME
-        User         = "$env:USERDOMAIN\$env:USERNAME"
-        OS           = "$($os.Caption) ($($os.Version), Build $($os.BuildNumber))"
-        Arch         = $os.OSArchitecture
-        LastBoot     = $os.LastBootUpTime
-        CPU          = $cpu.Name
-        Cores        = $cpu.NumberOfCores
-        LogicalCPUs  = $cpu.NumberOfLogicalProcessors
-        ClockMHz     = $cpu.MaxClockSpeed
-        RAM_GB       = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
-        FreeRAM_GB   = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-        GPUs         = $gpuInfo
-        Disks        = $disks
-        PageFile     = $pf
-        IsAdmin      = (Test-IsAdmin)
+        ComputerName   = $env:COMPUTERNAME
+        User           = "$env:USERDOMAIN\$env:USERNAME"
+        OS             = "$($os.Caption) ($($os.Version), Build $($os.BuildNumber))"
+        Arch           = $os.OSArchitecture
+        LastBoot       = $os.LastBootUpTime
+        InstallDate    = $os.InstallDate
+        CPU            = $cpu.Name
+        Cores          = $cpu.NumberOfCores
+        LogicalCPUs    = $cpu.NumberOfLogicalProcessors
+        ClockMHz       = $cpu.MaxClockSpeed
+        RAM_GB         = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+        FreeRAM_GB     = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+        GPUs           = $gpuInfo
+        HasDiscreteGPU = $hasDedicated
+        HasIntegrated  = $hasIntegrated
+        Disks          = $disks
+        PageFile       = $pf
+        ThermalZones   = @(Get-ThermalInfo)
+        Power          = Get-PowerState
+        IsAdmin        = (Test-IsAdmin)
     }
 }
 Write-Ok
 
-# -----------------------------------------------------------------------------
-# 5. Prerequisites
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 5. PREREQUISITES
+# =============================================================================
 Write-Stage "Checking prerequisites..."
 $netFx = Get-DotNetFrameworkVersion
 $vc    = @(Get-VCRedist)
 Write-Host " .NET=$netFx, VC++=$($vc.Count) entries." -ForegroundColor Green
 
-# -----------------------------------------------------------------------------
-# 6. Per-product checks
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 5b. WINDOWS HEALTH
+# =============================================================================
+function Get-WindowsHealth {
+    param([pscustomobject]$System)
+
+    $r = [ordered]@{
+        PendingReboot = $false
+        RebootReason  = ''
+        UpdateService = 'Unknown'
+        Defender      = 'Unknown'
+        Firewall      = 'Unknown'
+        Activation    = 'Unknown'
+        BuildAgeDays  = 0
+        Score         = 100
+    }
+
+    $rebootKeys = @(
+        @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'; Reason='CBS RebootPending'},
+        @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'; Reason='Windows Update RebootRequired'},
+        @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'; Reason='CBS PackagesPending'}
+    )
+    foreach ($k in $rebootKeys) {
+        if (Test-Path $k.Path) {
+            $r.PendingReboot = $true
+            $r.RebootReason  = $k.Reason
+            break
+        }
+    }
+    try {
+        $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop).PendingFileRenameOperations
+        if ($pfro) {
+            $r.PendingReboot = $true
+            if (-not $r.RebootReason) { $r.RebootReason = 'PendingFileRenameOperations' }
+        }
+    } catch { }
+
+    try {
+        $wu = Get-Service wuauserv -ErrorAction Stop
+        $r.UpdateService = $wu.Status.ToString()
+    } catch { }
+
+    try {
+        $def = Get-MpComputerStatus -ErrorAction Stop
+        $r.Defender = if ($def.AntivirusEnabled) { 'Active' } else { 'Off' }
+    } catch {
+        try {
+            $sc = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
+            $r.Defender = if ($sc) { 'Active' } else { 'Unknown' }
+        } catch { }
+    }
+
+    try {
+        $fw = Get-NetFirewallProfile -ErrorAction Stop
+        $enabled = @($fw | Where-Object Enabled -eq $true).Count
+        $r.Firewall = if ($enabled -eq $fw.Count) { 'On' } elseif ($enabled -eq 0) { 'Off' } else { "Partial ($enabled/$($fw.Count))" }
+    } catch { }
+
+    try {
+        $lic = Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+               Where-Object { $_.PartialProductKey -and $_.ApplicationID -eq '55c92734-d682-4d71-983e-d6ec3f16059f' } |
+               Select-Object -First 1
+        if ($lic) {
+            $r.Activation = switch ([int]$lic.LicenseStatus) {
+                0 { 'Unlicensed' }
+                1 { 'Licensed' }
+                2 { 'OOB Grace' }
+                3 { 'OOT Grace' }
+                4 { 'Non-Genuine Grace' }
+                5 { 'Notification' }
+                6 { 'Extended Grace' }
+                default { "Unknown ($($lic.LicenseStatus))" }
+            }
+        }
+    } catch { }
+
+    if ($System.InstallDate) {
+        try { $r.BuildAgeDays = (New-TimeSpan -Start $System.InstallDate -End (Get-Date)).Days } catch { }
+    }
+
+    $s = 100
+    if ($r.PendingReboot)                                   { $s -= 20 }
+    if ($r.UpdateService -ne 'Running')                     { $s -= 15 }
+    if ($r.Defender -eq 'Off')                              { $s -= 15 }
+    if ($r.Firewall -eq 'Off')                              { $s -= 10 }
+    if ($r.Activation -in @('Unlicensed','Notification','Non-Genuine Grace')) { $s -= 25 }
+    if ($r.BuildAgeDays -gt 3 * 365)                        { $s -= 10 }
+    elseif ($r.BuildAgeDays -gt 2 * 365)                    { $s -= 5 }
+    $r.Score = [math]::Max(0, $s)
+
+    [pscustomobject]$r
+}
+
+# =============================================================================
+# 5c. NETWORK HEALTH
+# =============================================================================
+function Get-NetworkHealth {
+    param([pscustomobject]$System, [array]$Catalog, [array]$Installed)
+
+    $r = [ordered]@{
+        Adapters      = @()
+        LinkSpeedMbps = 0
+        LinkSpeedText = ''
+        DNS           = 'Unknown'
+        DefaultGW     = ''
+        License       = @()
+        Score         = 100
+    }
+
+    try {
+        $nics = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object Status -eq 'Up')
+        $maxMbps = 0
+        foreach ($n in $nics) {
+            $mbps = 0
+            if ($n.LinkSpeed -match '([\d\.]+)\s*Gbps')      { $mbps = [double]$Matches[1] * 1000 }
+            elseif ($n.LinkSpeed -match '([\d\.]+)\s*Mbps')  { $mbps = [double]$Matches[1] }
+            if ($mbps -gt $maxMbps) { $maxMbps = $mbps }
+            $r.Adapters += [pscustomobject]@{
+                Name      = $n.Name
+                LinkSpeed = $n.LinkSpeed
+                Mac       = $n.MacAddress
+            }
+        }
+        $r.LinkSpeedMbps = [int]$maxMbps
+        $r.LinkSpeedText = if ($maxMbps -ge 1000) { "$([math]::Round($maxMbps/1000,1)) Gbps" }
+                           elseif ($maxMbps -gt 0) { "$maxMbps Mbps" } else { '' }
+    } catch { }
+
+    try {
+        $null = Resolve-DnsName 'microsoft.com' -ErrorAction Stop -QuickTimeout
+        $r.DNS = 'OK'
+    } catch {
+        $r.DNS = 'Failed'
+    }
+
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -First 1
+        if ($route) { $r.DefaultGW = $route.NextHop }
+    } catch { }
+
+    foreach ($entry in $Catalog) {
+        if (-not $entry.Lport) { continue }
+        $hit = $false
+        foreach ($pat in @($entry.P)) {
+            if ($Installed | Where-Object { $_.DisplayName -like $pat }) { $hit = $true; break }
+        }
+        if (-not $hit) { continue }
+
+        $anyOpen = $false
+        foreach ($p in $entry.Lport) {
+            if (Test-TcpPort -Port $p -TimeoutMs 800) { $anyOpen = $true; break }
+        }
+        $r.License += [pscustomobject]@{
+            Product = $entry.N
+            Ports   = ($entry.Lport -join ', ')
+            Local   = $anyOpen
+        }
+    }
+
+    $s = 100
+    if ($r.Adapters.Count -eq 0)                                            { $s -= 20 }
+    elseif ($r.LinkSpeedMbps -gt 0 -and $r.LinkSpeedMbps -lt 100)           { $s -= 15 }
+    elseif ($r.LinkSpeedMbps -gt 0 -and $r.LinkSpeedMbps -lt 1000)          { $s -= 5 }
+    if ($r.DNS -ne 'OK')                                                    { $s -= 10 }
+    if (-not $r.DefaultGW)                                                  { $s -= 10 }
+    $r.Score = [math]::Max(0, $s)
+
+    [pscustomobject]$r
+}
+
+# =============================================================================
+# 5d. PREFLIGHT
+# =============================================================================
+function Invoke-Preflight {
+    param(
+        [string]$ProductName,
+        [array]$Catalog,
+        [pscustomobject]$System,
+        [string]$NetFx,
+        [array]$VC,
+        [array]$Installed
+    )
+
+    Write-Host ""
+    Write-Host ("=" * 78) -ForegroundColor DarkCyan
+    Write-Host "  PREFLIGHT: $ProductName" -ForegroundColor Cyan
+    Write-Host ("=" * 78) -ForegroundColor DarkCyan
+    Write-Host ""
+
+    $entry = $Catalog | Where-Object { $_.N -eq $ProductName } | Select-Object -First 1
+    if (-not $entry) {
+        $entry = $Catalog | Where-Object { $_.N -like "*$ProductName*" } | Select-Object -First 1
+    }
+    if (-not $entry) {
+        Write-Host "[ERROR] Product not found in catalog: $ProductName" -ForegroundColor Red
+        Write-Host "[INFO]  Try one of the catalog names, e.g. ANSYS, SOLIDWORKS, Revit, MATLAB" -ForegroundColor Yellow
+        return
+    }
+
+    $script:pass = 0; $script:warn = 0; $script:fail = 0
+    function Report {
+        param([string]$State, [string]$Label, [string]$Detail = '')
+        switch ($State) {
+            'OK'   { Write-Host "  [ OK ]  " -ForegroundColor Green -NoNewline; $script:pass++ }
+            'WARN' { Write-Host "  [WARN]  " -ForegroundColor Yellow -NoNewline; $script:warn++ }
+            'FAIL' { Write-Host "  [FAIL]  " -ForegroundColor Red -NoNewline; $script:fail++ }
+        }
+        Write-Host $Label -NoNewline
+        if ($Detail) { Write-Host "  ($Detail)" -ForegroundColor DarkGray } else { Write-Host "" }
+    }
+
+    if ($entry.RAM) {
+        if ($System.RAM_GB -ge $entry.RAM) {
+            Report 'OK' "RAM installed" "$($System.RAM_GB) GB >= $($entry.RAM) GB recommended"
+        } else {
+            Report 'WARN' "RAM below recommendation" "$($System.RAM_GB) GB installed, $($entry.RAM) GB recommended"
+        }
+    }
+    Report 'OK' "Free RAM now" "$($System.FreeRAM_GB) GB of $($System.RAM_GB) GB"
+
+    if ($System.PageFile -and $System.PageFile.Count -gt 0) {
+        $pf = $System.PageFile | Select-Object -First 1
+        Report 'OK' "Pagefile enabled" "$($pf.AllocatedBaseSize) MB allocated"
+    } else {
+        Report 'FAIL' "Pagefile not detected" "large solvers may fail"
+    }
+
+    if ($entry.Disk) {
+        $sysd = $System.Disks | Where-Object Drive -eq "$($env:SystemDrive)"
+        if ($sysd -and $sysd.FreeGB -ge $entry.Disk) {
+            Report 'OK' "Scratch disk free" "$($sysd.FreeGB) GB on $($sysd.Drive)"
+        } elseif ($sysd) {
+            Report 'WARN' "Scratch disk tight" "$($sysd.FreeGB) GB free, $($entry.Disk) GB recommended"
+        }
+    }
+
+    if ($entry.Net) {
+        if (Compare-NetVersion -Have $NetFx -Need $entry.Net) {
+            Report 'OK' ".NET Framework" "$NetFx >= $($entry.Net)"
+        } else {
+            Report 'FAIL' ".NET Framework" "have $NetFx, need $($entry.Net)"
+        }
+    }
+
+    if ($entry.VCPP) {
+        if ($VC -and $VC.Count -gt 0) {
+            Report 'OK' "VC++ Runtime" "$($VC.Count) redistributable(s) present"
+        } else {
+            Report 'FAIL' "VC++ Runtime" "not detected"
+        }
+    }
+
+    if ($entry.GPU) {
+        $discrete = @($System.GPUs | Where-Object Kind -eq 'Discrete')
+        if ($discrete.Count -gt 0) {
+            Report 'OK' "Discrete GPU present" (($discrete | ForEach-Object { $_.Name }) -join ', ')
+        } else {
+            Report 'WARN' "No discrete GPU" "using integrated graphics"
+        }
+    }
+
+    if ($entry.Lsvc) {
+        $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
+            $n = $_.Name + ' ' + $_.DisplayName
+            foreach ($pat in $entry.Lsvc) { if ($n -like $pat) { return $true } }
+            return $false
+        })
+        if ($svc.Count -gt 0 -and (@($svc | Where-Object Status -eq 'Running').Count -gt 0)) {
+            Report 'OK' "License service running" (($svc | Where-Object Status -eq 'Running' | Select-Object -First 1).DisplayName)
+        } elseif ($svc.Count -gt 0) {
+            Report 'FAIL' "License service stopped" (($svc | Select-Object -First 1).DisplayName)
+        } else {
+            Report 'WARN' "License service not found" "may be remote"
+        }
+    }
+
+    if ($entry.Lport) {
+        $open = @()
+        foreach ($p in $entry.Lport) { if (Test-TcpPort -Port $p -TimeoutMs 800) { $open += $p } }
+        if ($open.Count -gt 0) {
+            Report 'OK' "License port(s) open" ($open -join ', ')
+        } else {
+            Report 'WARN' "License ports closed locally" "normal for node-locked or remote servers"
+        }
+    }
+
+    if ($System.ThermalZones -and $System.ThermalZones.Count -gt 0) {
+        $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
+        if ($max -lt 80) {
+            Report 'OK' "CPU temperature" "$max C"
+        } elseif ($max -lt 95) {
+            Report 'WARN' "CPU temperature elevated" "$max C"
+        } else {
+            Report 'FAIL' "CPU temperature critical" "$max C"
+        }
+    }
+
+    if ($System.Power.HasBattery) {
+        if ($System.Power.OnAC) {
+            Report 'OK' "AC power" "battery at $($System.Power.Percent)% ($($System.Power.StatusText))"
+        } else {
+            Report 'WARN' "Running on battery" "$($System.Power.Percent)% - heavy solve will drain fast"
+        }
+    }
+
+    $heavyNames = @('chrome','msedge','firefox','teams','slack','discord','zoom',
+                    'photoshop','illustrator','premiere','aftereffects',
+                    'code','devenv','rider','webstorm','pycharm','idea',
+                    'excel','powerpnt','winword','outlook','spotify','obs','blender')
+    $heavy = @()
+    $recoverGB = 0
+    try {
+        $procs = Get-Process -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            if ($heavyNames -contains $p.ProcessName.ToLower()) {
+                $gb = [math]::Round($p.WorkingSet64 / 1GB, 2)
+                $heavy += [pscustomobject]@{ Name = $p.ProcessName; GB = $gb }
+                $recoverGB += $gb
+            }
+        }
+    } catch { }
+    if ($heavy.Count -eq 0) {
+        Report 'OK' "No heavy background apps detected"
+    } else {
+        $recoverGB = [math]::Round($recoverGB, 1)
+        Report 'WARN' "$($heavy.Count) heavy application(s) open" "closing them recovers ~$recoverGB GB"
+        foreach ($h in ($heavy | Sort-Object GB -Descending | Select-Object -First 5)) {
+            Write-Host ("           - {0,-14} {1,5} GB" -f $h.Name, $h.GB) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ""
+    $verdict = if ($fail -gt 0) { 'NOT READY' } elseif ($warn -gt 2) { 'CAUTION' } else { 'READY' }
+    $col = if ($fail -gt 0) { 'Red' } elseif ($warn -gt 2) { 'Yellow' } else { 'Green' }
+    Write-Host ("  $script:pass OK   $script:warn WARN   $script:fail FAIL   ->  $verdict") -ForegroundColor $col
+    Write-Host ""
+}
+
+# =============================================================================
+# 5e. WHY-SLOW
+# =============================================================================
+function Invoke-WhySlow {
+    param([pscustomobject]$System)
+
+    Write-Host ""
+    Write-Host ("=" * 78) -ForegroundColor DarkCyan
+    Write-Host "  WHY IS MY PC SLOW?" -ForegroundColor Cyan
+    Write-Host ("=" * 78) -ForegroundColor DarkCyan
+    Write-Host ""
+
+    $ramPctFree = [math]::Round(($System.FreeRAM_GB / $System.RAM_GB) * 100, 1)
+    $critDisk = $System.Disks | Sort-Object FreePct | Select-Object -First 1
+
+    $topMem = @()
+    try {
+        $topMem = Get-Process -ErrorAction SilentlyContinue |
+                  Sort-Object WorkingSet64 -Descending |
+                  Select-Object -First 8 |
+                  ForEach-Object {
+                      [pscustomobject]@{
+                          Name = $_.ProcessName
+                          GB   = [math]::Round($_.WorkingSet64 / 1GB, 2)
+                      }
+                  }
+    } catch { }
+
+    $topCpu = @()
+    try {
+        $s1 = @{}
+        Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $s1[$_.Id] = $_.TotalProcessorTime.TotalMilliseconds }
+        Start-Sleep -Milliseconds 800
+        $cores = [math]::Max(1, $System.LogicalCPUs)
+        $topCpu = Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            $prev = if ($s1.ContainsKey($_.Id)) { $s1[$_.Id] } else { 0 }
+            $delta = $_.TotalProcessorTime.TotalMilliseconds - $prev
+            $pct = [math]::Round(($delta / 800) * 100 / $cores, 1)
+            [pscustomobject]@{ Name = $_.ProcessName; CPU = $pct }
+        } | Sort-Object CPU -Descending | Select-Object -First 8
+    } catch { }
+
+    $verdicts = [ordered]@{
+        RAM    = if ($ramPctFree -lt 15) { 'CRITICAL' } elseif ($ramPctFree -lt 30) { 'ELEVATED' } else { 'OK' }
+        Disk   = if ($critDisk -and $critDisk.FreePct -lt 5) { 'CRITICAL' } elseif ($critDisk -and $critDisk.FreePct -lt 15) { 'ELEVATED' } else { 'OK' }
+        CPU    = if (($topCpu | Select-Object -First 1).CPU -gt 60) { 'ELEVATED' } else { 'OK' }
+        GPU    = if ($System.HasDiscreteGPU) { 'OK' } else { 'ELEVATED' }
+        Power  = if ($System.Power.HasBattery -and -not $System.Power.OnAC) { 'ELEVATED' } else { 'OK' }
+        Thermal= if ($System.ThermalZones.Count -gt 0 -and (($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum) -gt 85) { 'ELEVATED' } else { 'OK' }
+    }
+
+    $primary = 'None detected'
+    foreach ($k in @('RAM','Disk','Thermal','Power','CPU','GPU')) {
+        if ($verdicts[$k] -eq 'CRITICAL') { $primary = $k; break }
+    }
+    if ($primary -eq 'None detected') {
+        foreach ($k in @('RAM','Disk','Thermal','Power','CPU','GPU')) {
+            if ($verdicts[$k] -eq 'ELEVATED') { $primary = $k; break }
+        }
+    }
+
+    Write-Host "  Current snapshot" -ForegroundColor Cyan
+    Write-Host ("    RAM free            {0} GB / {1} GB ({2}%)" -f $System.FreeRAM_GB, $System.RAM_GB, $ramPctFree)
+    Write-Host ("    CPU cores           {0} logical" -f $System.LogicalCPUs)
+    Write-Host ("    Worst disk free     {0} GB ({1}% on {2})" -f $critDisk.FreeGB, $critDisk.FreePct, $critDisk.Drive)
+    Write-Host ("    Power               {0}" -f $System.Power.StatusText)
+    $thMax = if ($System.ThermalZones.Count -gt 0) { "$((($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum)) C max" } else { 'not exposed' }
+    Write-Host ("    Thermals            {0}" -f $thMax)
+    Write-Host ""
+
+    Write-Host "  Verdicts" -ForegroundColor Cyan
+    foreach ($k in $verdicts.Keys) {
+        $col = switch ($verdicts[$k]) { 'CRITICAL' { 'Red' } 'ELEVATED' { 'Yellow' } default { 'Green' } }
+        Write-Host ("    {0,-8} {1}" -f $k, $verdicts[$k]) -ForegroundColor $col
+    }
+    Write-Host ""
+
+    Write-Host ("  PRIMARY BOTTLENECK: {0}" -f $primary) -ForegroundColor Yellow
+    Write-Host ""
+
+    if ($topMem.Count -gt 0) {
+        Write-Host "  Top memory consumers" -ForegroundColor Cyan
+        foreach ($p in $topMem) {
+            Write-Host ("    {0,-22} {1,6} GB" -f $p.Name, $p.GB)
+        }
+        Write-Host ""
+    }
+    if ($topCpu.Count -gt 0) {
+        Write-Host "  Top CPU consumers (last 0.8s)" -ForegroundColor Cyan
+        foreach ($p in $topCpu) {
+            if ($p.CPU -lt 0.5) { continue }
+            Write-Host ("    {0,-22} {1,6}%" -f $p.Name, $p.CPU)
+        }
+        Write-Host ""
+    }
+
+    $rec = switch ($primary) {
+        'RAM'    { "Close unused applications or upgrade RAM. Currently $ramPctFree% free." }
+        'Disk'   { "Free space on $($critDisk.Drive). Engineering tools need scratch headroom." }
+        'Thermal'{ "Check cooling. Consider limiting solver threads until temperatures fall." }
+        'Power'  { "Plug in AC power. Laptop battery mode throttles CPU and GPU." }
+        'CPU'    { "A background process is consuming CPU. See the list above." }
+        'GPU'    { "No discrete GPU detected. Some 3D and solver workloads will be slow." }
+        default  { "No obvious local bottleneck. Check license server reachability and project file size." }
+    }
+    Write-Host "  RECOMMENDATION" -ForegroundColor Cyan
+    Write-Host "    $rec"
+    Write-Host ""
+}
+
+# =============================================================================
+# 5f. DISPATCH PREFLIGHT / WHYSLOW
+# =============================================================================
+if ($Preflight) {
+    Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog `
+                     -System $sys -NetFx $netFx -VC $vc -Installed $installed
+    exit 0
+}
+
+if ($WhySlow) {
+    Invoke-WhySlow -System $sys
+    exit 0
+}
+
+# =============================================================================
+# 6. PER-PRODUCT CHECKS
+# =============================================================================
 function Get-ProductStatus {
-    param([hashtable]$Entry, [array]$Installed, [pscustomobject]$System,
-          [string]$NetFx, [array]$VC, [switch]$DeepScan)
+    param(
+        [hashtable]$Entry,
+        [array]$Installed,
+        [pscustomobject]$System,
+        [string]$NetFx,
+        [array]$VC,
+        [string[]]$ActiveDisciplines,
+        [switch]$DeepScan
+    )
 
     $status = [ordered]@{
         Name        = $Entry.N
@@ -578,86 +1223,196 @@ function Get-ProductStatus {
         Installed   = $false
         Version     = ''
         Match       = ''
-        State       = 'Red'
-        Issues      = @()
+        State       = 'NotInstalled'
+        Severity    = 'info'
+        Findings    = (New-Object System.Collections.Generic.List[object])
         Notes       = @()
         CacheGB     = 0
     }
 
+    if ($ActiveDisciplines.Count -gt 0) {
+        $overlap = $false
+        foreach ($d in $Entry.D) {
+            if ($ActiveDisciplines -contains $d) { $overlap = $true; break }
+        }
+        if (-not $overlap) {
+            $status.State = 'NotApplicable'
+            return [pscustomobject]$status
+        }
+    }
+
     $hits = @()
-    foreach ($pat in $Entry.P) {
+    foreach ($pat in @($Entry.P)) {
         $hits += $Installed | Where-Object { $_.DisplayName -like $pat }
     }
-    $hits = $hits | Sort-Object DisplayName -Unique
+    $hits = @($hits | Sort-Object DisplayName -Unique)
 
-    if (-not $hits) {
-        $status.State  = 'Red'
-        $status.Issues += 'Not installed / not detected on this PC'
+    if ($hits.Count -eq 0) {
+        $status.State = 'NotInstalled'
         return [pscustomobject]$status
     }
+
     $status.Installed = $true
     $status.Version   = (($hits | ForEach-Object { $_.DisplayVersion } |
                           Where-Object { $_ } | Sort-Object -Unique) -join ', ')
     $status.Match     = ($hits.DisplayName -join ' | ')
 
+    $minRam = 0
+    if ($Entry.MinRAM) { $minRam = [int]$Entry.MinRAM }
+    elseif ($Entry.RAM) { $minRam = [int][math]::Ceiling($Entry.RAM * 0.5) }
+
     if ($Entry.RAM -and $System.RAM_GB -lt $Entry.RAM) {
-        $status.Issues += "RAM below recommended minimum ($($System.RAM_GB) GB < $($Entry.RAM) GB)"
+        $sev = if ($minRam -gt 0 -and $System.RAM_GB -lt $minRam) { 'critical' } else { 'warn' }
+        $why = if ($sev -eq 'critical') {
+            "Large models may fail to open or the solver may crash mid-run."
+        } else {
+            "Large models may spill to the pagefile, causing noticeably slower performance."
+        }
+        $rec = if ($sev -eq 'critical') {
+            "Upgrade RAM before attempting large models. Close memory-heavy applications now."
+        } else {
+            "Close memory-heavy applications before running large models."
+        }
+        $status.Findings.Add((New-Finding `
+            -Id "$($Entry.N).RAM_LOW" `
+            -Software $Entry.N `
+            -Problem "$($Entry.N) may experience slow performance or instability." `
+            -Detected "$($System.RAM_GB) GB installed; $($Entry.RAM) GB recommended (min $minRam GB)." `
+            -WhyItMatters $why `
+            -Recommendation $rec `
+            -Optional "Consider upgrading to $($Entry.RAM) GB or more for large workloads." `
+            -Severity $sev))
     }
+
     if ($Entry.Disk) {
         $sysd = $System.Disks | Where-Object Drive -eq "$($env:SystemDrive)"
         if ($sysd -and $sysd.FreeGB -lt $Entry.Disk) {
-            $status.Issues += "Free disk on $($sysd.Drive) low ($($sysd.FreeGB) GB < $($Entry.Disk) GB recommended)"
+            $sev = if ($sysd.FreeGB -lt 5) { 'critical' } else { 'warn' }
+            $status.Findings.Add((New-Finding `
+                -Id "$($Entry.N).DISK_LOW" `
+                -Software $Entry.N `
+                -Problem "$($Entry.N) scratch disk is running low." `
+                -Detected "$($sysd.FreeGB) GB free on $($sysd.Drive); $($Entry.Disk) GB recommended." `
+                -WhyItMatters "Solvers, caches, and autosaves write to this disk. Running out can abort jobs." `
+                -Recommendation "Free space on $($sysd.Drive) or redirect scratch to another volume." `
+                -Severity $sev))
         }
     }
+
     if ($Entry.GPU) {
         $hasDedicated = $false
-        foreach ($g in $System.GPUs) { if ($g.VRAM_GB -and $g.VRAM_GB -ge 2) { $hasDedicated = $true } }
-        if (-not $hasDedicated) { $status.Issues += 'Dedicated GPU with >=2 GB VRAM recommended' }
-    }
-    if ($Entry.Net) {
-        if (-not (Compare-NetVersion -Have $NetFx -Need $Entry.Net)) {
-            $status.Issues += ".NET Framework $($Entry.Net) or newer required (have: $NetFx)"
+        foreach ($g in $System.GPUs) {
+            if ($g.VRAM_GB -and $g.VRAM_GB -ge 2) { $hasDedicated = $true }
+        }
+        if (-not $hasDedicated) {
+            $status.Findings.Add((New-Finding `
+                -Id "$($Entry.N).GPU_LOW" `
+                -Software $Entry.N `
+                -Problem "$($Entry.N) prefers a dedicated GPU." `
+                -Detected "No dedicated GPU with 2 GB or more VRAM detected." `
+                -WhyItMatters "3D views, rendering, and GPU-accelerated solvers will be slow." `
+                -Recommendation "Install a dedicated GPU (NVIDIA RTX / AMD Radeon Pro class)." `
+                -Severity 'warn'))
         }
     }
-    if ($Entry.VCPP -and (-not $VC -or $VC.Count -eq 0)) {
-        $status.Issues += 'Microsoft Visual C++ Redistributables not detected'
+
+    if ($Entry.Net) {
+        if (-not (Compare-NetVersion -Have $NetFx -Need $Entry.Net)) {
+            $status.Findings.Add((New-Finding `
+                -Id "$($Entry.N).DOTNET" `
+                -Software $Entry.N `
+                -Problem "$($Entry.N) may not start." `
+                -Detected ".NET Framework $NetFx installed; $($Entry.Net) required." `
+                -WhyItMatters "Missing framework versions cause startup errors and missing features." `
+                -Recommendation "Install .NET Framework $($Entry.Net) or newer from Microsoft." `
+                -Severity 'critical'))
+        }
     }
+
+    if ($Entry.VCPP -and (-not $VC -or $VC.Count -eq 0)) {
+        $status.Findings.Add((New-Finding `
+            -Id "$($Entry.N).VCPP" `
+            -Software $Entry.N `
+            -Problem "$($Entry.N) may fail to launch." `
+            -Detected "No Microsoft Visual C++ Redistributable detected." `
+            -WhyItMatters "Most engineering applications depend on the VC++ runtime." `
+            -Recommendation "Install the Microsoft Visual C++ Redistributable (2015-2022, x64)." `
+            -Severity 'critical'))
+    }
+
     if ($Entry.Lsvc) {
-        $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object {
+        $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
             $n = $_.Name + ' ' + $_.DisplayName
             foreach ($pat in $Entry.Lsvc) { if ($n -like $pat) { return $true } }
             return $false
-        }
-        if ($svc) {
+        })
+        if ($svc.Count -gt 0) {
             $running = @($svc | Where-Object Status -eq 'Running').Count
-            if ($running -eq 0) { $status.Issues += 'License/vendor services installed but not running' }
+            if ($running -eq 0) {
+                $status.Findings.Add((New-Finding `
+                    -Id "$($Entry.N).LICSVC" `
+                    -Software $Entry.N `
+                    -Problem "$($Entry.N) license service is not running." `
+                    -Detected "$($svc.Count) vendor service(s) installed; 0 running." `
+                    -WhyItMatters "The application will fail to acquire a license and may not launch." `
+                    -Recommendation "Start the vendor license service or repair the install." `
+                    -Severity 'critical'))
+            }
         }
     }
+
     if ($Entry.Lport) {
         $openAny = $false
         foreach ($p in $Entry.Lport) {
-            try {
-                $t = Test-NetConnection -ComputerName 'localhost' -Port $p -InformationLevel Quiet `
-                                        -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
-                if ($t) { $openAny = $true }
-            } catch { }
+            if (Test-TcpPort -Port $p -TimeoutMs 800) { $openAny = $true; break }
         }
         if (-not $openAny) {
-            $status.Notes += "License ports not open locally ($($Entry.Lport -join ', ')) — normal for node-locked or remote licence servers"
+            $status.Notes += "License ports not open locally ($($Entry.Lport -join ', ')) - normal for node-locked or remote license servers."
         }
     }
+
+    if ($System.Power.HasBattery -and -not $System.Power.OnAC) {
+        if ($Entry.RAM -ge 16 -or $Entry.K -match 'FEA|CFD|BIM|Explicit|FEA/CFD') {
+            $status.Findings.Add((New-Finding `
+                -Id "$($Entry.N).POWER" `
+                -Software $Entry.N `
+                -Problem "$($Entry.N) will run slower on battery." `
+                -Detected "Currently on battery at $($System.Power.Percent)% ($($System.Power.StatusText))." `
+                -WhyItMatters "Windows throttles CPU and GPU under battery power, which lengthens solve times significantly." `
+                -Recommendation "Plug in AC power before heavy workloads." `
+                -Severity 'warn'))
+        }
+    }
+
     if ($DeepScan -and $Entry.Cache) {
         $total = 0
         foreach ($c in $Entry.Cache) { $total += (Get-FolderSizeGB -Path (Expand-Env $c)) }
         $status.CacheGB = [math]::Round($total, 2)
         if ($total -gt 20) {
-            $status.Notes += "Cache is large ($($status.CacheGB) GB) — safe to clear if the app is closed"
+            $recoverable = [math]::Round($total * 0.7, 1)
+            $status.Notes += "Cache is large ($($status.CacheGB) GB)."
+            $status.Findings.Add((New-Finding `
+                -Id "$($Entry.N).CACHE" `
+                -Software $Entry.N `
+                -Problem "$($Entry.N) cache is unusually large." `
+                -Detected "Cache total: $($status.CacheGB) GB across $($Entry.Cache.Count) folder(s)." `
+                -WhyItMatters "Oversized caches slow launches and often indicate leftover project data." `
+                -Recommendation "Review the cache folders while the app is closed." `
+                -Optional "Estimated recoverable space: $recoverable GB." `
+                -Severity 'warn' `
+                -RecoverableGB $recoverable))
         }
     }
 
-    if (-not $status.Installed)         { $status.State = 'Red' }
-    elseif ($status.Issues.Count -gt 0) { $status.State = 'Yellow' }
-    else                                { $status.State = 'Green' }
+    $crit = @($status.Findings | Where-Object Severity -eq 'critical').Count
+    $warn = @($status.Findings | Where-Object Severity -eq 'warn').Count
+    if ($crit -gt 0) {
+        $status.State = 'Critical'; $status.Severity = 'critical'
+    } elseif ($warn -gt 0) {
+        $status.State = 'Attention'; $status.Severity = 'warn'
+    } else {
+        $status.State = 'Healthy'; $status.Severity = 'info'
+    }
 
     return [pscustomobject]$status
 }
@@ -666,19 +1421,141 @@ Write-Stage "Checking every product in the catalog..."
 $allResults = New-Object System.Collections.Generic.List[object]
 foreach ($entry in $Script:RawCatalog) {
     $allResults.Add((Get-ProductStatus -Entry $entry -Installed $installed -System $sys `
-                                        -NetFx $netFx -VC $vc -DeepScan:$deepScan))
+                                        -NetFx $netFx -VC $vc -ActiveDisciplines $Disciplines `
+                                        -DeepScan:$DeepScan))
 }
-$gCount = @($allResults | Where-Object State -eq 'Green').Count
-$yCount = @($allResults | Where-Object State -eq 'Yellow').Count
-$rCount = @($allResults | Where-Object State -eq 'Red').Count
-Write-Host " $gCount green / $yCount yellow / $rCount red." -ForegroundColor Green
 
-# -----------------------------------------------------------------------------
-# 7. Discipline rollup
-# -----------------------------------------------------------------------------
+$gCount = @($allResults | Where-Object State -eq 'Healthy').Count
+$yCount = @($allResults | Where-Object State -eq 'Attention').Count
+$rCount = @($allResults | Where-Object State -eq 'Critical').Count
+$nCount = @($allResults | Where-Object State -eq 'NotInstalled').Count
+$aCount = @($allResults | Where-Object State -eq 'NotApplicable').Count
+Write-Host " $gCount healthy / $yCount attention / $rCount critical / $nCount not installed / $aCount not applicable." -ForegroundColor Green
+
+# =============================================================================
+# 7. HEALTH SCORE
+# =============================================================================
+function Get-HealthScore {
+    param(
+        [array]$Results,
+        [pscustomobject]$System,
+        [string]$NetFx,
+        [array]$VC,
+        [pscustomobject]$WindowsHealth,
+        [pscustomobject]$NetworkHealth
+    )
+
+    $cats = [ordered]@{}
+
+    $hw = 100
+    if ($System.RAM_GB -lt 16) { $hw -= 30 }
+    elseif ($System.RAM_GB -lt 32) { $hw -= 10 }
+    if ($System.LogicalCPUs -lt 8) { $hw -= 20 }
+    if (-not $System.HasDiscreteGPU) { $hw -= 25 }
+    $cats['Hardware'] = [math]::Max(0, $hw)
+
+    $st = 100
+    if ($System.Disks.Count -gt 0) {
+        $worst = ($System.Disks | Sort-Object FreePct | Select-Object -First 1).FreePct
+        if ($worst -lt 5)      { $st = 30 }
+        elseif ($worst -lt 10) { $st = 55 }
+        elseif ($worst -lt 20) { $st = 80 }
+    }
+    $cats['Storage'] = $st
+
+    $rel = @($Results | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') })
+    if ($rel.Count -eq 0) {
+        $cats['EngineeringSoftware'] = 100
+    } else {
+        $healthy = @($rel | Where-Object State -eq 'Healthy').Count
+        $cats['EngineeringSoftware'] = [int](100 * $healthy / $rel.Count)
+    }
+
+    $gpuScore = 100
+    $newestDriverDate = $null
+    foreach ($g in $System.GPUs) {
+        if ($g.DriverDate) {
+            try {
+                $d = [datetime]::Parse($g.DriverDate)
+                if (-not $newestDriverDate -or $d -gt $newestDriverDate) { $newestDriverDate = $d }
+            } catch { }
+        }
+    }
+    if ($newestDriverDate) {
+        $ageDays = (New-TimeSpan -Start $newestDriverDate -End (Get-Date)).Days
+        if ($ageDays -gt 365)      { $gpuScore = 55 }
+        elseif ($ageDays -gt 180)  { $gpuScore = 75 }
+        elseif ($ageDays -gt 90)   { $gpuScore = 90 }
+    }
+    $cats['GPU'] = $gpuScore
+
+    $drv = 100
+    if ($NetFx -match '^4\.[0-6]')     { $drv -= 40 }
+    elseif ($NetFx -eq '4.7')          { $drv -= 15 }
+    if (-not $VC -or $VC.Count -eq 0)  { $drv -= 30 }
+    $cats['Drivers'] = [math]::Max(0, $drv)
+
+    $licIssues = @($rel | Where-Object { @($_.Findings | Where-Object Id -match 'LICSVC').Count -gt 0 }).Count
+    $cats['Licensing'] = if ($rel.Count -eq 0) { 100 } else { [int](100 - (100 * $licIssues / $rel.Count)) }
+
+    $cats['Windows'] = if ($WindowsHealth) { $WindowsHealth.Score } else { 85 }
+    $cats['Network'] = if ($NetworkHealth) { $NetworkHealth.Score } else { 90 }
+
+    $th = 85
+    if ($System.ThermalZones -and $System.ThermalZones.Count -gt 0) {
+        $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
+        if ($max -lt 60)      { $th = 100 }
+        elseif ($max -lt 80)  { $th = 88 }
+        elseif ($max -lt 95)  { $th = 60 }
+        else                  { $th = 30 }
+    }
+    $cats['Thermals'] = $th
+
+    $cats['ProjectSafety'] = 100
+
+    $weights = @{
+        Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
+        GPU = 0.08; Drivers = 0.10; Licensing = 0.07
+        Windows = 0.05; Thermals = 0.05; Network = 0.05; ProjectSafety = 0.05
+    }
+    $overall = 0
+    foreach ($k in $cats.Keys) {
+        $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
+        $overall += $cats[$k] * $w
+    }
+
+    [pscustomobject]@{
+        Overall    = [int][math]::Round($overall)
+        Categories = $cats
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Windows / Network health
+# ---------------------------------------------------------------------------
+$windowsHealth = Get-WindowsHealth -System $sys
+$networkHealth = Get-NetworkHealth -System $sys -Catalog $Script:RawCatalog -Installed $installed
+
+# ---------------------------------------------------------------------------
+# Live GPU sample (optional)
+# ---------------------------------------------------------------------------
+$liveGpu = @()
+if ($LiveGpuSample) {
+    Write-Stage "Sampling live GPU utilization..."
+    $liveGpu = Get-LiveGpuSample -DurationSeconds 2
+    Write-Ok
+}
+
+$score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx -VC $vc `
+                         -WindowsHealth $windowsHealth -NetworkHealth $networkHealth
+
+# =============================================================================
+# 8. DISCIPLINE ROLLUP
+# =============================================================================
 Write-Head "Discipline rollup"
 $byDisc = @{}
 foreach ($r in $allResults) {
+    if ($r.State -in @('NotInstalled','NotApplicable')) { continue }
     foreach ($d in ($r.Disciplines -split ',\s*')) {
         if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
         $byDisc[$d] += $r
@@ -686,39 +1563,249 @@ foreach ($r in $allResults) {
 }
 foreach ($d in $byDisc.Keys | Sort-Object) {
     $rs    = $byDisc[$d]
-    $green = @($rs | Where-Object State -eq 'Green').Count
-    $yell  = @($rs | Where-Object State -eq 'Yellow').Count
-    $red   = @($rs | Where-Object State -eq 'Red').Count
+    $green = @($rs | Where-Object State -eq 'Healthy').Count
+    $yell  = @($rs | Where-Object State -eq 'Attention').Count
+    $red   = @($rs | Where-Object State -eq 'Critical').Count
     $total = $rs.Count
     $bar   = ('#' * $green) + ('=' * $yell) + ('.' * $red)
-    Write-Host ("  {0,-18} {1,2}/{2,2} green  {3,2} yellow  {4,2} red   [{5}]" `
+    Write-Host ("  {0,-18} {1,2}/{2,2} healthy  {3,2} attention  {4,2} critical   [{5}]" `
                 -f $d, $green, $total, $yell, $red, $bar) -ForegroundColor Cyan
 }
 
-# -----------------------------------------------------------------------------
-# 8. Write report
-# -----------------------------------------------------------------------------
+Write-Host ""
+Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100" -f $score.Overall) -ForegroundColor Green
+foreach ($k in $score.Categories.Keys) {
+    Write-Host ("    {0,-22} {1,3}/100" -f $k, $score.Categories[$k])
+}
+
+# =============================================================================
+# 9. PROJECT GUARDIAN
+# =============================================================================
+function Get-DwgReferences {
+    param([string]$FilePath)
+
+    $refs = New-Object System.Collections.Generic.List[object]
+    $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+
+    try {
+        if ($ext -eq '.dxf') {
+            if ((Get-Item -LiteralPath $FilePath).Length -gt 200MB) { return $refs }
+            $text = Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
+            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"BLOCK"\)[\s\S]{0,4000}?\(2\s*\.\s*"\*X[^"]*"\)[\s\S]{0,4000}?\(1\s*\.\s*"([^"]+)"\)')) {
+                $refs.Add([pscustomobject]@{ Type = 'XREF'; Path = $m.Groups[1].Value })
+            }
+            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"IMAGEDEF"\)[\s\S]{0,3000}?\(1\s*\.\s*"([^"]+)"\)')) {
+                $refs.Add([pscustomobject]@{ Type = 'IMAGE'; Path = $m.Groups[1].Value })
+            }
+            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"PDFDEFINITION"\)[\s\S]{0,3000}?\(1\s*\.\s*"([^"]+)"\)')) {
+                $refs.Add([pscustomobject]@{ Type = 'PDF'; Path = $m.Groups[1].Value })
+            }
+        } elseif ($ext -eq '.dwg') {
+            $fi = Get-Item -LiteralPath $FilePath
+            if ($fi.Length -gt 250MB) { return $refs }
+            $bytes = [System.IO.File]::ReadAllBytes($FilePath)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $extPat = '(dwg|dxf|pdf|jpg|jpeg|png|tif|tiff|shx|ttf|shp|dgn|dwf|dwfx)'
+
+            foreach ($m in [regex]::Matches($ascii, "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{0,250}\.$extPat", 'IgnoreCase')) {
+                $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
+            }
+            foreach ($m in [regex]::Matches($ascii, "\\\\\\\\[^\x00-\x1F`"<>|]{0,250}\.$extPat", 'IgnoreCase')) {
+                $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
+            }
+        }
+    } catch {
+        Add-Diagnostic 'XREF' "Failed to parse ${FilePath}: $_"
+    }
+    return $refs
+}
+
+function Invoke-ProjectGuardian {
+    param([string]$Root)
+
+    if (-not (Test-Path $Root)) {
+        Write-Host "[ERROR] Project path not found: $Root" -ForegroundColor Red
+        return $null
+    }
+
+    Write-Head "Project Guardian: $Root"
+
+    $engExt = @(
+        '.dwg','.dxf','.rvt','.rfa','.nwd','.nwc','.ifc',
+        '.sldprt','.sldasm','.slddrw','.step','.stp','.iges','.igs','.stl',
+        '.inp','.cdb','.mph','.mat','.m','.slx','.sdb','.edb',
+        '.kicad_pcb','.kicad_sch','.sch','.brd',
+        '.shp','.shx','.dbf','.las','.laz','.tif','.tiff',
+        '.catpart','.catproduct','.prt','.asm','.3dxml',
+        '.model','.exp','.cgr','.cnc'
+    )
+    $backupExt = @('.bak','.tmp','.sv$','.dwl','.dwl2','.ac$','.err','.log')
+
+    $scan = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction SilentlyContinue)
+
+    $byExt = @{}
+    $totalBytes = 0
+    $longPaths = 0
+    $backupFiles = 0
+    $largeFiles = 0
+    $largeBytes = 0
+    $oldBackups = 0
+
+    $cutoff = (Get-Date).AddDays(-180)
+
+    foreach ($f in $scan) {
+        $ext = $f.Extension.ToLower()
+        if (-not $byExt.ContainsKey($ext)) { $byExt[$ext] = 0 }
+        $byExt[$ext]++
+        $totalBytes += $f.Length
+
+        if ($f.FullName.Length -gt 240) { $longPaths++ }
+        if ($backupExt -contains $ext) {
+            $backupFiles++
+            if ($f.LastWriteTime -lt $cutoff) { $oldBackups++ }
+        }
+        if ($f.Length -gt 500MB) { $largeFiles++; $largeBytes += $f.Length }
+    }
+
+    $engFiles = 0
+    foreach ($k in $byExt.Keys) { if ($engExt -contains $k) { $engFiles += $byExt[$k] } }
+
+    Write-Host ""
+    Write-Host ("  Total files:          {0}" -f $scan.Count)
+    Write-Host ("  Total size:           {0} GB" -f [math]::Round($totalBytes/1GB, 2))
+    Write-Host ("  Engineering files:    {0}" -f $engFiles)
+    Write-Host ("  Long paths (>240):    {0}" -f $longPaths)
+    Write-Host ("  Backup/temp files:    {0} (older than 180 days: {1})" -f $backupFiles, $oldBackups)
+    Write-Host ("  Large files (>500MB): {0} ({1} GB)" -f $largeFiles, [math]::Round($largeBytes/1GB, 2))
+    Write-Host ""
+
+    $penalty = 0
+    if ($longPaths -gt 0)      { $penalty += [math]::Min(25, $longPaths) }
+    if ($oldBackups -gt 5)     { $penalty += [math]::Min(15, [int]($oldBackups / 5)) }
+    if ($largeFiles -gt 10)    { $penalty += [math]::Min(15, [int]($largeFiles / 5)) }
+
+    Write-Host "  Top file types:" -ForegroundColor Cyan
+    $byExt.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object {
+        Write-Host ("    {0,-14} {1,6}" -f $_.Key, $_.Value)
+    }
+
+    # ---- XREF / reference scan ----
+    $dwgFiles = @($scan | Where-Object { $_.Extension -in @('.dwg','.dxf') })
+    $maxDwg = 200
+    if ($dwgFiles.Count -gt $maxDwg) {
+        Write-Host "  (limiting reference scan to first $maxDwg drawings)" -ForegroundColor Yellow
+        $dwgFiles = $dwgFiles | Select-Object -First $maxDwg
+    }
+
+    $refTotal = 0
+    $refMissing = 0
+    $refMissingList = @()
+
+    if ($dwgFiles.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Scanning drawing references..." -ForegroundColor Cyan
+        foreach ($dwg in $dwgFiles) {
+            $refs = Get-DwgReferences -FilePath $dwg.FullName
+            foreach ($r in $refs) {
+                $refTotal++
+                $p = $r.Path -replace '/', '\'
+                if (-not [System.IO.Path]::IsPathRooted($p)) {
+                    $p = Join-Path $dwg.DirectoryName $p
+                }
+                if (-not (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) {
+                    $refMissing++
+                    $refMissingList += [pscustomobject]@{
+                        Drawing = $dwg.FullName
+                        Type    = $r.Type
+                        Ref     = $r.Path
+                    }
+                }
+            }
+        }
+        Write-Host ("    References found:   {0}" -f $refTotal)
+        Write-Host ("    Missing / broken:   {0}" -f $refMissing) -ForegroundColor $(if ($refMissing -gt 0) { 'Yellow' } else { 'Green' })
+    }
+
+    if ($refTotal -gt 0) {
+        $missRatio = $refMissing / $refTotal
+        $penalty += [math]::Min(30, [int]($missRatio * 100))
+    }
+
+    $health = [math]::Max(0, 100 - $penalty)
+    $col = if ($health -ge 80) { 'Green' } elseif ($health -ge 60) { 'Yellow' } else { 'Red' }
+    Write-Host ""
+    Write-Host ("  Project Health: {0}%" -f $health) -ForegroundColor $col
+    Write-Host ""
+
+    return [pscustomobject]@{
+        Root             = $Root
+        TotalFiles       = $scan.Count
+        TotalGB          = [math]::Round($totalBytes/1GB, 2)
+        EngineeringFiles = $engFiles
+        LongPaths        = $longPaths
+        BackupFiles      = $backupFiles
+        OldBackups       = $oldBackups
+        LargeFiles       = $largeFiles
+        LargeGB          = [math]::Round($largeBytes/1GB, 2)
+        ByExtension      = $byExt
+        RefTotal         = $refTotal
+        RefMissing       = $refMissing
+        RefMissingList   = $refMissingList
+        Health           = $health
+    }
+}
+
+$guardian = $null
+if ($ProjectGuardian) {
+    $guardian = Invoke-ProjectGuardian -Root $ProjectGuardian
+    if ($guardian) {
+        $score.Categories['ProjectSafety'] = $guardian.Health
+        $weights = @{
+            Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
+            GPU = 0.08; Drivers = 0.10; Licensing = 0.07
+            Windows = 0.05; Thermals = 0.05; Network = 0.05; ProjectSafety = 0.05
+        }
+        $recalc = 0
+        foreach ($k in $score.Categories.Keys) {
+            $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
+            $recalc += $score.Categories[$k] * $w
+        }
+        $score.Overall = [int][math]::Round($recalc)
+    }
+}
+
+# =============================================================================
+# 10. WRITE REPORT
+# =============================================================================
 Write-Stage "Writing report (HTML / JSON / CSV)..."
 Ensure-Folder $exportPath
 
 [pscustomobject]@{
-    GeneratedAt = (Get-Date).ToString('s')
-    System      = $sys
-    NetFx       = $netFx
-    VCRedist    = $vc
-    Results     = $allResults
-} | ConvertTo-Json -Depth 8 | Set-Content "$reportBase.json" -Encoding UTF8
+    GeneratedAt   = (Get-Date).ToString('s')
+    System        = $sys
+    NetFx         = $netFx
+    VCRedist      = $vc
+    Score         = $score
+    WindowsHealth = $windowsHealth
+    NetworkHealth = $networkHealth
+    LiveGpu       = $liveGpu
+    Guardian      = $guardian
+    Results       = $allResults
+} | ConvertTo-Json -Depth 12 | Set-Content "$reportBase.json" -Encoding UTF8
 
 $allResults | Select-Object Name, Disciplines, Kind, State, Version, Installed,
-                              @{n='Issues';e={$_.Issues -join ' | '}},
-                              @{n='Notes'; e={$_.Notes  -join ' | '}} |
+    @{n='Findings';e={ ($_.Findings | ForEach-Object { "$($_.Severity): $($_.Problem)" }) -join ' | ' }},
+    @{n='Notes';   e={ $_.Notes -join ' | ' }} |
     Export-Csv "$reportBase.csv" -NoTypeInformation -Encoding UTF8
 
-$style = @"
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+$style = @'
 <style>
  body{font-family:'Segoe UI',Arial,sans-serif;margin:24px;color:#1a1a1a;background:#f7f8fa}
  h1{color:#0b5394;margin-bottom:4px}
- h2{color:#0b5394;margin-top:28px;border-bottom:2px solid #dde3ec;padding-bottom:4px}
+ h2{color:#0b5394;margin-top:32px;border-bottom:2px solid #dde3ec;padding-bottom:4px}
  h3{color:#222;margin-top:20px}
  .sub{color:#555;font-size:12px;margin-top:0}
  .card{background:#fff;border:1px solid #e0e4ea;border-radius:8px;padding:14px 18px;margin:10px 0;box-shadow:0 1px 2px rgba(0,0,0,.03)}
@@ -727,82 +1814,267 @@ $style = @"
  th{background:#eef2f8}
  tr:nth-child(even) td{background:#fafbfd}
  .chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;color:#fff}
- .green{background:#1c9b4b}.yellow{background:#d18b00}.red{background:#c23636}
+ .chip.green{background:#1c9b4b}.chip.yellow{background:#d18b00}.chip.red{background:#c23636}
+ .chip.gray{background:#8b95a5}.chip.darkgray{background:#4a5568}.chip.blue{background:#2b6cb0}
  .small{font-size:12px;color:#666}
  .disc{border-left:4px solid #0b5394;padding-left:10px;margin-top:22px}
+
+ .hero{background:linear-gradient(135deg,#0b5394,#0a3d6e);color:#fff;border-radius:12px;padding:28px 24px;margin:10px 0 20px 0;text-align:center;box-shadow:0 6px 20px rgba(11,83,148,.25)}
+ .hero-num{font-size:64px;font-weight:800;line-height:1;letter-spacing:-2px}
+ .hero-num span{font-size:22px;font-weight:400;opacity:.55}
+ .hero-label{font-size:13px;text-transform:uppercase;letter-spacing:3px;opacity:.85;margin-top:6px}
+ .hero-cats{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;margin-top:22px}
+ .hero-cats > div{background:rgba(255,255,255,.12);padding:10px 14px;border-radius:8px;min-width:100px}
+ .hero-cats b{display:block;font-size:20px;font-weight:700}
+ .hero-cats span{font-size:10px;text-transform:uppercase;letter-spacing:1px;opacity:.8}
+
+ .finding{background:#fff;border-left:5px solid #8b95a5;border-radius:6px;padding:14px 18px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+ .finding.sev-critical{border-left-color:#c23636}
+ .finding.sev-warn{border-left-color:#d18b00}
+ .finding-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px}
+ .finding-title{font-weight:600;font-size:14px}
+ .finding-body{width:100%;border:none;font-size:12px;margin:0}
+ .finding-body th{background:transparent;border:none;color:#8b95a5;text-transform:uppercase;font-size:10px;letter-spacing:1.2px;width:150px;padding:3px 12px 3px 0;vertical-align:top;font-weight:700}
+ .finding-body td{border:none;padding:3px 0}
+
+ .legend{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px 0}
+ .legend .chip{font-size:12px;padding:4px 10px}
 </style>
-"@
+'@
+
+$chipClass = @{
+    'Healthy'       = 'green'
+    'Attention'     = 'yellow'
+    'Critical'      = 'red'
+    'NotInstalled'  = 'gray'
+    'NotApplicable' = 'darkgray'
+    'Unknown'       = 'blue'
+}
+
 $sb = New-Object System.Text.StringBuilder
-[void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Engineer Toolkit — Report</title>$style</head><body>")
+[void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Engineer Toolkit - Report</title>$style</head><body>")
 [void]$sb.AppendLine("<h1>Sigma Engineer Toolkit</h1>")
 [void]$sb.AppendLine("<p class='sub'>Generated $(Get-Date) on $($sys.ComputerName) by $($sys.User)</p>")
 
-[void]$sb.AppendLine("<div class='card'><h3>Machine</h3><table>")
+# Hero
+[void]$sb.AppendLine("<div class='hero'>")
+[void]$sb.AppendLine("<div class='hero-num'>$($score.Overall)<span>/100</span></div>")
+[void]$sb.AppendLine("<div class='hero-label'>Sigma Engineering Score</div>")
+[void]$sb.AppendLine("<div class='hero-cats'>")
+foreach ($k in $score.Categories.Keys) {
+    [void]$sb.AppendLine("<div><b>$($score.Categories[$k])</b><span>$k</span></div>")
+}
+[void]$sb.AppendLine("</div></div>")
+
+# Legend
+[void]$sb.AppendLine("<h2>Legend</h2>")
+[void]$sb.AppendLine("<div class='legend'>")
+[void]$sb.AppendLine("<span class='chip green'>Healthy</span>")
+[void]$sb.AppendLine("<span class='chip yellow'>Attention</span>")
+[void]$sb.AppendLine("<span class='chip red'>Critical</span>")
+[void]$sb.AppendLine("<span class='chip gray'>Not installed</span>")
+[void]$sb.AppendLine("<span class='chip darkgray'>Not applicable</span>")
+[void]$sb.AppendLine("<span class='chip blue'>Unknown</span>")
+[void]$sb.AppendLine("</div>")
+
+# Findings
+$topFindings = @()
+foreach ($r in $allResults) {
+    foreach ($f in $r.Findings) { $topFindings += $f }
+}
+$topFindings = @($topFindings | Sort-Object @{e={ if ($_.Severity -eq 'critical') { 0 } else { 1 } }}, Id)
+
+[void]$sb.AppendLine("<h2>Findings ($($topFindings.Count))</h2>")
+if ($topFindings.Count -eq 0) {
+    [void]$sb.AppendLine("<div class='card'>No findings. Everything detected is healthy.</div>")
+} else {
+    foreach ($f in $topFindings) {
+        $sevCls = if ($f.Severity -eq 'critical') { 'sev-critical' } else { 'sev-warn' }
+        $chipCls = if ($f.Severity -eq 'critical') { 'red' } else { 'yellow' }
+        $chipTxt = if ($f.Severity -eq 'critical') { 'CRITICAL' } else { 'ATTENTION' }
+        [void]$sb.AppendLine("<div class='finding $sevCls'>")
+        [void]$sb.AppendLine("<div class='finding-head'><span class='finding-title'>$($f.Problem)</span><span class='chip $chipCls'>$chipTxt</span></div>")
+        [void]$sb.AppendLine("<table class='finding-body'>")
+        [void]$sb.AppendLine("<tr><th>Software</th><td>$($f.Software)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Detected</th><td>$($f.Detected)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Why it matters</th><td>$($f.WhyItMatters)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Recommended</th><td>$($f.Recommendation)</td></tr>")
+        if ($f.Optional) {
+            [void]$sb.AppendLine("<tr><th>Optional</th><td>$($f.Optional)</td></tr>")
+        }
+        [void]$sb.AppendLine("</table></div>")
+    }
+}
+
+# Machine
+[void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
 foreach ($kv in @(
-    @('OS',$sys.OS), @('Architecture',$sys.Arch),
-    @('CPU',"$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T)"),
-    @('RAM',"$($sys.RAM_GB) GB (free $($sys.FreeRAM_GB) GB)"),
-    @('.NET Framework',$netFx),
+    @('OS', $sys.OS), @('Architecture', $sys.Arch),
+    @('CPU', "$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T)"),
+    @('RAM', "$($sys.RAM_GB) GB (free $($sys.FreeRAM_GB) GB)"),
+    @('.NET Framework', $netFx),
     @('VC++ Redistributables', $vc.Count),
     @('PowerShell', $PSVersionTable.PSVersion.ToString()),
-    @('Admin', $sys.IsAdmin)
-)) { [void]$sb.AppendLine("<tr><th style='width:220px'>$($kv[0])</th><td>$($kv[1])</td></tr>") }
-[void]$sb.AppendLine("</table></div>")
-
-[void]$sb.AppendLine("<div class='card'><h3>Graphics</h3><table><tr><th>GPU</th><th>Driver</th><th>Date</th><th>VRAM (GB)</th></tr>")
-foreach ($g in $sys.GPUs) {
-    [void]$sb.AppendLine("<tr><td>$($g.Name)</td><td>$($g.DriverVersion)</td><td>$($g.DriverDate)</td><td>$($g.VRAM_GB)</td></tr>")
+    @('Admin', $sys.IsAdmin),
+    @('Power', $sys.Power.StatusText),
+    @('Discrete GPU', $sys.HasDiscreteGPU)
+)) {
+    [void]$sb.AppendLine("<tr><th style='width:220px'>$($kv[0])</th><td>$($kv[1])</td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
 
-[void]$sb.AppendLine("<div class='card'><h3>Disks</h3><table><tr><th>Drive</th><th>Label</th><th>FS</th><th>Size GB</th><th>Free GB</th><th>Free %</th></tr>")
+# Graphics
+[void]$sb.AppendLine("<h2>Graphics</h2><div class='card'><table><tr><th>GPU</th><th>Kind</th><th>Driver</th><th>Date</th><th>VRAM (GB)</th></tr>")
+foreach ($g in $sys.GPUs) {
+    [void]$sb.AppendLine("<tr><td>$($g.Name)</td><td>$($g.Kind)</td><td>$($g.DriverVersion)</td><td>$($g.DriverDate)</td><td>$($g.VRAM_GB)</td></tr>")
+}
+[void]$sb.AppendLine("</table></div>")
+
+# Live GPU sample
+if ($LiveGpu -and $LiveGpu.Count -gt 0) {
+    [void]$sb.AppendLine("<h2>Live GPU Sample</h2><div class='card'><table><tr><th>PID</th><th>Process</th><th>GPU %</th></tr>")
+    foreach ($g in $LiveGpu) {
+        [void]$sb.AppendLine("<tr><td>$($g.Pid)</td><td>$($g.Process)</td><td>$($g.GPU)%</td></tr>")
+    }
+    [void]$sb.AppendLine("</table></div>")
+}
+
+# Disks
+[void]$sb.AppendLine("<h2>Disks</h2><div class='card'><table><tr><th>Drive</th><th>Label</th><th>FS</th><th>Size GB</th><th>Free GB</th><th>Free %</th></tr>")
 foreach ($d in $sys.Disks) {
-    $cls = if ($d.FreePct -lt 10) {'red'} elseif ($d.FreePct -lt 20) {'yellow'} else {'green'}
+    $cls = if ($d.FreePct -lt 10) { 'red' } elseif ($d.FreePct -lt 20) { 'yellow' } else { 'green' }
     [void]$sb.AppendLine("<tr><td>$($d.Drive)</td><td>$($d.Label)</td><td>$($d.FS)</td><td>$($d.SizeGB)</td><td>$($d.FreeGB)</td><td><span class='chip $cls'>$($d.FreePct)%</span></td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
 
-$green = @($allResults | Where-Object State -eq 'Green').Count
-$yell  = @($allResults | Where-Object State -eq 'Yellow').Count
-$red   = @($allResults | Where-Object State -eq 'Red').Count
-$total = $allResults.Count
-[void]$sb.AppendLine("<h2>Overall</h2><div class='card'>")
-[void]$sb.AppendLine("<p><span class='chip green'>$green green</span> &nbsp; <span class='chip yellow'>$yell yellow</span> &nbsp; <span class='chip red'>$red red</span> &nbsp; of $total checked</p></div>")
+# Windows Health
+[void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
+$rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
+[void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
+[void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$($windowsHealth.UpdateService)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Defender</th><td>$($windowsHealth.Defender)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Activation</th><td>$($windowsHealth.Activation)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Build age</th><td>$($windowsHealth.BuildAgeDays) days</td></tr>")
+[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$($windowsHealth.Score)/100</b></td></tr>")
+[void]$sb.AppendLine("</table></div>")
 
+# Power
+[void]$sb.AppendLine("<h2>Power</h2><div class='card'><table>")
+[void]$sb.AppendLine("<tr><th style='width:220px'>Has battery</th><td>$($sys.Power.HasBattery)</td></tr>")
+$acChip = if ($sys.Power.OnAC) { 'Yes' } else { "<span class='chip yellow'>No</span>" }
+[void]$sb.AppendLine("<tr><th>On AC power</th><td>$acChip</td></tr>")
+if ($sys.Power.Percent -ne $null) {
+    [void]$sb.AppendLine("<tr><th>Charge</th><td>$($sys.Power.Percent)%</td></tr>")
+}
+[void]$sb.AppendLine("<tr><th>Status</th><td>$($sys.Power.StatusText)</td></tr>")
+[void]$sb.AppendLine("</table></div>")
+
+# Thermals
+if ($sys.ThermalZones.Count -gt 0) {
+    [void]$sb.AppendLine("<h2>Thermals</h2><div class='card'><table><tr><th>Zone</th><th>Temperature</th></tr>")
+    foreach ($z in $sys.ThermalZones) {
+        $cls = if ($z.Celsius -lt 70) { 'green' } elseif ($z.Celsius -lt 85) { 'yellow' } else { 'red' }
+        [void]$sb.AppendLine("<tr><td>$($z.Zone)</td><td><span class='chip $cls'>$($z.Celsius) C</span></td></tr>")
+    }
+    [void]$sb.AppendLine("</table></div>")
+}
+
+# Network
+[void]$sb.AppendLine("<h2>Network</h2><div class='card'><table>")
+[void]$sb.AppendLine("<tr><th style='width:220px'>Link speed</th><td>$($networkHealth.LinkSpeedText)</td></tr>")
+$dnsChip = if ($networkHealth.DNS -eq 'OK') { "<span class='chip green'>OK</span>" } else { "<span class='chip red'>$($networkHealth.DNS)</span>" }
+[void]$sb.AppendLine("<tr><th>DNS</th><td>$dnsChip</td></tr>")
+[void]$sb.AppendLine("<tr><th>Default gateway</th><td>$($networkHealth.DefaultGW)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$($networkHealth.Score)/100</b></td></tr>")
+[void]$sb.AppendLine("</table>")
+if ($networkHealth.Adapters.Count -gt 0) {
+    [void]$sb.AppendLine("<h3 style='margin-top:16px'>Adapters</h3>")
+    [void]$sb.AppendLine("<table><tr><th>Name</th><th>Link speed</th><th>MAC</th></tr>")
+    foreach ($a in $networkHealth.Adapters) {
+        [void]$sb.AppendLine("<tr><td>$($a.Name)</td><td>$($a.LinkSpeed)</td><td>$($a.Mac)</td></tr>")
+    }
+    [void]$sb.AppendLine("</table>")
+}
+[void]$sb.AppendLine("</div>")
+
+# License Center
+if ($networkHealth.License.Count -gt 0) {
+    [void]$sb.AppendLine("<h2>License Center</h2><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th>Product</th><th>Ports</th><th>Local</th></tr>")
+    foreach ($l in $networkHealth.License) {
+        $chip = if ($l.Local) { "<span class='chip green'>OPEN</span>" } else { "<span class='chip gray'>CLOSED</span>" }
+        [void]$sb.AppendLine("<tr><td>$($l.Product)</td><td>$($l.Ports)</td><td>$chip</td></tr>")
+    }
+    [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers.</p></div>")
+}
+
+# Guardian
+if ($guardian) {
+    [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'>")
+    [void]$sb.AppendLine("<p><b>$($guardian.Root)</b></p>")
+    [void]$sb.AppendLine("<table>")
+    [void]$sb.AppendLine("<tr><th style='width:220px'>Total files</th><td>$($guardian.TotalFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Total size</th><td>$($guardian.TotalGB) GB</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Engineering files</th><td>$($guardian.EngineeringFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Long paths</th><td>$($guardian.LongPaths)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Backup/temp files</th><td>$($guardian.BackupFiles) (old: $($guardian.OldBackups))</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Large files</th><td>$($guardian.LargeFiles) ($($guardian.LargeGB) GB)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>References scanned</th><td>$($guardian.RefTotal)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Broken references</th><td>$($guardian.RefMissing)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Project Health</th><td><b>$($guardian.Health)%</b></td></tr>")
+    [void]$sb.AppendLine("</table>")
+    if ($guardian.RefMissingList -and $guardian.RefMissingList.Count -gt 0) {
+        [void]$sb.AppendLine("<h3 style='margin-top:16px'>Broken references (first 50)</h3>")
+        [void]$sb.AppendLine("<table><tr><th>Drawing</th><th>Type</th><th>Reference</th></tr>")
+        foreach ($ref in ($guardian.RefMissingList | Select-Object -First 50)) {
+            [void]$sb.AppendLine("<tr><td class='small'>$($ref.Drawing)</td><td>$($ref.Type)</td><td class='small'>$($ref.Ref)</td></tr>")
+        }
+        [void]$sb.AppendLine("</table>")
+    }
+    [void]$sb.AppendLine("</div>")
+}
+
+# Overall
+[void]$sb.AppendLine("<h2>Overall</h2><div class='card'>")
+[void]$sb.AppendLine("<p><span class='chip green'>$gCount healthy</span> &nbsp; <span class='chip yellow'>$yCount attention</span> &nbsp; <span class='chip red'>$rCount critical</span> &nbsp; <span class='chip gray'>$nCount not installed</span> &nbsp; <span class='chip darkgray'>$aCount not applicable</span></p>")
+[void]$sb.AppendLine("</div>")
+
+# Disciplines
 [void]$sb.AppendLine("<h2>Disciplines</h2>")
 foreach ($d in $byDisc.Keys | Sort-Object) {
     $rs = $byDisc[$d] | Sort-Object State, Name
-    $g  = @($rs | Where-Object State -eq 'Green').Count
-    $y  = @($rs | Where-Object State -eq 'Yellow').Count
-    $rr = @($rs | Where-Object State -eq 'Red').Count
-    [void]$sb.AppendLine("<div class='disc'><h3>$d <span class='small'>($g green / $y yellow / $rr red)</span></h3>")
-    [void]$sb.AppendLine("<table><tr><th>Software</th><th>Kind</th><th>Status</th><th>Version</th><th>Issues / Notes</th></tr>")
+    $g  = @($rs | Where-Object State -eq 'Healthy').Count
+    $y  = @($rs | Where-Object State -eq 'Attention').Count
+    $rr = @($rs | Where-Object State -eq 'Critical').Count
+    [void]$sb.AppendLine("<div class='disc'><h3>$d <span class='small'>($g healthy / $y attention / $rr critical)</span></h3>")
+    [void]$sb.AppendLine("<table><tr><th>Software</th><th>Kind</th><th>Status</th><th>Version</th><th>Findings</th></tr>")
     foreach ($p in $rs) {
-        $cls = switch ($p.State) { 'Green'{'green'} 'Yellow'{'yellow'} default {'red'} }
+        $cls = if ($chipClass.ContainsKey($p.State)) { $chipClass[$p.State] } else { 'gray' }
         $msg = @()
-        foreach ($i in $p.Issues) { $msg += "! $i" }
-        foreach ($n in $p.Notes ) { $msg += ". $n" }
+        foreach ($f in $p.Findings) {
+            $mark = if ($f.Severity -eq 'critical') { '!!' } else { '!' }
+            $msg += "$mark $($f.Problem)"
+        }
+        foreach ($n in $p.Notes) { $msg += ". $n" }
         $msg = $msg -join '<br>'
         [void]$sb.AppendLine("<tr><td><b>$($p.Name)</b></td><td>$($p.Kind)</td><td><span class='chip $cls'>$($p.State)</span></td><td>$($p.Version)</td><td class='small'>$msg</td></tr>")
     }
     [void]$sb.AppendLine("</table></div>")
 }
 
-[void]$sb.AppendLine("<p class='small'>End of report. Yellows and reds are advisory, not errors.</p>")
+[void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors.</p>")
 [void]$sb.AppendLine("</body></html>")
 $sb.ToString() | Set-Content "$reportBase.html" -Encoding UTF8
 Write-Ok
 
-# -----------------------------------------------------------------------------
-# 9. Final commit
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 11. FINAL
+# =============================================================================
 Write-Stage "Finalising..."
 $null = Get-Item "$reportBase.html" -ErrorAction SilentlyContinue
 Write-Ok
 
-# -----------------------------------------------------------------------------
-# 10. Error summary
-# -----------------------------------------------------------------------------
 Write-Host ""
 if (Test-Path $errorLog) {
     $errorCount = (Get-Content $errorLog | Measure-Object -Line).Lines
@@ -821,11 +2093,9 @@ Write-Host ""
 Write-Host "Have a good day!" -ForegroundColor Cyan
 Write-Host ""
 
-# -----------------------------------------------------------------------------
-# 11. Final prompt
-# -----------------------------------------------------------------------------
-$finalChoice = Read-Host "Press R to open the report folder, or Q to quit"
+if ($NonInteractive) { exit 0 }
 
+$finalChoice = Read-Host "Press R to open the report folder, or Q to quit"
 if ($finalChoice -eq "R" -or $finalChoice -eq "r") {
     Start-Process $exportPath
 } else {
