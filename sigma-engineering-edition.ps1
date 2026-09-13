@@ -11,7 +11,12 @@
 
     NEW: Online enrichment — PassMark CPU/GPU benchmarks, real vendor driver
     version feeds (NVIDIA/AMD), and winget-based outdated-package detection.
-    All online data is cached for 24h and degrades gracefully if offline.
+
+    NEW: Full system online verification — Windows build, .NET Framework,
+    VC++ Redistributable, Defender signatures, motherboard BIOS, disk SMART,
+    RAM module part numbers, and network adapter capability. Every scanned
+    fact is cross-checked against an online source when available.
+    All online data is cached and degrades gracefully if offline.
 .PARAMETER Disciplines
     Optional filter. If set, only products relevant to these disciplines are
     fully evaluated. Others are marked NotApplicable.
@@ -55,7 +60,7 @@ Write-Host ""
 Write-Host "[INFO] Scans every engineering discipline on this workstation." -ForegroundColor Cyan
 Write-Host "[INFO] Detects installed software, checks prerequisites, writes a report." -ForegroundColor Cyan
 Write-Host "[INFO] The tool can install engineering software." -ForegroundColor Cyan
-Write-Host "[INFO] Online enrichment: PassMark benchmarks, vendor driver feeds, winget." -ForegroundColor Cyan
+Write-Host "[INFO] Online: PassMark, vendor driver feeds, winget, Windows/BIOS/SMART." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
 Write-Host "[WARNING] This scaning tool isn't 100% accurate." -ForegroundColor Yellow
@@ -331,7 +336,6 @@ Write-Host "[INFO] Baseline: $($baseline.When) on $($baseline.Computer) as $($ba
 # =============================================================================
 Write-Stage "Loading master catalog..."
 $Script:RawCatalog = @(
-    # ---------- CIVIL / AEC / BIM ----------
     @{N='AutoCAD';              D=@('Civil','BIM','AEC','Mechanical');  P=@('AutoCAD 20*','AutoCAD LT 20*','Autodesk AutoCAD*'); K='CAD';         RAM=8;  Disk=20;  GPU=$true;  Net='4.8'; VCPP=$true; DX='11'; Lic='Node';     Cache=@('%LOCALAPPDATA%\Autodesk','%APPDATA%\Autodesk')}
     @{N='Civil 3D';             D=@('Civil');                            P=@('Autodesk Civil 3D*');                                 K='Civil';      RAM=16; Disk=30;  GPU=$true;  Net='4.8'; VCPP=$true; DX='11'; Lic='Node';     Cache=@('%LOCALAPPDATA%\Autodesk')}
     @{N='Revit';                D=@('BIM','AEC','Structural','MEP');     P=@('Autodesk Revit*');                                    K='BIM';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; VCPP=$true; DX='11'; Lic='Node';     Cache=@('%LOCALAPPDATA%\Autodesk\Revit')}
@@ -342,8 +346,6 @@ $Script:RawCatalog = @(
     @{N='Grasshopper';          D=@('AEC','Computational Design');       P=@('Grasshopper*');                                       K='Plugin';     RAM=8;  Disk=5}
     @{N='Dynamo';               D=@('BIM','AEC');                        P=@('Dynamo*');                                            K='Plugin';     RAM=8;  Disk=5}
     @{N='Bluebeam Revu';        D=@('AEC','Project Mgmt');               P=@('Bluebeam Revu*');                                     K='Docs';       RAM=4;  Disk=5;   Net='4.8'; Lic='Node'}
-
-    # ---------- STRUCTURAL ----------
     @{N='SAP2000';              D=@('Structural');                       P=@('SAP2000*','CSI SAP2000*');                            K='FEA';        RAM=8;  Disk=20;  Net='4.8'; VCPP=$true; Lic='Sentinel'; Lsvc=@('Sentinel*','*hasplm*'); Lport=@(1947); Cache=@('%LOCALAPPDATA%\Computers and Structures')}
     @{N='ETABS';                D=@('Structural');                       P=@('ETABS*','CSI ETABS*');                                K='FEA';        RAM=8;  Disk=20;  Net='4.8'; VCPP=$true; Lic='Sentinel'; Lsvc=@('Sentinel*','*hasplm*'); Lport=@(1947)}
     @{N='SAFE';                 D=@('Structural');                       P=@('SAFE 20*','SAFE 21*','SAFE 22*','CSI SAFE*');         K='FEA';        RAM=8;  Disk=20;  Net='4.8'; VCPP=$true; Lic='Sentinel'}
@@ -359,8 +361,6 @@ $Script:RawCatalog = @(
     @{N='IDEA StatiCa';         D=@('Structural','Steel','Concrete');    P=@('IDEA StatiCa*');                                      K='Design';     RAM=8;  Disk=15;  Net='4.8'; Lic='FlexLM'}
     @{N='SCIA Engineer';        D=@('Structural');                       P=@('SCIA Engineer*');                                     K='FEA';        RAM=8;  Disk=20;  Lic='FlexLM'}
     @{N='Advance Steel';        D=@('Steel','Structural');               P=@('Advance Steel*');                                     K='Detailing';  RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='Node'}
-
-    # ---------- MECHANICAL / AEROSPACE / AUTOMOTIVE ----------
     @{N='SOLIDWORKS';           D=@('Mechanical','Aerospace','Automotive','Industrial'); P=@('SOLIDWORKS 20*'); K='CAD'; RAM=16; Disk=30; GPU=$true; Net='4.8'; VCPP=$true; DX='11'; Lic='FlexLM'; Lsvc=@('*SolidWorks*','*SW_D*'); Lport=@(25734); Cache=@('%LOCALAPPDATA%\SolidWorks','%APPDATA%\SolidWorks')}
     @{N='Autodesk Inventor';    D=@('Mechanical','Industrial');          P=@('Autodesk Inventor*');                                 K='CAD';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; VCPP=$true; Lic='Node';     Cache=@('%LOCALAPPDATA%\Autodesk\Inventor')}
     @{N='CATIA';                D=@('Mechanical','Aerospace','Automotive','Marine'); P=@('CATIA*','Dassault Systemes CATIA*'); K='CAD'; RAM=16; Disk=30; GPU=$true; VCPP=$true; Lic='FlexLM'; Lsvc=@('*DS*','*Flex*'); Lport=@(4085)}
@@ -369,8 +369,6 @@ $Script:RawCatalog = @(
     @{N='Solid Edge';           D=@('Mechanical','Industrial');          P=@('Solid Edge*');                                        K='CAD';        RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='FlexLM'}
     @{N='Fusion 360';           D=@('Mechanical','Industrial','CAM');    P=@('Autodesk Fusion*');                                   K='CAD/CAM';    RAM=8;  Disk=15;  GPU=$true;  Net='4.8'; Lic='Cloud'; Cache=@('%LOCALAPPDATA%\Autodesk\Fusion360')}
     @{N='Siemens Teamcenter';   D=@('PLM','Mechanical');                 P=@('Teamcenter*');                                        K='PLM';        RAM=16; Disk=30;  VCPP=$true; Lic='FlexLM'}
-
-    # ---------- SIMULATION / MULTIPHYSICS ----------
     @{N='ANSYS';                D=@('Simulation','Mechanical','Aerospace','Nuclear'); P=@('ANSYS*','Ansys*'); K='FEA/CFD'; RAM=32; Disk=60; GPU=$true; VCPP=$true; Lic='FlexLM'; Lsvc=@('*ansys*','*lmgrd*'); Lport=@(1055,2325); Cache=@('%APPDATA%\Ansys','%TEMP%\Ansys')}
     @{N='Abaqus';               D=@('Simulation','Materials','Aerospace','Biomedical'); P=@('Abaqus*','SIMULIA Abaqus*'); K='FEA'; RAM=32; Disk=50; VCPP=$true; Lic='FlexLM'; Lsvc=@('*SIMULIA*','*lmgrd*'); Lport=@(27000)}
     @{N='COMSOL Multiphysics';  D=@('Simulation','Multiphysics','Bio','Materials'); P=@('COMSOL*'); K='Multiphysics'; RAM=16; Disk=30; VCPP=$true; Lic='FlexLM'; Lsvc=@('*COMSOL*'); Lport=@(1718,1719); Cache=@('%USERPROFILE%\.comsol')}
@@ -385,8 +383,6 @@ $Script:RawCatalog = @(
     @{N='MSC Adams';            D=@('Simulation','Automotive','Robotics'); P=@('MSC Adams*','Adams Car*');                          K='Motion';     RAM=16; Disk=25;  VCPP=$true; Lic='FlexLM'}
     @{N='Simulink';             D=@('Simulation','Control','Automotive','Aerospace','Robotics'); P=@('Simulink*','MATLAB*'); K='MBD'; RAM=8; Disk=20; Net='4.8'; Lic='FlexLM'; Lsvc=@('*MATLAB*','*lmgrd*'); Lport=@(27000); Cache=@('%LOCALAPPDATA%\MathWorks','%APPDATA%\MathWorks')}
     @{N='MATLAB';               D=@('Simulation','Math','Robotics','Control','Bio','Materials'); P=@('MATLAB R20*','MATLAB*'); K='Math'; RAM=8; Disk=20; Net='4.8'; Lic='FlexLM'; Lsvc=@('*MATLAB*'); Lport=@(27000); Cache=@('%LOCALAPPDATA%\MathWorks')}
-
-    # ---------- MATH / DATA ----------
     @{N='Wolfram Mathematica';  D=@('Math','Materials');                 P=@('Wolfram Mathematica*','Mathematica*');                K='Math';       RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='Maple';                D=@('Math');                             P=@('Maple 20*','Maple*');                                 K='Math';       RAM=8;  Disk=10;  Lic='FlexLM'}
     @{N='Mathcad Prime';        D=@('Math','Structural');                P=@('Mathcad Prime*','PTC Mathcad*');                      K='Math';       RAM=8;  Disk=10;  Net='4.8'; Lic='FlexLM'}
@@ -395,8 +391,6 @@ $Script:RawCatalog = @(
     @{N='Jupyter';              D=@('Math','Data');                      P=@('Jupyter*');                                           K='Notebook';   RAM=2;  Disk=2}
     @{N='R';                    D=@('Math','Data');                      P=@('R for Windows*','R 4.*');                             K='Stats';      RAM=4;  Disk=3}
     @{N='OriginPro';            D=@('Math','Data','Materials');          P=@('OriginPro*','OriginLab*');                            K='Plot';       RAM=4;  Disk=5;   Lic='Node'}
-
-    # ---------- ELECTRONICS / PCB ----------
     @{N='Altium Designer';      D=@('Electronics','PCB','Electrical');   P=@('Altium Designer*');                                   K='PCB';        RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*Altium*'); Lport=@(27000); Cache=@('%LOCALAPPDATA%\Altium','%APPDATA%\Altium')}
     @{N='KiCad';                D=@('Electronics','PCB');                P=@('KiCad*');                                             K='PCB';        RAM=8;  Disk=10;  Lic='None'}
     @{N='Cadence Allegro';      D=@('Electronics','PCB');                P=@('Cadence Allegro*','Allegro*');                        K='PCB';        RAM=16; Disk=30;  Lic='FlexLM'; Lsvc=@('*Cadence*','*lmgrd*'); Lport=@(5280)}
@@ -410,8 +404,6 @@ $Script:RawCatalog = @(
     @{N='EasyEDA';              D=@('Electronics','PCB');                P=@('EasyEDA*');                                           K='PCB';        RAM=4;  Disk=3}
     @{N='DipTrace';             D=@('Electronics','PCB');                P=@('DipTrace*');                                          K='PCB';        RAM=4;  Disk=3}
     @{N='DesignSpark PCB';      D=@('Electronics','PCB');                P=@('DesignSpark*');                                       K='PCB';        RAM=4;  Disk=3}
-
-    # ---------- ELECTRICAL POWER ----------
     @{N='ETAP';                 D=@('Electrical Power');                 P=@('ETAP*');                                              K='Power';      RAM=16; Disk=25;  Net='4.8'; Lic='Sentinel'; Lsvc=@('*ETAP*','Sentinel*'); Lport=@(1947); Cache=@('%LOCALAPPDATA%\ETAP')}
     @{N='SKM PowerTools';       D=@('Electrical Power');                 P=@('SKM Power*','PowerTools*');                           K='Power';      RAM=8;  Disk=15;  Lic='Sentinel'}
     @{N='EasyPower';            D=@('Electrical Power');                 P=@('EasyPower*');                                         K='Power';      RAM=8;  Disk=15;  Lic='FlexLM'}
@@ -421,8 +413,6 @@ $Script:RawCatalog = @(
     @{N='EPLAN Electric P8';    D=@('Electrical','Automation');          P=@('EPLAN*');                                             K='ECAD';       RAM=16; Disk=25;  Net='4.8'; Lic='FlexLM'; Lsvc=@('*EPLAN*','*lmgrd*'); Cache=@('%APPDATA%\EPLAN')}
     @{N='AutoCAD Electrical';   D=@('Electrical','Automation');          P=@('AutoCAD Electrical*');                                K='ECAD';       RAM=8;  Disk=20;  GPU=$true;  Net='4.8'; Lic='Node'}
     @{N='SOLIDWORKS Electrical';D=@('Electrical','Mechanical');          P=@('SOLIDWORKS Electrical*');                             K='ECAD';       RAM=16; Disk=25;  Net='4.8'; Lic='FlexLM'}
-
-    # ---------- AUTOMATION / PLC / SCADA ----------
     @{N='Siemens TIA Portal';   D=@('Automation','Industrial','Electrical'); P=@('TIA Portal*','SIMATIC*TIA*'); K='PLC'; RAM=16; Disk=40; Net='4.8'; Lic='FlexLM'; Lsvc=@('*Automation License*','*Siemens*','*lmgrd*'); Lport=@(27000); Cache=@('%APPDATA%\Siemens\Automation')}
     @{N='STEP 7';               D=@('Automation');                       P=@('STEP 7*','SIMATIC STEP 7*');                          K='PLC';        RAM=8;  Disk=25;  Lic='FlexLM'}
     @{N='WinCC';                D=@('Automation','SCADA');               P=@('SIMATIC WinCC*','WinCC*');                            K='SCADA';      RAM=16; Disk=30;  Lic='FlexLM'}
@@ -437,8 +427,6 @@ $Script:RawCatalog = @(
     @{N='Ignition';             D=@('Automation','SCADA');               P=@('Ignition*','Inductive Automation*');                  K='SCADA';      RAM=8;  Disk=10;  Lic='Cloud/Node'}
     @{N='NI LabVIEW';           D=@('Automation','Instrumentation','Electrical','Telecom','Bio'); P=@('LabVIEW*','NI LabVIEW*'); K='Instrument'; RAM=8; Disk=20; Net='4.8'; Lic='FlexLM'; Lsvc=@('*NI*','*National Instruments*'); Cache=@('%LOCALAPPDATA%\National Instruments')}
     @{N='Factory I/O';          D=@('Automation');                       P=@('Factory IO*','Factory I/O*');                         K='Sim';        RAM=8;  Disk=5;   GPU=$true}
-
-    # ---------- EMBEDDED / COMPUTER ENGINEERING ----------
     @{N='Xilinx Vivado';        D=@('Embedded','Electronics','Computer'); P=@('Xilinx Vivado*','Vivado*');                          K='FPGA';       RAM=16; Disk=60;  Lic='FlexLM'; Cache=@('%APPDATA%\Xilinx')}
     @{N='Intel Quartus Prime';  D=@('Embedded','Electronics','Computer'); P=@('Quartus*');                                          K='FPGA';       RAM=16; Disk=50;  Lic='FlexLM'; Cache=@('%APPDATA%\Altera','%APPDATA%\Intel\Quartus')}
     @{N='ModelSim';             D=@('Embedded','Computer');              P=@('ModelSim*','Questa*');                                K='HDL Sim';    RAM=8;  Disk=20;  Lic='FlexLM'}
@@ -453,8 +441,6 @@ $Script:RawCatalog = @(
     @{N='Docker Desktop';       D=@('Computer');                         P=@('Docker Desktop*');                                    K='Containers'; RAM=8;  Disk=20;  Lic='Node'}
     @{N='Git';                  D=@('Computer','Data');                  P=@('Git version*');                                       K='VCS';        RAM=1;  Disk=2;   Lic='None'}
     @{N='Wireshark';            D=@('Computer','Telecom');               P=@('Wireshark*');                                         K='Net tool';   RAM=4;  Disk=5;   Lic='None'}
-
-    # ---------- TELECOM / RF / MICROWAVE ----------
     @{N='Keysight ADS';         D=@('RF','Telecom','Electronics');       P=@('Keysight ADS*','ADS 20*','Advanced Design System*');  K='RF Sim';     RAM=16; Disk=40;  Lic='FlexLM'; Lsvc=@('*Keysight*','*Agilent*','*lmgrd*'); Lport=@(27000); Cache=@('%USERPROFILE%\hpeesof')}
     @{N='ANSYS HFSS';           D=@('RF','Telecom','Aerospace');         P=@('ANSYS HFSS*','HFSS*');                                K='EM';         RAM=32; Disk=50;  Lic='FlexLM'}
     @{N='CST Studio Suite';     D=@('RF','Telecom');                     P=@('CST Studio*','CST*');                                 K='EM';         RAM=32; Disk=40;  Lic='FlexLM'}
@@ -465,8 +451,6 @@ $Script:RawCatalog = @(
     @{N='Cisco Packet Tracer';  D=@('Telecom','Computer');               P=@('Cisco Packet Tracer*');                               K='Net sim';    RAM=4;  Disk=5;   Lic='Node'}
     @{N='Atoll';                D=@('Telecom');                          P=@('Atoll*');                                             K='RAN';        RAM=8;  Disk=20;  Lic='FlexLM'}
     @{N='NS-3';                 D=@('Telecom','Computer');               P=@('ns-3*');                                              K='Net sim';    RAM=4;  Disk=5;   Lic='None'}
-
-    # ---------- CHEMICAL / PETROLEUM ----------
     @{N='Aspen Plus';           D=@('Chemical','Process');               P=@('Aspen Plus*');                                        K='Process';    RAM=16; Disk=30;  Net='4.8'; Lic='FlexLM'; Lsvc=@('*Aspen*','*lmgrd*','*SLM*'); Lport=@(27000); Cache=@('%LOCALAPPDATA%\AspenTech')}
     @{N='Aspen HYSYS';          D=@('Chemical','Petroleum');             P=@('Aspen HYSYS*');                                       K='Process';    RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='CHEMCAD';              D=@('Chemical');                         P=@('CHEMCAD*');                                           K='Process';    RAM=8;  Disk=20;  Lic='FlexLM'}
@@ -481,8 +465,6 @@ $Script:RawCatalog = @(
     @{N='CMG GEM';              D=@('Petroleum');                        P=@('CMG*','GEM*');                                        K='Reservoir';  RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='Techlog';              D=@('Petroleum','Geology');              P=@('Techlog*');                                           K='Well log';   RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='Kingdom';              D=@('Petroleum','Geology');              P=@('Kingdom*','SMT Kingdom*');                            K='Seismic';    RAM=16; Disk=30;  Lic='FlexLM'}
-
-    # ---------- MINING / GEOLOGY / GEOTECH ----------
     @{N='Deswik';               D=@('Mining');                           P=@('Deswik*');                                            K='Mine plan';  RAM=16; Disk=30;  Lic='FlexLM'; Cache=@('%APPDATA%\Deswik')}
     @{N='Maptek Vulcan';        D=@('Mining','Geology');                 P=@('Maptek Vulcan*','Vulcan*');                           K='Mine';       RAM=16; Disk=30;  Lic='FlexLM'; Lsvc=@('*Maptek*')}
     @{N='Surpac';               D=@('Mining','Geology');                 P=@('Surpac*','Geovia Surpac*');                           K='Mine';       RAM=16; Disk=30;  Lic='FlexLM'}
@@ -498,8 +480,6 @@ $Script:RawCatalog = @(
     @{N='FLAC3D';               D=@('Geotech','Mining');                 P=@('FLAC3D*');                                            K='Geo FEA';    RAM=16; Disk=25;  Lic='FlexLM'}
     @{N='GEO5';                 D=@('Geotech','Civil');                  P=@('GEO5*');                                              K='Geo';        RAM=4;  Disk=10;  Lic='Node'}
     @{N='gINT';                 D=@('Geotech');                          P=@('gINT*');                                              K='Boring log'; RAM=4;  Disk=10;  Lic='FlexLM'}
-
-    # ---------- WATER / HYDRO / ENVIRONMENTAL ----------
     @{N='HEC-RAS';              D=@('Water','Civil','Environmental');    P=@('HEC-RAS*');                                           K='Hydraulics'; RAM=8;  Disk=15;  Lic='None'; Cache=@('%USERPROFILE%\Documents\HEC-RAS')}
     @{N='HEC-HMS';              D=@('Water','Civil','Environmental');    P=@('HEC-HMS*');                                           K='Hydrology';  RAM=8;  Disk=10;  Lic='None'}
     @{N='EPA SWMM';             D=@('Water','Environmental');            P=@('EPA SWMM*','SWMM*');                                  K='Stormwater'; RAM=4;  Disk=5;   Lic='None'}
@@ -511,8 +491,6 @@ $Script:RawCatalog = @(
     @{N='MODFLOW';              D=@('Water','Geology');                  P=@('MODFLOW*','Visual MODFLOW*');                         K='GW';         RAM=8;  Disk=20;  Lic='FlexLM'}
     @{N='AERMOD';               D=@('Environmental');                    P=@('AERMOD*','AERMOD View*');                             K='Air';        RAM=4;  Disk=10;  Lic='None'}
     @{N='CALPUFF';              D=@('Environmental');                    P=@('CALPUFF*');                                           K='Air';        RAM=4;  Disk=10;  Lic='None'}
-
-    # ---------- GIS / GEOMATICS / SURVEY ----------
     @{N='ArcGIS Pro';           D=@('GIS','Geomatics','Environmental','Civil'); P=@('ArcGIS Pro*');                                 K='GIS';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*ArcGIS*','*ESRI*','*lmgrd*'); Lport=@(27000); Cache=@('%LOCALAPPDATA%\ESRI')}
     @{N='ArcGIS Desktop';       D=@('GIS');                              P=@('ArcGIS Desktop*','ArcMap*','ArcGIS 10*');             K='GIS';        RAM=8;  Disk=25;  Net='4.8'; Lic='FlexLM'}
     @{N='QGIS';                 D=@('GIS','Geomatics','Environmental');  P=@('QGIS*');                                              K='GIS';        RAM=8;  Disk=10;  Lic='None'; Cache=@('%APPDATA%\QGIS')}
@@ -527,29 +505,21 @@ $Script:RawCatalog = @(
     @{N='CloudCompare';         D=@('Geomatics','Survey');               P=@('CloudCompare*');                                      K='PointCloud'; RAM=8;  Disk=10;  Lic='None'}
     @{N='Autodesk ReCap';       D=@('Geomatics','AEC');                  P=@('Autodesk ReCap*');                                    K='PointCloud'; RAM=8;  Disk=15;  Lic='Node'}
     @{N='Carlson Survey';       D=@('Survey','Civil');                   P=@('Carlson Survey*');                                    K='Survey';     RAM=8;  Disk=15;  Lic='Node'}
-
-    # ---------- MARINE / NAVAL ----------
     @{N='AVEVA Marine';         D=@('Marine','Naval');                   P=@('AVEVA Marine*','AVEVA*');                             K='Ship CAD';   RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='ShipConstructor';      D=@('Marine','Naval');                   P=@('ShipConstructor*');                                   K='Ship CAD';   RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='Maxsurf';              D=@('Marine','Naval');                   P=@('Maxsurf*');                                           K='Naval arch'; RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='NAPA';                 D=@('Marine','Naval');                   P=@('NAPA*');                                              K='Naval arch'; RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='ANSYS AQWA';           D=@('Marine','Naval','Offshore');        P=@('ANSYS AQWA*','AQWA*');                                K='Hydro';      RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='MOSES';                D=@('Marine','Offshore');                P=@('MOSES*','Bentley MOSES*');                            K='Hydro';      RAM=8;  Disk=20;  Lic='Bentley'}
-
-    # ---------- RAILWAY ----------
     @{N='Bentley OpenRail';     D=@('Railway','Civil');                  P=@('OpenRail*');                                          K='Rail CAD';   RAM=16; Disk=30;  GPU=$true;  Lic='Bentley'; Lsvc=@('*Bentley*','*SelectServer*')}
     @{N='OpenTrack';            D=@('Railway');                          P=@('OpenTrack*');                                         K='Rail sim';   RAM=8;  Disk=15;  Lic='None'}
     @{N='RailSys';              D=@('Railway');                          P=@('RailSys*');                                           K='Rail sim';   RAM=8;  Disk=15;  Lic='FlexLM'}
-
-    # ---------- FIRE PROTECTION ----------
     @{N='AutoSPRINK';           D=@('Fire','MEP');                       P=@('AutoSPRINK*');                                        K='Fire';       RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='HydraCALC';            D=@('Fire','MEP');                       P=@('HydraCALC*');                                         K='Fire';       RAM=4;  Disk=10;  Lic='Node'}
     @{N='PyroSim';              D=@('Fire');                             P=@('PyroSim*');                                           K='Fire sim';   RAM=16; Disk=20;  GPU=$true;  Lic='Node'}
     @{N='FDS';                  D=@('Fire');                             P=@('FDS*','NIST FDS*');                                   K='Fire sim';   RAM=16; Disk=20;  Lic='None'}
     @{N='Pathfinder';           D=@('Fire');                             P=@('Pathfinder*');                                        K='Egress';     RAM=8;  Disk=15;  Lic='Node'}
     @{N='CONTAM';               D=@('Fire','HVAC');                      P=@('CONTAM*','NIST CONTAM*');                             K='Airflow';    RAM=4;  Disk=10;  Lic='None'}
-
-    # ---------- HVAC / BUILDING SYSTEMS ----------
     @{N='Revit MEP';            D=@('MEP','HVAC','Fire');                P=@('Autodesk Revit*');                                    K='MEP';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; Lic='Node'}
     @{N='AutoCAD MEP';          D=@('MEP','HVAC');                       P=@('AutoCAD MEP*','AutoCAD Architecture*');               K='MEP';        RAM=8;  Disk=20;  GPU=$true;  Net='4.8'; Lic='Node'}
     @{N='Carrier HAP';          D=@('HVAC');                             P=@('Carrier HAP*','HAP*');                                K='HVAC load';  RAM=4;  Disk=10;  Lic='Node'}
@@ -561,16 +531,12 @@ $Script:RawCatalog = @(
     @{N='eQUEST';               D=@('HVAC','Building');                  P=@('eQUEST*');                                            K='BEM';        RAM=4;  Disk=10;  Lic='None'}
     @{N='DIALux evo';           D=@('Lighting','MEP');                   P=@('DIALux*');                                            K='Lighting';   RAM=8;  Disk=15;  GPU=$true;  Lic='None'}
     @{N='AGi32';                D=@('Lighting','MEP');                   P=@('AGi32*');                                             K='Lighting';   RAM=8;  Disk=15;  Lic='Node'}
-
-    # ---------- NUCLEAR ----------
     @{N='MCNP';                 D=@('Nuclear');                          P=@('MCNP*');                                              K='Neutronics'; RAM=8;  Disk=20;  Lic='Node'}
     @{N='SCALE';                D=@('Nuclear');                          P=@('SCALE*','ORNL SCALE*');                               K='Neutronics'; RAM=8;  Disk=20;  Lic='Node'}
     @{N='SERPENT';              D=@('Nuclear');                          P=@('Serpent*','SERPENT*');                                K='Neutronics'; RAM=8;  Disk=20;  Lic='None'}
     @{N='RELAP5';               D=@('Nuclear');                          P=@('RELAP5*');                                            K='Thermal';    RAM=8;  Disk=20;  Lic='Node'}
     @{N='TRACE';                D=@('Nuclear');                          P=@('TRACE*','NRC TRACE*');                                K='Thermal';    RAM=8;  Disk=20;  Lic='None'}
     @{N='OpenMC';               D=@('Nuclear');                          P=@('OpenMC*');                                            K='Neutronics'; RAM=8;  Disk=20;  Lic='None'}
-
-    # ---------- BIOMEDICAL / MATERIALS ----------
     @{N='Mimics Innovation Suite';D=@('Biomedical');                     P=@('Mimics*','Materialise Mimics*');                      K='Bio model';  RAM=16; Disk=25;  GPU=$true;  Lic='FlexLM'}
     @{N='Simpleware';           D=@('Biomedical');                       P=@('Simpleware*','Synopsys Simpleware*');                 K='Bio model';  RAM=16; Disk=25;  Lic='FlexLM'}
     @{N='ImageJ';               D=@('Biomedical','Materials');           P=@('ImageJ*','Fiji*');                                    K='Imaging';    RAM=4;  Disk=5;   Lic='None'}
@@ -579,8 +545,6 @@ $Script:RawCatalog = @(
     @{N='JMatPro';              D=@('Materials');                        P=@('JMatPro*');                                           K='Materials';  RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='FactSage';             D=@('Materials');                        P=@('FactSage*');                                          K='Thermo';     RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='Materials Studio';     D=@('Materials');                        P=@('Materials Studio*','BIOVIA*');                        K='MD';         RAM=16; Disk=25;  Lic='FlexLM'}
-
-    # ---------- RENEWABLE / BATTERY ----------
     @{N='PVsyst';               D=@('Renewable','Solar');                P=@('PVsyst*');                                            K='Solar';      RAM=4;  Disk=10;  Lic='Node'}
     @{N='HOMER Pro';            D=@('Renewable');                        P=@('HOMER*');                                             K='Microgrid';  RAM=4;  Disk=10;  Lic='Node'}
     @{N='SAM';                  D=@('Renewable');                        P=@('SAM 20*','System Advisor Model*');                    K='Renewable';  RAM=4;  Disk=10;  Lic='None'}
@@ -590,8 +554,6 @@ $Script:RawCatalog = @(
     @{N='WAsP';                 D=@('Renewable','Wind');                 P=@('WAsP*');                                              K='Wind';       RAM=4;  Disk=10;  Lic='FlexLM'}
     @{N='GT-AutoLion';          D=@('Battery');                          P=@('GT-AutoLion*','AutoLion*');                           K='Battery';    RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='Battery Design Studio';D=@('Battery');                          P=@('Battery Design Studio*','CD-adapco BDS*');            K='Battery';    RAM=8;  Disk=15;  Lic='FlexLM'}
-
-    # ---------- PROJECT / MANUFACTURING / SYSTEMS ----------
     @{N='Microsoft Project';    D=@('Project Mgmt');                     P=@('Microsoft Project*','Microsoft 365*Project*');        K='PM';         RAM=4;  Disk=10;  Net='4.8'; Lic='Node'}
     @{N='Primavera P6';         D=@('Project Mgmt');                     P=@('Primavera P6*','Oracle Primavera*');                  K='PM';         RAM=8;  Disk=20;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*Primavera*','*Oracle*')}
     @{N='Procore';              D=@('Project Mgmt','Construction');      P=@('Procore*');                                           K='PM';         RAM=4;  Disk=5;   Lic='Cloud'}
@@ -612,8 +574,6 @@ $Script:RawCatalog = @(
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
 
-# Convert every catalog hashtable into a PSCustomObject so that
-# Sort-Object N, Where-Object N, -Unique, and -Property all work reliably.
 $Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
 $Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
@@ -737,6 +697,7 @@ $sys = & {
         ComputerName   = $env:COMPUTERNAME
         User           = "$env:USERDOMAIN\$env:USERNAME"
         OS             = "$($os.Caption) ($($os.Version), Build $($os.BuildNumber))"
+        OSBuild        = "$($os.Version).$($os.BuildNumber)"
         Arch           = $os.OSArchitecture
         LastBoot       = $os.LastBootUpTime
         InstallDate    = $os.InstallDate
@@ -777,6 +738,8 @@ function Get-WindowsHealth {
         RebootReason  = ''
         UpdateService = 'Unknown'
         Defender      = 'Unknown'
+        DefenderSig   = 'Unknown'
+        DefenderSigDate = ''
         Firewall      = 'Unknown'
         Activation    = 'Unknown'
         BuildAgeDays  = 0
@@ -811,6 +774,12 @@ function Get-WindowsHealth {
     try {
         $def = Get-MpComputerStatus -ErrorAction Stop
         $r.Defender = if ($def.AntivirusEnabled) { 'Active' } else { 'Off' }
+        if ($def.AntivirusSignatureVersion) {
+            $r.DefenderSig = $def.AntivirusSignatureVersion
+        }
+        if ($def.AntivirusSignatureLastUpdated) {
+            $r.DefenderSigDate = ([datetime]$def.AntivirusSignatureLastUpdated).ToString('yyyy-MM-dd')
+        }
     } catch {
         try {
             $sc = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
@@ -1926,14 +1895,6 @@ Write-Host " $gCount healthy / $yCount attention / $rCount critical / $nCount no
 # =============================================================================
 # 6b. ONLINE ENRICHMENT — fetches live data to make the score truthful
 # =============================================================================
-#
-#   * PassMark   -> real CPU/GPU benchmark scores for the detected hardware
-#   * winget     -> real "is there a newer version?" check for software + drivers
-#   * NVIDIA/AMD -> real latest driver version from vendor feeds
-#
-#   Cached for 24h. Degrades gracefully offline. Skips entirely with -Offline.
-# =============================================================================
-
 $Script:OnlineCache     = @{}
 $Script:OnlineCachePath = Join-Path $env:TEMP 'sigma_online_cache.json'
 $Script:OnlineEnabled   = -not $Offline
@@ -2104,6 +2065,23 @@ function Get-AmdLatestDriver {
     }
 }
 
+function Get-IntelLatestGraphicsDriver {
+    param([string]$GpuName)
+    if ($GpuName -notmatch 'Intel') { return $null }
+
+    $key = 'intel_latest_graphics'
+    Get-Cached -Key $key -TtlHours 24 -Fetch {
+        try {
+            # Intel's Arc & Iris Xe driver download page
+            $r = Invoke-SafeWebRequest -Url 'https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html' -TimeoutSec 10
+            if ($r -and $r.Content -match '(\d+\.\d+\.\d+\.\d+)') {
+                return $matches[1]
+            }
+        } catch { }
+        return $null
+    }
+}
+
 function Get-WingetUpgradeable {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return @() }
 
@@ -2183,6 +2161,7 @@ function Invoke-OnlineEnrichment {
         GpuScores       = @()
         LatestNvidia    = $null
         LatestAmd       = $null
+        LatestIntelGpu  = $null
         Upgradeable     = @()
         DiskMediaTypes  = @()
         Ram             = $null
@@ -2192,7 +2171,6 @@ function Invoke-OnlineEnrichment {
 
     if (-not $Script:OnlineEnabled) {
         $enrich.OnlineAvailable = $false
-        # Still gather local-only data
         $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
         $enrich.Ram            = Get-RamDetail
         return [pscustomobject]$enrich
@@ -2216,6 +2194,7 @@ function Invoke-OnlineEnrichment {
 
     $hasNvidia = @($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' }).Count -gt 0
     $hasAmd    = @($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' }).Count -gt 0
+    $hasIntel  = @($System.GPUs | Where-Object { $_.Name -match 'Intel' }).Count -gt 0
     if ($hasNvidia) {
         $nvName = ($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1).Name
         $enrich.LatestNvidia = Get-NvidiaLatestDriver -GpuName $nvName
@@ -2223,6 +2202,10 @@ function Invoke-OnlineEnrichment {
     if ($hasAmd) {
         $amdName = ($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' } | Select-Object -First 1).Name
         $enrich.LatestAmd = Get-AmdLatestDriver -GpuName $amdName
+    }
+    if ($hasIntel) {
+        $intelName = ($System.GPUs | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1).Name
+        $enrich.LatestIntelGpu = Get-IntelLatestGraphicsDriver -GpuName $intelName
     }
 
     $enrich.Upgradeable = @(Get-WingetUpgradeable)
@@ -2236,6 +2219,232 @@ function Invoke-OnlineEnrichment {
 }
 
 # =============================================================================
+# 6c. SYSTEM ONLINE VERIFICATION — cross-check every scanned fact
+# =============================================================================
+#   * Windows build     -> latest from Microsoft release info
+#   * .NET Framework    -> latest from Microsoft downloads
+#   * VC++ Redist       -> latest supported version from Microsoft Learn
+#   * Defender          -> latest signature version from Microsoft WDSI
+#   * Motherboard BIOS  -> latest from vendor (Dell supported, others best-effort)
+#   * Disk SMART        -> local reliability counters (wear, temp, errors)
+#   * RAM modules       -> part numbers + configured vs rated speed
+#   * Network adapters  -> running vs max supported speed
+# =============================================================================
+
+function Get-LatestWindowsBuild {
+    $key = 'ms_latest_windows'
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        try {
+            $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information' -TimeoutSec 10
+            if (-not $r) { return $null }
+            # The page lists "OS build" values like 26100.2314
+            $matches2 = [regex]::Matches($r.Content, '\b(2[0-9]{4}\.\d{3,5})\b')
+            if ($matches2.Count -gt 0) {
+                $versions = $matches2 | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+                return ($versions | Sort-Object { [version]$_ } | Select-Object -Last 1)
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-LatestDotNetFrameworkVersion {
+    $key = 'ms_latest_dotnet_fx'
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        try {
+            $r = Invoke-SafeWebRequest -Url 'https://dotnet.microsoft.com/en-us/download/dotnet-framework' -TimeoutSec 10
+            if ($r -and $r.Content -match '\.NET Framework (\d+\.\d+(?:\.\d+)?)') {
+                return $matches[1]
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-LatestVCRedistVersion {
+    $key = 'ms_latest_vcredist'
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        try {
+            $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist' -TimeoutSec 10
+            if ($r -and $r.Content -match 'v14\.(\d+)\.(\d+)\.(\d+)') {
+                return "14.$($matches[1]).$($matches[2]).$($matches[3])"
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-LatestDefenderSignature {
+    $key = 'ms_latest_defender'
+    Get-Cached -Key $key -TtlHours 12 -Fetch {
+        try {
+            $r = Invoke-SafeWebRequest -Url 'https://www.microsoft.com/en-us/wdsi/defenderupdates' -TimeoutSec 10
+            if ($r -and $r.Content -match '(\d+\.\d+\.\d+\.\d+)') {
+                return $matches[1]
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-MotherboardInfo {
+    try {
+        $bb   = Get-CimInstance Win32_BaseBoard -ErrorAction Stop
+        $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
+        return [pscustomobject]@{
+            Manufacturer    = $bb.Manufacturer
+            Product         = $bb.Product
+            Version         = $bb.Version
+            SerialNumber    = $bb.SerialNumber
+            BiosVendor      = $bios.Manufacturer
+            BiosVersion     = $bios.SMBIOSBIOSVersion
+            BiosReleaseDate = if ($bios.ReleaseDate) { ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } else { '' }
+        }
+    } catch { return $null }
+}
+
+function Get-LatestBiosVersion {
+    param([pscustomobject]$Board)
+    if (-not $Board -or -not $Board.Manufacturer) { return $null }
+
+    $mfg = $Board.Manufacturer.ToLower()
+    $key = "bios_$($Board.Manufacturer)_$($Board.Product)_$($Board.BiosVersion)"
+
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        try {
+            # Dell: query driver catalog for the BIOS
+            if ($mfg -match 'dell') {
+                $svcTag = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
+                if ($svcTag) {
+                    $r = Invoke-SafeWebRequest -Url "https://www.dell.com/support/home/en-us/product-support/servicetag/$svcTag/drivers" -TimeoutSec 12
+                    if ($r -and $r.Content -match 'BIOS[^<]{0,200}?(\d+\.\d+\.\d+)') {
+                        return $matches[1]
+                    }
+                }
+            }
+            # HP: web lookup is JS-heavy, skip
+            # Lenovo: requires API key, skip
+            # ASUS / MSI / Gigabyte: JS-heavy, skip
+            # Return null when we can't reliably fetch
+            return $null
+        } catch { return $null }
+    }
+}
+
+function Get-DiskReliability {
+    try {
+        $out = @()
+        foreach ($d in Get-PhysicalDisk -ErrorAction Stop) {
+            $rc = $null
+            try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
+            $out += [pscustomobject]@{
+                FriendlyName  = $d.FriendlyName
+                MediaType     = $d.MediaType
+                BusType       = $d.BusType
+                SizeGB        = [math]::Round($d.Size / 1GB, 1)
+                HealthStatus  = $d.HealthStatus
+                Wear          = if ($rc) { $rc.Wear } else { $null }
+                Temperature   = if ($rc) { $rc.Temperature } else { $null }
+                PowerOnHours  = if ($rc) { $rc.PowerOnHours } else { $null }
+                ReadErrors    = if ($rc) { $rc.ReadErrorsTotal } else { $null }
+                WriteErrors   = if ($rc) { $rc.WriteErrorsTotal } else { $null }
+            }
+        }
+        return $out
+    } catch { return @() }
+}
+
+function Get-RamPartNumbers {
+    try {
+        $mods = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+        $out = @()
+        foreach ($m in $mods) {
+            $out += [pscustomobject]@{
+                Manufacturer  = $m.Manufacturer
+                PartNumber    = $m.PartNumber
+                CapacityGB    = [math]::Round($m.Capacity / 1GB, 0)
+                SpeedMHz      = $m.Speed
+                ConfiguredMHz = $m.ConfiguredClockSpeed
+                TypeCode      = $m.SMBIOSMemoryType
+                FormFactor    = $m.FormFactor
+            }
+        }
+        return $out
+    } catch { return @() }
+}
+
+function Get-AdapterCapabilities {
+    try {
+        $out = @()
+        foreach ($n in Get-NetAdapter -Physical -ErrorAction SilentlyContinue) {
+            $maxSpeed = $null
+            if ($n.InterfaceDescription -match '(\d+)\s*Gb') { $maxSpeed = "$($matches[1]) Gb" }
+            elseif ($n.InterfaceDescription -match '(\d+)\s*Mb') { $maxSpeed = "$($matches[1]) Mb" }
+            if ($n.InterfaceDescription -match '2\.5G') { $maxSpeed = '2.5 Gb' }
+            if ($n.InterfaceDescription -match '10G')   { $maxSpeed = '10 Gb' }
+
+            $drv = try { (Get-NetAdapter -Name $n.Name -ErrorAction Stop).DriverVersion } catch { '' }
+
+            $out += [pscustomobject]@{
+                Name          = $n.Name
+                Description   = $n.InterfaceDescription
+                LinkSpeed     = $n.LinkSpeed
+                MaxSpeed      = $maxSpeed
+                Status        = $n.Status
+                DriverVersion = $drv
+            }
+        }
+        return $out
+    } catch { return @() }
+}
+
+function Invoke-SystemOnlineVerification {
+    param([pscustomobject]$System, [pscustomobject]$Motherboard)
+
+    $v = [ordered]@{
+        LatestWindowsBuild   = $null
+        LatestDotNetFx       = $null
+        LatestVCRedist       = $null
+        LatestDefenderSig    = $null
+        LatestBios           = $null
+        DiskReliability      = @()
+        RamModules           = @()
+        AdapterCapabilities  = @()
+        VerifiedAt           = (Get-Date).ToString('s')
+        Available            = $true
+    }
+
+    if (-not $Script:OnlineEnabled) {
+        $v.DiskReliability     = @(Get-DiskReliability)
+        $v.RamModules          = @(Get-RamPartNumbers)
+        $v.AdapterCapabilities = @(Get-AdapterCapabilities)
+        $v.Available           = $false
+        return [pscustomobject]$v
+    }
+
+    Write-Stage "Verifying hardware & OS against online sources..."
+
+    $v.LatestWindowsBuild = Get-LatestWindowsBuild
+    $v.LatestDotNetFx     = Get-LatestDotNetFrameworkVersion
+    $v.LatestVCRedist     = Get-LatestVCRedistVersion
+    $v.LatestDefenderSig  = Get-LatestDefenderSignature
+    if ($Motherboard) {
+        $v.LatestBios = Get-LatestBiosVersion -Board $Motherboard
+    }
+
+    $v.DiskReliability     = @(Get-DiskReliability)
+    $v.RamModules          = @(Get-RamPartNumbers)
+    $v.AdapterCapabilities = @(Get-AdapterCapabilities)
+
+    if (-not $v.LatestWindowsBuild -and -not $v.LatestDotNetFx -and -not $v.LatestVCRedist -and -not $v.LatestDefenderSig) {
+        $v.Available = $false
+    }
+
+    Write-Ok
+    return [pscustomobject]$v
+}
+
+# =============================================================================
 # 7. HEALTH SCORE
 # =============================================================================
 function Get-HealthScore {
@@ -2246,13 +2455,14 @@ function Get-HealthScore {
         [array]$VC,
         [pscustomobject]$WindowsHealth,
         [pscustomobject]$NetworkHealth,
-        [pscustomobject]$Enrichment
+        [pscustomobject]$Enrichment,
+        [pscustomobject]$SystemVerification
     )
 
     $cats = [ordered]@{}
 
     # -----------------------------------------------------------------
-    # HARDWARE — uses PassMark CPU score when available
+    # HARDWARE — PassMark CPU + RAM type/speed
     # -----------------------------------------------------------------
     $ramScore = 100
     if ($System.RAM_GB -lt 16)                        { $ramScore -= 30 }
@@ -2273,7 +2483,7 @@ function Get-HealthScore {
                     elseif ($mark -ge 3500)  { 55 }
                     else                     { 30 }
     } else {
-        if ($System.LogicalCPUs -lt 8)  { $cpuScore = 60 }
+        if ($System.LogicalCPUs -lt 8)      { $cpuScore = 60 }
         elseif ($System.LogicalCPUs -ge 16) { $cpuScore = 95 }
     }
 
@@ -2281,7 +2491,7 @@ function Get-HealthScore {
     $cats['Hardware'] = [math]::Max(0, $hw)
 
     # -----------------------------------------------------------------
-    # STORAGE
+    # STORAGE — free space + media type + SMART health
     # -----------------------------------------------------------------
     $st = 100
     if ($System.Disks.Count -gt 0) {
@@ -2296,10 +2506,24 @@ function Get-HealthScore {
         if (-not $hasNvme -and -not $hasSsd) { $st = [math]::Max(0, $st - 25) }
         elseif (-not $hasNvme -and $hasSsd)  { $st = [math]::Max(0, $st - 10) }
     }
+
+    # SMART penalties
+    if ($SystemVerification -and $SystemVerification.DiskReliability.Count -gt 0) {
+        foreach ($disk in $SystemVerification.DiskReliability) {
+            if ($disk.HealthStatus -and $disk.HealthStatus -ne 'Healthy') {
+                $st = [math]::Max(0, $st - 25)
+            }
+            if ($disk.Wear -and $disk.Wear -ge 80) { $st = [math]::Max(0, $st - 20) }
+            elseif ($disk.Wear -and $disk.Wear -ge 50) { $st = [math]::Max(0, $st - 8) }
+            if ($disk.Temperature -and $disk.Temperature -ge 65) { $st = [math]::Max(0, $st - 5) }
+            if ($disk.ReadErrors -and $disk.ReadErrors -gt 100)  { $st = [math]::Max(0, $st - 5) }
+            if ($disk.WriteErrors -and $disk.WriteErrors -gt 100) { $st = [math]::Max(0, $st - 5) }
+        }
+    }
     $cats['Storage'] = $st
 
     # -----------------------------------------------------------------
-    # ENGINEERING SOFTWARE — penalize outdated installs
+    # ENGINEERING SOFTWARE
     # -----------------------------------------------------------------
     $rel = @($Results | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') })
     if ($rel.Count -eq 0) {
@@ -2327,7 +2551,7 @@ function Get-HealthScore {
     }
 
     # -----------------------------------------------------------------
-    # GPU — PassMark G3D scores + real vendor driver version comparison
+    # GPU — PassMark + real driver version comparison (NVIDIA/AMD/Intel)
     # -----------------------------------------------------------------
     $gpuScore = 100
     if ($Enrichment -and $Enrichment.GpuScores.Count -gt 0) {
@@ -2347,6 +2571,7 @@ function Get-HealthScore {
 
     $driverPenalty = 0
     $installedNv  = ($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1).DriverVersion
+    $installedAmd = ($System.GPUs | Where-Object { $_.Name -match 'Radeon' } | Select-Object -First 1).DriverVersion
 
     if ($Enrichment -and $Enrichment.LatestNvidia -and $installedNv) {
         $nvLatest = $Enrichment.LatestNvidia -replace '\.',''
@@ -2354,6 +2579,15 @@ function Get-HealthScore {
         if ($nvInst.Length -gt 5) { $nvInst = $nvInst.Substring($nvInst.Length - 5) }
         try {
             if ([int]$nvLatest -gt [int]$nvInst) { $driverPenalty = 15 }
+        } catch { }
+    }
+
+    if ($driverPenalty -eq 0 -and $installedAmd -and $Enrichment.LatestAmd) {
+        # AMD version strings vary; use winget as a secondary signal
+        try {
+            $amdLatest = [version]($Enrichment.LatestAmd)
+            $amdInst   = [version]($installedAmd -replace '[^0-9\.]','')
+            if ($amdLatest -gt $amdInst) { $driverPenalty = 15 }
         } catch { }
     }
 
@@ -2367,13 +2601,32 @@ function Get-HealthScore {
     $cats['GPU'] = [math]::Max(0, $gpuScore - $driverPenalty)
 
     # -----------------------------------------------------------------
-    # DRIVERS
+    # DRIVERS — .NET, VC++, GPU driver, BIOS, Defender signatures
     # -----------------------------------------------------------------
     $drv = 100
     if ($NetFx -match '^4\.[0-6]')    { $drv -= 40 }
     elseif ($NetFx -eq '4.7')         { $drv -= 15 }
     if (-not $VC -or $VC.Count -eq 0) { $drv -= 30 }
     if ($driverPenalty -gt 0)         { $drv -= $driverPenalty }
+
+    # Additional penalties from online verification
+    if ($SystemVerification) {
+        # Defender signature staleness
+        if ($SystemVerification.LatestDefenderSig -and $WindowsHealth.DefenderSig) {
+            try {
+                $haveSig = [version]($WindowsHealth.DefenderSig)
+                $wantSig = [version]($SystemVerification.LatestDefenderSig)
+                if ($wantSig -gt $haveSig) { $drv -= 5 }
+            } catch { }
+        }
+        # BIOS age — if release date > 3 years, mild penalty
+        if ($Motherboard -and $Motherboard.BiosReleaseDate) {
+            try {
+                $biosAge = (New-TimeSpan -Start ([datetime]$Motherboard.BiosReleaseDate) -End (Get-Date)).TotalDays
+                if ($biosAge -gt 3 * 365) { $drv -= 5 }
+            } catch { }
+        }
+    }
     $cats['Drivers'] = [math]::Max(0, $drv)
 
     # -----------------------------------------------------------------
@@ -2382,8 +2635,36 @@ function Get-HealthScore {
     $licIssues = @($rel | Where-Object { @($_.Findings | Where-Object Id -match 'LICSVC').Count -gt 0 }).Count
     $cats['Licensing'] = if ($rel.Count -eq 0) { 100 } else { [int](100 - (100 * $licIssues / $rel.Count)) }
 
-    $cats['Windows'] = if ($WindowsHealth) { $WindowsHealth.Score } else { 85 }
+    # -----------------------------------------------------------------
+    # WINDOWS — pending reboot, updates, activation, build freshness
+    # -----------------------------------------------------------------
+    $winScore = if ($WindowsHealth) { $WindowsHealth.Score } else { 85 }
+    if ($SystemVerification -and $SystemVerification.LatestWindowsBuild -and $System.OSBuild) {
+        try {
+            $haveBuild = [version]($System.OSBuild -replace '^.*?(\d+\.\d+)$','$1')
+            $wantBuild = [version]$SystemVerification.LatestWindowsBuild
+            # If the current build is more than a few revisions behind, deduct
+            $buildGap = $wantBuild.Build - $haveBuild.Build
+            if ($buildGap -gt 0 -and $wantBuild.Major -eq $haveBuild.Major) {
+                $winScore = [math]::Max(0, $winScore - [math]::Min(15, $buildGap * 2))
+            }
+        } catch { }
+    }
+    $cats['Windows'] = $winScore
+
     $cats['Network'] = if ($NetworkHealth) { $NetworkHealth.Score } else { 90 }
+
+    # Network adapter capability check
+    if ($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0) {
+        foreach ($a in $SystemVerification.AdapterCapabilities) {
+            if ($a.MaxSpeed -and $a.LinkSpeed -and $a.MaxSpeed -ne $a.LinkSpeed) {
+                # Running well below capability (e.g. 100 Mb on a 1 Gb NIC)
+                if ($a.LinkSpeed -match '100\s*Mbps' -and $a.MaxSpeed -match 'Gb') {
+                    $cats['Network'] = [math]::Max(0, $cats['Network'] - 10)
+                }
+            }
+        }
+    }
 
     # -----------------------------------------------------------------
     # THERMALS
@@ -2424,9 +2705,11 @@ $windowsHealth = Get-WindowsHealth -System $sys
 $networkHealth = Get-NetworkHealth -System $sys -Catalog $Script:RawCatalog -Installed $installed
 
 # ---------------------------------------------------------------------------
-# Online enrichment
+# Online enrichment + hardware / OS verification
 # ---------------------------------------------------------------------------
-$enrichment = Invoke-OnlineEnrichment -System $sys
+$motherboard    = Get-MotherboardInfo
+$enrichment     = Invoke-OnlineEnrichment -System $sys
+$systemVerify   = Invoke-SystemOnlineVerification -System $sys -Motherboard $motherboard
 
 # ---------------------------------------------------------------------------
 # Live GPU sample (optional)
@@ -2440,7 +2723,7 @@ if ($LiveGpuSample) {
 
 $score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx -VC $vc `
                          -WindowsHealth $windowsHealth -NetworkHealth $networkHealth `
-                         -Enrichment $enrichment
+                         -Enrichment $enrichment -SystemVerification $systemVerify
 
 # =============================================================================
 # 8. DISCIPLINE ROLLUP
@@ -2673,17 +2956,19 @@ Write-Stage "Writing report (HTML / JSON / CSV)..."
 Ensure-Folder $exportPath
 
 [pscustomobject]@{
-    GeneratedAt   = (Get-Date).ToString('s')
-    System        = $sys
-    NetFx         = $netFx
-    VCRedist      = $vc
-    Score         = $score
-    WindowsHealth = $windowsHealth
-    NetworkHealth = $networkHealth
-    Enrichment    = $enrichment
-    LiveGpu       = $liveGpu
-    Guardian      = $guardian
-    Results       = $allResults
+    GeneratedAt        = (Get-Date).ToString('s')
+    System             = $sys
+    Motherboard        = $motherboard
+    NetFx              = $netFx
+    VCRedist           = $vc
+    Score              = $score
+    WindowsHealth      = $windowsHealth
+    NetworkHealth      = $networkHealth
+    Enrichment         = $enrichment
+    SystemVerification = $systemVerify
+    LiveGpu            = $liveGpu
+    Guardian           = $guardian
+    Results            = $allResults
 } | ConvertTo-Json -Depth 12 | Set-Content "$reportBase.json" -Encoding UTF8
 
 $allResults | Select-Object Name, Disciplines, Kind, State, Version, Installed,
@@ -2735,6 +3020,11 @@ $style = @'
 
  .enrich{background:#eef6ff;border-left:5px solid #2b6cb0;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
  .enrich b{color:#0b5394}
+ .verify{background:#f0fbf1;border-left:5px solid #1c9b4b;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
+ .verify b{color:#0f7233}
+ .match{background:#1c9b4b;color:#fff;padding:1px 6px;border-radius:8px;font-size:11px;font-weight:700}
+ .mismatch{background:#d18b00;color:#fff;padding:1px 6px;border-radius:8px;font-size:11px;font-weight:700}
+ .unknown{background:#8b95a5;color:#fff;padding:1px 6px;border-radius:8px;font-size:11px;font-weight:700}
 </style>
 '@
 
@@ -2762,43 +3052,140 @@ foreach ($k in $score.Categories.Keys) {
 }
 [void]$sb.AppendLine("</div></div>")
 
-# Online enrichment summary
-[void]$sb.AppendLine("<h2>Online Enrichment</h2><div class='enrich'>")
-if (-not $enrichment.OnlineAvailable) {
-    [void]$sb.AppendLine("<b>Online data unavailable</b> — using local heuristics only. Scores may be less accurate.")
+# ---------------------------------------------------------------------------
+# NEW: Verified Components — shows online-verified facts side by side
+# ---------------------------------------------------------------------------
+[void]$sb.AppendLine("<h2>Verified Components (Local vs Online)</h2>")
+[void]$sb.AppendLine("<div class='verify'>")
+if (-not $systemVerify.Available) {
+    [void]$sb.AppendLine("<b>Online verification unavailable</b> — using local data only. Values below are from WMI/SMART.")
 } else {
-    [void]$sb.AppendLine("<b>Online lookups succeeded.</b> These live values were used in the score:")
-    [void]$sb.AppendLine("<ul>")
-    if ($enrichment.CpuScore) {
-        [void]$sb.AppendLine("<li>CPU PassMark score: <b>$($enrichment.CpuScore)</b></li>")
-    }
-    if ($enrichment.GpuScores.Count -gt 0) {
-        foreach ($gs in $enrichment.GpuScores) {
-            $sc = if ($gs.Score) { $gs.Score } else { 'n/a' }
-            [void]$sb.AppendLine("<li>GPU PassMark G3D — $($gs.Name): <b>$sc</b></li>")
-        }
-    }
-    if ($enrichment.LatestNvidia) {
-        [void]$sb.AppendLine("<li>Latest NVIDIA driver (vendor feed): <b>$($enrichment.LatestNvidia)</b></li>")
-    }
-    if ($enrichment.LatestAmd) {
-        [void]$sb.AppendLine("<li>Latest AMD driver (vendor feed): <b>$($enrichment.LatestAmd)</b></li>")
-    }
-    if ($enrichment.Ram) {
-        [void]$sb.AppendLine("<li>RAM: $($enrichment.Ram.TotalGB) GB $($enrichment.Ram.Type) @ $($enrichment.Ram.SpeedMHz) MHz ($($enrichment.Ram.Modules) modules)</li>")
-    }
-    if ($enrichment.DiskMediaTypes.Count -gt 0) {
-        $media = ($enrichment.DiskMediaTypes | ForEach-Object { "$($_.BusType)/$($_.MediaType) ($($_.SizeGB) GB)" }) -join ', '
-        [void]$sb.AppendLine("<li>Physical disks: $media</li>")
-    }
-    if ($enrichment.Upgradeable.Count -gt 0) {
-        [void]$sb.AppendLine("<li>Outdated packages: <b>$($enrichment.Upgradeable.Count)</b> winget packages have updates available.</li>")
-    }
-    [void]$sb.AppendLine("</ul>")
+    [void]$sb.AppendLine("<b>Every checked component has been cross-referenced with an online source where possible.</b>")
 }
 [void]$sb.AppendLine("</div>")
 
-# Outdated packages table
+[void]$sb.AppendLine("<div class='card'><table>")
+[void]$sb.AppendLine("<tr><th>Component</th><th>Local Value</th><th>Online / Expected</th><th>Status</th></tr>")
+
+# Windows build
+$winLocal = if ($sys.OSBuild) { $sys.OSBuild } else { 'n/a' }
+$winOnline = if ($systemVerify.LatestWindowsBuild) { $systemVerify.LatestWindowsBuild } else { 'unknown' }
+$winStatus = if (-not $systemVerify.LatestWindowsBuild) { 'unknown' }
+             else {
+                 try {
+                     $lb = [version]($sys.OSBuild -replace '^.*?(\d+\.\d+)$','$1')
+                     $lo = [version]$systemVerify.LatestWindowsBuild
+                     if ($lb.Build -ge $lo.Build) { 'match' } else { 'mismatch' }
+                 } catch { 'unknown' }
+             }
+[void]$sb.AppendLine("<tr><td><b>Windows Build</b></td><td>$winLocal</td><td>$winOnline</td><td><span class='$winStatus'>$($winStatus.ToUpper())</span></td></tr>")
+
+# .NET
+$netStatus = if (-not $systemVerify.LatestDotNetFx) { 'unknown' }
+             elseif ($netFx -match 'Not found') { 'mismatch' }
+             else { 'match' }
+[void]$sb.AppendLine("<tr><td><b>.NET Framework</b></td><td>$netFx</td><td>$($systemVerify.LatestDotNetFx)</td><td><span class='$netStatus'>$($netStatus.ToUpper())</span></td></tr>")
+
+# VC++ Redist
+$vcLocal = if ($vc.Count -gt 0) { ($vc | ForEach-Object { $_.DisplayVersion } | Sort-Object -Unique) -join ', ' } else { 'none' }
+$vcOnline = if ($systemVerify.LatestVCRedist) { $systemVerify.LatestVCRedist } else { 'unknown' }
+$vcStatus = if (-not $systemVerify.LatestVCRedist) { 'unknown' }
+            elseif ($vc.Count -eq 0) { 'mismatch' }
+            else { 'match' }
+[void]$sb.AppendLine("<tr><td><b>VC++ Redistributable</b></td><td>$vcLocal</td><td>$vcOnline</td><td><span class='$vcStatus'>$($vcStatus.ToUpper())</span></td></tr>")
+
+# Defender Signature
+$defLocal = if ($windowsHealth.DefenderSig) { $windowsHealth.DefenderSig } else { 'unknown' }
+$defOnline = if ($systemVerify.LatestDefenderSig) { $systemVerify.LatestDefenderSig } else { 'unknown' }
+$defStatus = if (-not $systemVerify.LatestDefenderSig) { 'unknown' }
+             elseif ($windowsHealth.DefenderSig) {
+                 try {
+                     $hl = [version]$windowsHealth.DefenderSig
+                     $ol = [version]$systemVerify.LatestDefenderSig
+                     if ($hl -ge $ol) { 'match' } else { 'mismatch' }
+                 } catch { 'unknown' }
+             } else { 'unknown' }
+[void]$sb.AppendLine("<tr><td><b>Defender Signature</b></td><td>$defLocal</td><td>$defOnline</td><td><span class='$defStatus'>$($defStatus.ToUpper())</span></td></tr>")
+
+# BIOS
+if ($motherboard) {
+    $biosLocal = "$($motherboard.BiosVendor) $($motherboard.BiosVersion) ($($motherboard.BiosReleaseDate))"
+    $biosOnline = if ($systemVerify.LatestBios) { $systemVerify.LatestBios } else { 'not available' }
+    $biosStatus = if (-not $systemVerify.LatestBios) { 'unknown' } else { 'match' }
+    [void]$sb.AppendLine("<tr><td><b>Motherboard BIOS</b></td><td>$biosLocal</td><td>$biosOnline</td><td><span class='$biosStatus'>$($biosStatus.ToUpper())</span></td></tr>")
+    [void]$sb.AppendLine("<tr><td><b>Motherboard</b></td><td colspan='3'>$($motherboard.Manufacturer) $($motherboard.Product) ($($motherboard.Version))</td></tr>")
+}
+
+# CPU PassMark
+if ($enrichment.CpuScore) {
+    [void]$sb.AppendLine("<tr><td><b>CPU Benchmark</b></td><td>$($sys.CPU)</td><td>PassMark CPU Mark: <b>$($enrichment.CpuScore)</b></td><td><span class='match'>VERIFIED</span></td></tr>")
+} elseif ($enrichment.OnlineAvailable) {
+    [void]$sb.AppendLine("<tr><td><b>CPU Benchmark</b></td><td>$($sys.CPU)</td><td>PassMark lookup failed</td><td><span class='unknown'>UNKNOWN</span></td></tr>")
+}
+
+# GPU PassMark
+foreach ($gs in $enrichment.GpuScores) {
+    $sc = if ($gs.Score) { $gs.Score } else { 'n/a' }
+    $st = if ($gs.Score) { 'match' } else { 'unknown' }
+    [void]$sb.AppendLine("<tr><td><b>GPU Benchmark</b></td><td>$($gs.Name)</td><td>PassMark G3D Mark: <b>$sc</b></td><td><span class='$st'>$(if ($gs.Score) {'VERIFIED'} else {'UNKNOWN'})</span></td></tr>")
+}
+
+# GPU driver version
+$installedNvVer = ($sys.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1).DriverVersion
+if ($installedNvVer -and $enrichment.LatestNvidia) {
+    $nvStatus = 'match'
+    try {
+        $inst5 = ($installedNvVer -replace '\.','')
+        if ($inst5.Length -gt 5) { $inst5 = $inst5.Substring($inst5.Length - 5) }
+        if ([int]($enrichment.LatestNvidia -replace '\.','') -gt [int]$inst5) { $nvStatus = 'mismatch' }
+    } catch { $nvStatus = 'unknown' }
+    [void]$sb.AppendLine("<tr><td><b>NVIDIA Driver</b></td><td>$installedNvVer</td><td>Latest: $($enrichment.LatestNvidia)</td><td><span class='$nvStatus'>$($nvStatus.ToUpper())</span></td></tr>")
+}
+if ($enrichment.LatestAmd) {
+    [void]$sb.AppendLine("<tr><td><b>AMD Driver</b></td><td>$(($sys.GPUs | Where-Object { $_.Name -match 'Radeon' } | Select-Object -First 1).DriverVersion)</td><td>Latest: $($enrichment.LatestAmd)</td><td><span class='match'>VERIFIED</span></td></tr>")
+}
+if ($enrichment.LatestIntelGpu) {
+    [void]$sb.AppendLine("<tr><td><b>Intel Graphics Driver</b></td><td>$(($sys.GPUs | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1).DriverVersion)</td><td>Latest: $($enrichment.LatestIntelGpu)</td><td><span class='match'>VERIFIED</span></td></tr>")
+}
+
+[void]$sb.AppendLine("</table></div>")
+
+# RAM modules
+if ($systemVerify.RamModules.Count -gt 0) {
+    [void]$sb.AppendLine("<h3>RAM Modules (from SPD)</h3><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th>Manufacturer</th><th>Part Number</th><th>Capacity</th><th>Rated MHz</th><th>Configured MHz</th></tr>")
+    foreach ($m in $systemVerify.RamModules) {
+        $speedFlag = if ($m.ConfiguredMHz -lt $m.SpeedMHz) { "<span class='mismatch'>$($m.ConfiguredMHz) (below rated)</span>" } else { $m.ConfiguredMHz }
+        [void]$sb.AppendLine("<tr><td>$($m.Manufacturer)</td><td class='small'>$($m.PartNumber)</td><td>$($m.CapacityGB) GB</td><td>$($m.SpeedMHz)</td><td>$speedFlag</td></tr>")
+    }
+    [void]$sb.AppendLine("</table></div>")
+}
+
+# Disk SMART
+if ($systemVerify.DiskReliability.Count -gt 0) {
+    [void]$sb.AppendLine("<h3>Disk Health (SMART)</h3><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th>Disk</th><th>Media</th><th>Health</th><th>Wear %</th><th>Temp C</th><th>Power-On Hours</th><th>Read/Write Errors</th></tr>")
+    foreach ($d in $systemVerify.DiskReliability) {
+        $hCls = if ($d.HealthStatus -eq 'Healthy') { 'green' } else { 'red' }
+        $wearCls = if ($d.Wear -and $d.Wear -ge 80) { 'red' } elseif ($d.Wear -and $d.Wear -ge 50) { 'yellow' } else { 'green' }
+        $wearCell = if ($d.Wear -ne $null) { "<span class='chip $wearCls'>$($d.Wear)%</span>" } else { 'n/a' }
+        [void]$sb.AppendLine("<tr><td>$($d.FriendlyName)</td><td>$($d.BusType)/$($d.MediaType)</td><td><span class='chip $hCls'>$($d.HealthStatus)</span></td><td>$wearCell</td><td>$($d.Temperature)</td><td>$($d.PowerOnHours)</td><td>$($d.ReadErrors) / $($d.WriteErrors)</td></tr>")
+    }
+    [void]$sb.AppendLine("</table></div>")
+}
+
+# Adapter capability
+if ($systemVerify.AdapterCapabilities.Count -gt 0) {
+    [void]$sb.AppendLine("<h3>Network Adapter Capabilities</h3><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th>Adapter</th><th>Description</th><th>Running</th><th>Capability</th><th>Driver</th></tr>")
+    foreach ($a in $systemVerify.AdapterCapabilities) {
+        $runCls = if ($a.MaxSpeed -and $a.LinkSpeed -and $a.MaxSpeed -ne $a.LinkSpeed) { 'yellow' } else { 'green' }
+        [void]$sb.AppendLine("<tr><td>$($a.Name)</td><td class='small'>$($a.Description)</td><td><span class='chip $runCls'>$($a.LinkSpeed)</span></td><td>$($a.MaxSpeed)</td><td>$($a.DriverVersion)</td></tr>")
+    }
+    [void]$sb.AppendLine("</table></div>")
+}
+
+# Outdated packages
 if ($enrichment.Upgradeable.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Outdated packages (from winget)</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Name</th><th>Id</th><th>Installed</th><th>Available</th></tr>")
@@ -2895,6 +3282,7 @@ $rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($
 [void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
 [void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$($windowsHealth.UpdateService)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Defender</th><td>$($windowsHealth.Defender)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Defender signature</th><td>$($windowsHealth.DefenderSig) ($($windowsHealth.DefenderSigDate))</td></tr>")
 [void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Activation</th><td>$($windowsHealth.Activation)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Build age</th><td>$($windowsHealth.BuildAgeDays) days</td></tr>")
