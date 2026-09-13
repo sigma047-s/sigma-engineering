@@ -8,6 +8,10 @@
     Includes health scoring, structured findings, preflight, project guardian,
     Windows/Network health, License Center, live GPU sampling, and a winget-based
     software installer with manual download fallbacks.
+
+    NEW: Online enrichment — PassMark CPU/GPU benchmarks, real vendor driver
+    version feeds (NVIDIA/AMD), and winget-based outdated-package detection.
+    All online data is cached for 24h and degrades gracefully if offline.
 .PARAMETER Disciplines
     Optional filter. If set, only products relevant to these disciplines are
     fully evaluated. Others are marked NotApplicable.
@@ -24,6 +28,8 @@
     Sample GPU engine utilization via performance counters during the scan.
 .PARAMETER NonInteractive
     Skip confirmation prompts.
+.PARAMETER Offline
+    Skip all online enrichment. Uses local heuristics only.
 .PARAMETER Install
     Enter interactive software installer (choose discipline, then products).
 .PARAMETER InstallList
@@ -39,6 +45,7 @@ param(
     [switch]$WhySlow,
     [switch]$LiveGpuSample,
     [switch]$NonInteractive,
+    [switch]$Offline,
     [switch]$Install,
     [string[]]$InstallList = @()
 )
@@ -48,8 +55,13 @@ Write-Host ""
 Write-Host "[INFO] Scans every engineering discipline on this workstation." -ForegroundColor Cyan
 Write-Host "[INFO] Detects installed software, checks prerequisites, writes a report." -ForegroundColor Cyan
 Write-Host "[INFO] The tool can install engineering software." -ForegroundColor Cyan
+Write-Host "[INFO] Online enrichment: PassMark benchmarks, vendor driver feeds, winget." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
+Write-Host "[WARNING] This scaning tool isn't 100% accurate." -ForegroundColor Yellow
+if ($Offline) {
+    Write-Host "[INFO] Offline mode: online enrichment disabled." -ForegroundColor Cyan
+}
 if ($Disciplines.Count -gt 0) {
     Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan
 }
@@ -600,12 +612,8 @@ $Script:RawCatalog = @(
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
 
-# -----------------------------------------------------------------------------
-# FIX: Convert every catalog hashtable into a PSCustomObject so that
-#      Sort-Object N, Where-Object N, -Unique, and -Property all work
-#      reliably. Without this, the installer collapses every discipline
-#      bucket to a single product.
-# -----------------------------------------------------------------------------
+# Convert every catalog hashtable into a PSCustomObject so that
+# Sort-Object N, Where-Object N, -Unique, and -Property all work reliably.
 $Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
 $Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
@@ -1224,9 +1232,7 @@ if ($WhySlow) {
 # 5g. SOFTWARE INSTALLER
 # =============================================================================
 
-# --- winget-only mapping for products that support silent auto-install ---
 $Script:WingetMap = @{
-    # --- developer / general tools present in the catalog ---
     'Python'             = 'Python.Python.3.12'
     'Anaconda'           = 'Anaconda.Anaconda3'
     'Git'                = 'Git.Git'
@@ -1234,8 +1240,6 @@ $Script:WingetMap = @{
     'Visual Studio'      = 'Microsoft.VisualStudio.2022.Community'
     'Docker Desktop'     = 'Docker.DockerDesktop'
     'Wireshark'          = 'WiresharkFoundation.Wireshark'
-
-    # --- engineering / free tools ---
     'KiCad'              = 'KiCad.KiCad'
     'QGIS'               = 'QGIS.QGIS'
     'CloudCompare'       = 'CloudCompare.CloudCompare'
@@ -1246,8 +1250,6 @@ $Script:WingetMap = @{
     'DWSIM'              = 'DWSIM.DWSIM'
     '3D Slicer'          = 'Slicer.Slicer'
     'PlatformIO'         = 'PlatformIO.PlatformIO'
-
-    # --- useful adjacent tools sometimes searched by engineers ---
     'FreeCAD'            = 'FreeCAD.FreeCAD'
     'OpenSCAD'           = 'OpenSCAD.OpenSCAD'
     'Blender'            = 'BlenderFoundation.Blender'
@@ -1260,10 +1262,7 @@ $Script:WingetMap = @{
     '7-Zip'              = '7zip.7zip'
 }
 
-# --- Manual download fallbacks for products winget can't install ---
-# NOTE: Every key here MUST be unique. Duplicate keys abort PowerShell parsing.
 $Script:ManualUrls = @{
-    # --- AEC / Autodesk ---
     'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
     'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
     'Civil 3D'            = 'https://www.autodesk.com/products/civil-3d/free-trial'
@@ -1285,8 +1284,6 @@ $Script:ManualUrls = @{
     'Bluebeam Revu'       = 'https://www.bluebeam.com/'
     'Rhino'               = 'https://www.rhino3d.com/download/'
     'Grasshopper'         = 'https://www.grasshopper3d.com/'
-
-    # --- Dassault / Siemens PLM ---
     'SOLIDWORKS'          = 'https://www.solidworks.com/sw/support/downloads.htm'
     'SOLIDWORKS Electrical' = 'https://www.solidworks.com/sw/support/downloads.htm'
     'CATIA'               = 'https://www.3ds.com/products/catia'
@@ -1300,8 +1297,6 @@ $Script:ManualUrls = @{
     'Solid Edge'          = 'https://solidedge.siemens.com/'
     'Siemens Xpedition'   = 'https://eda.sw.siemens.com/en-US/pcb/xpedition/'
     'PADS Professional'   = 'https://eda.sw.siemens.com/en-US/pcb/pads/'
-
-    # --- Simulation / CAE ---
     'ANSYS'               = 'https://www.ansys.com/products'
     'ANSYS HFSS'          = 'https://www.ansys.com/products/electronics/ansys-hfss'
     'ANSYS Fluent'        = 'https://www.ansys.com/products/fluids/ansys-fluent'
@@ -1319,8 +1314,6 @@ $Script:ManualUrls = @{
     'FactSage'            = 'https://www.factsage.com/'
     'Thermo-Calc'         = 'https://thermocalc.com/'
     'JMatPro'             = 'https://www.sentesoftware.co.uk/jmatpro'
-
-    # --- Electrical / Electronics ---
     'Altium Designer'     = 'https://www.altium.com/'
     'ETAP'                = 'https://etap.com/'
     'EPLAN Electric P8'   = 'https://www.eplan-software.com/'
@@ -1339,8 +1332,6 @@ $Script:ManualUrls = @{
     'Keysight ADS'        = 'https://www.keysight.com/us/en/products/software/pathwave-design-software/pathwave-advanced-design-system.html'
     'NI LabVIEW'          = 'https://www.ni.com/en-us/support/downloads/software-products/download.labview.html'
     'NI Multisim'         = 'https://www.ni.com/en-us/support/downloads/software-products/download.multisim.html'
-
-    # --- Automation / PLC / SCADA ---
     'Siemens TIA Portal'  = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
     'STEP 7'              = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
     'WinCC'               = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
@@ -1355,8 +1346,6 @@ $Script:ManualUrls = @{
     'CODESYS'             = 'https://www.codesys.com/download.html'
     'Ignition'            = 'https://inductiveautomation.com/downloads/'
     'Factory I/O'         = 'https://factoryio.com/downloads/'
-
-    # --- Embedded / FPGA ---
     'Xilinx Vivado'       = 'https://www.xilinx.com/support/download.html'
     'Intel Quartus Prime' = 'https://www.intel.com/content/www/us/en/software-kit/'
     'ModelSim'            = 'https://www.intel.com/content/www/us/en/software/programmable/quartus-prime/model-sim.html'
@@ -1364,8 +1353,6 @@ $Script:ManualUrls = @{
     'STM32CubeIDE'        = 'https://www.st.com/en/development-tools/stm32cubeide.html'
     'IAR Embedded Workbench' = 'https://www.iar.com/products/architectures/arm/iar-embedded-workbench-for-arm/'
     'Keil uVision'        = 'https://www.keil.com/demo/eval/arm.htm'
-
-    # --- Structural / Geotech / Mining ---
     'STAAD.Pro'           = 'https://www.bentley.com/software/staad-pro/'
     'Tekla Structures'    = 'https://www.tekla.com/products/tekla-structures'
     'Tekla Tedds'         = 'https://www.tekla.com/products/tekla-tedds'
@@ -1395,8 +1382,6 @@ $Script:ManualUrls = @{
     'Leapfrog Geo'        = 'https://www.seequent.com/products-solutions/leapfrog-geo/'
     'Bentley OpenRail'    = 'https://www.bentley.com/software/openrail-designer/'
     'RailSys'             = 'https://www.rmcon.de/en/'
-
-    # --- Water / Environmental / GIS ---
     'HEC-RAS'             = 'https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
     'HEC-HMS'             = 'https://www.hec.usace.army.mil/software/hec-hms/downloads.aspx'
     'EPA SWMM'            = 'https://www.epa.gov/water-research/storm-water-management-model-swmm'
@@ -1418,13 +1403,9 @@ $Script:ManualUrls = @{
     'Leica Infinity'      = 'https://leica-geosystems.com/products/software/leica-infinity'
     'Leica Cyclone'       = 'https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
     'Carlson Survey'      = 'https://www.carlsonsw.com/'
-
-    # --- Chemical / Petroleum ---
     'Aspen Plus'          = 'https://www.aspentech.com/en/products/engineering/aspen-plus'
     'Aspen HYSYS'         = 'https://www.aspentech.com/en/products/engineering/aspen-hysys'
     'Petrel'              = 'https://www.software.slb.com/products/petrel'
-
-    # --- Marine / Fire / HVAC ---
     'ShipConstructor'     = 'https://www.ssi-corporate.com/'
     'Maxsurf'             = 'https://www.bentley.com/software/maxsurf/'
     'NAPA'                = 'https://www.napa.fi/'
@@ -1443,31 +1424,23 @@ $Script:ManualUrls = @{
     'DesignBuilder'       = 'https://designbuilder.co.uk/'
     'DIALux evo'          = 'https://www.dialux.com/en-GB/download'
     'AGi32'               = 'https://lightinganalysts.com/software-products/agi32/'
-
-    # --- Nuclear / Biomedical / Materials ---
     'MCNP'                = 'https://mcnp.lanl.gov/'
     'SCALE'               = 'https://www.ornl.gov/scale'
     'RELAP5'              = 'https://www.nrc.gov/about-nrc/regulatory/research/safetycodes.html'
     'OpenMC'              = 'https://docs.openmc.org/'
     'Mimics Innovation Suite' = 'https://www.materialise.com/en/medical/mimics-innovation-suite'
     'Simpleware'          = 'https://www.synopsys.com/simpleware.html'
-
-    # --- Renewable ---
     'PVsyst'              = 'https://www.pvsyst.com/'
     'HOMER Pro'           = 'https://www.homerenergy.com/products/pro/'
     'SAM'                 = 'https://sam.nrel.gov/download'
     'RETScreen Expert'    = 'https://www.nrcan.gc.ca/maps-tools-and-publications/tools/modelling-tools/retscreen/7465'
     'WindPRO'             = 'https://www.emdt.co.uk/product/windpro'
     'WAsP'                = 'https://www.wasp.dk/'
-
-    # --- Math / Data ---
     'Wolfram Mathematica' = 'https://www.wolfram.com/mathematica/'
     'Maple'               = 'https://www.maplesoft.com/products/Maple/'
     'Mathcad Prime'       = 'https://www.ptc.com/en/products/mathcad'
     'OriginPro'           = 'https://www.originlab.com/'
     'GNU Radio'           = 'https://wiki.gnuradio.org/index.php/InstallingGR'
-
-    # --- CAM / Metrology / PM ---
     'Mastercam'           = 'https://www.mastercam.com/'
     'SolidCAM'            = 'https://www.solidcam.com/'
     'VERICUT'             = 'https://www.cgtech.com/'
@@ -1480,8 +1453,6 @@ $Script:ManualUrls = @{
     'Oracle Aconex'       = 'https://www.oracle.com/construction-engineering/aconex/'
     'CostX'               = 'https://www.exactal.com/'
     'PlanSwift'           = 'https://www.planswift.com/'
-
-    # --- Systems / MBSE ---
     'IBM Engineering DOORS' = 'https://www.ibm.com/products/requirements-management-doors'
     'Capella'             = 'https://www.eclipse.org/capella/'
     'Enterprise Architect'= 'https://sparxsystems.com/products/ea/'
@@ -1555,7 +1526,6 @@ function Install-OneProduct {
 function Show-DisciplineInstaller {
     param([bool]$HasWinget)
 
-    # Index every catalog product by every discipline it belongs to
     $byDisc = @{}
     foreach ($e in $Script:RawCatalog) {
         foreach ($d in $e.D) {
@@ -1679,7 +1649,6 @@ function Invoke-Installer {
         Write-Host "  [INFO] Manual download pages will still be offered." -ForegroundColor Yellow
     }
 
-    # ---- Non-interactive batch ----
     if ($InstallList.Count -gt 0) {
         Write-Host ""
         Write-Host "  Batch mode: $($InstallList -join ', ')" -ForegroundColor Cyan
@@ -1708,7 +1677,6 @@ function Invoke-Installer {
         return
     }
 
-    # ---- Interactive loop ----
     while ($true) {
         Show-DisciplineInstaller -HasWinget $hasWinget
         Write-Host ""
@@ -1956,6 +1924,318 @@ $aCount = @($allResults | Where-Object State -eq 'NotApplicable').Count
 Write-Host " $gCount healthy / $yCount attention / $rCount critical / $nCount not installed / $aCount not applicable." -ForegroundColor Green
 
 # =============================================================================
+# 6b. ONLINE ENRICHMENT — fetches live data to make the score truthful
+# =============================================================================
+#
+#   * PassMark   -> real CPU/GPU benchmark scores for the detected hardware
+#   * winget     -> real "is there a newer version?" check for software + drivers
+#   * NVIDIA/AMD -> real latest driver version from vendor feeds
+#
+#   Cached for 24h. Degrades gracefully offline. Skips entirely with -Offline.
+# =============================================================================
+
+$Script:OnlineCache     = @{}
+$Script:OnlineCachePath = Join-Path $env:TEMP 'sigma_online_cache.json'
+$Script:OnlineEnabled   = -not $Offline
+
+try {
+    if (Test-Path $Script:OnlineCachePath) {
+        $cached = Get-Content $Script:OnlineCachePath -Raw | ConvertFrom-Json
+        foreach ($p in $cached.PSObject.Properties) {
+            $Script:OnlineCache[$p.Name] = $p.Value
+        }
+    }
+} catch { }
+
+function Save-OnlineCache {
+    try {
+        $Script:OnlineCache | ConvertTo-Json -Depth 6 |
+            Set-Content $Script:OnlineCachePath -Encoding UTF8
+    } catch { }
+}
+
+function Get-Cached {
+    param(
+        [string]$Key,
+        [scriptblock]$Fetch,
+        [int]$TtlHours = 24
+    )
+    if (-not $Script:OnlineEnabled) { return $null }
+
+    if ($Script:OnlineCache.ContainsKey($Key)) {
+        $e = $Script:OnlineCache[$Key]
+        try {
+            $age = (New-TimeSpan -Start ([datetime]$e.Fetched) -End (Get-Date)).TotalHours
+            if ($age -lt $TtlHours) { return $e.Value }
+        } catch { }
+    }
+
+    $val = $null
+    try { $val = & $Fetch } catch { Add-Diagnostic 'Online' "Fetch failed for ${Key}: $_" }
+
+    $Script:OnlineCache[$Key] = @{ Value = $val; Fetched = (Get-Date).ToString('s') }
+    Save-OnlineCache
+    return $val
+}
+
+function Invoke-SafeWebRequest {
+    param([string]$Url, [int]$TimeoutSec = 8, [hashtable]$Headers = @{})
+    if (-not $Headers.ContainsKey('User-Agent')) {
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.0'
+    }
+    try {
+        return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing `
+                                 -Headers $Headers -ErrorAction Stop
+    } catch {
+        Add-Diagnostic 'Online' "GET $Url failed: $_"
+        return $null
+    }
+}
+
+function Get-CpuPassMarkScore {
+    param([string]$CpuName)
+    if (-not $CpuName) { return $null }
+
+    $clean = $CpuName -replace '\(R\)','' -replace '\(TM\)','' `
+                      -replace '\s+CPU\s+@.*$','' `
+                      -replace '\s+Processor.*$','' `
+                      -replace '\s+\d+-Core.*$','' `
+                      -replace '\s+@.*$','' `
+                      -replace '\s+',' '
+    $clean = $clean.Trim()
+    $key   = "cpu_passmark_$clean"
+
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        $q = [uri]::EscapeDataString($clean)
+        $r = Invoke-SafeWebRequest -Url "https://www.cpubenchmark.net/cpu.php?cpu=$q"
+        if (-not $r) { return $null }
+        $html = $r.Content
+        if ($html -match 'mark-neww[^>]*>\s*([\d,]+)\s*<') {
+            return [int]($matches[1] -replace ',','')
+        }
+        if ($html -match 'CPU Mark[^<]*<[^>]*>\s*([\d,]+)') {
+            return [int]($matches[1] -replace ',','')
+        }
+        return $null
+    }
+}
+
+function Get-GpuPassMarkScore {
+    param([string]$GpuName)
+    if (-not $GpuName) { return $null }
+
+    $clean = $GpuName -replace '^NVIDIA\s+','' -replace '^AMD\s+','' -replace '^Intel\s+',''
+    $clean = $clean.Trim()
+    $key   = "gpu_passmark_$clean"
+
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        $q = [uri]::EscapeDataString($clean)
+        $r = Invoke-SafeWebRequest -Url "https://www.videocardbenchmark.net/gpu.php?gpu=$q"
+        if (-not $r) { return $null }
+        $html = $r.Content
+        if ($html -match 'mark-neww[^>]*>\s*([\d,]+)\s*<') {
+            return [int]($matches[1] -replace ',','')
+        }
+        if ($html -match 'G3D Mark[^<]*<[^>]*>\s*([\d,]+)') {
+            return [int]($matches[1] -replace ',','')
+        }
+        return $null
+    }
+}
+
+function Get-NvidiaLatestDriver {
+    param([string]$GpuName)
+    $series = switch -Regex ($GpuName) {
+        'RTX\s*50'  { 'rtx50' }
+        'RTX\s*40'  { 'rtx40' }
+        'RTX\s*30'  { 'rtx30' }
+        'RTX\s*20'  { 'rtx20' }
+        'GTX\s*16'  { 'gtx16' }
+        'GTX\s*10'  { 'gtx10' }
+        default     { 'unknown' }
+    }
+    if ($series -eq 'unknown') { return $null }
+
+    $key = "nvidia_driver_$series"
+    Get-Cached -Key $key -TtlHours 24 -Fetch {
+        $psid = switch ($series) {
+            'rtx50' { 129 }
+            'rtx40' { 127 }
+            'rtx30' { 124 }
+            'rtx20' { 120 }
+            'gtx16' { 118 }
+            'gtx10' { 101 }
+        }
+        try {
+            $body = @{
+                func = 'DriverManualLookup'
+                psid = $psid
+                pfid = 0
+                osID = 135
+                lid  = 1
+                whql = 1
+                dch  = 1
+                sort1 = 0
+                numberOfResults = 1
+            }
+            $r = Invoke-RestMethod -Uri 'https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php' `
+                                   -Method Get -Body $body -TimeoutSec 8 -ErrorAction Stop
+            if ($r -and $r.IDS -and $r.IDS.Count -gt 0) {
+                return $r.IDS[0].downloadInfo.Version
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-AmdLatestDriver {
+    param([string]$GpuName)
+    if ($GpuName -notmatch 'Radeon|AMD') { return $null }
+
+    $key = 'amd_latest_driver'
+    Get-Cached -Key $key -TtlHours 24 -Fetch {
+        try {
+            $r = Invoke-SafeWebRequest -Url 'https://www.amd.com/en/support/rss' -TimeoutSec 8
+            if ($r -and $r.Content -match 'Adrenalin[^\d]*(\d+\.\d+\.\d+)') {
+                return $matches[1]
+            }
+        } catch { }
+        return $null
+    }
+}
+
+function Get-WingetUpgradeable {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return @() }
+
+    $key = 'winget_upgradeable'
+    Get-Cached -Key $key -TtlHours 6 -Fetch {
+        try {
+            $raw = winget upgrade --include-unknown --accept-source-agreements 2>$null | Out-String
+            $list = @()
+            $lines = $raw -split "`r?`n"
+            $inTable = $false
+
+            foreach ($line in $lines) {
+                if ($line -match '^-{5,}') { $inTable = $true; continue }
+                if (-not $inTable) { continue }
+                if ($line -match '^\s*\d+\s+upgrades?\s+available') { break }
+
+                if ($line -match '^(.+?)\s{2,}(\S+)\s{2,}(\S+)\s{2,}(\S+)\s{2,}(\S+)\s*$') {
+                    $list += [pscustomobject]@{
+                        Name      = $matches[1].Trim()
+                        Id        = $matches[2].Trim()
+                        Installed = $matches[3].Trim()
+                        Available = $matches[4].Trim()
+                        Source    = $matches[5].Trim()
+                    }
+                }
+            }
+            return $list
+        } catch {
+            Add-Diagnostic 'winget' "upgrade query failed: $_"
+            return @()
+        }
+    }
+}
+
+function Get-DiskMediaTypes {
+    try {
+        $out = @()
+        Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
+            $out += [pscustomobject]@{
+                FriendlyName = $_.FriendlyName
+                MediaType    = $_.MediaType
+                BusType      = $_.BusType
+                SizeGB       = [math]::Round($_.Size / 1GB, 1)
+            }
+        }
+        return $out
+    } catch { return @() }
+}
+
+function Get-RamDetail {
+    try {
+        $mods = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+        if ($mods.Count -eq 0) { return $null }
+        $speedMhz = ($mods | Measure-Object -Property Speed -Average).Average
+        $typeCode = ($mods | Select-Object -First 1).SMBIOSMemoryType
+        $type = switch ($typeCode) {
+            26 { 'DDR4' }
+            34 { 'DDR5' }
+            24 { 'DDR3' }
+            21 { 'DDR2' }
+            default { "Unknown ($typeCode)" }
+        }
+        return [pscustomobject]@{
+            Modules  = $mods.Count
+            SpeedMHz = [int]$speedMhz
+            Type     = $type
+            TotalGB  = [math]::Round((($mods | Measure-Object -Property Capacity -Sum).Sum) / 1GB, 1)
+        }
+    } catch { return $null }
+}
+
+function Invoke-OnlineEnrichment {
+    param([pscustomobject]$System)
+
+    $enrich = [ordered]@{
+        CpuScore        = $null
+        GpuScores       = @()
+        LatestNvidia    = $null
+        LatestAmd       = $null
+        Upgradeable     = @()
+        DiskMediaTypes  = @()
+        Ram             = $null
+        EnrichedAt      = (Get-Date).ToString('s')
+        OnlineAvailable = $true
+    }
+
+    if (-not $Script:OnlineEnabled) {
+        $enrich.OnlineAvailable = $false
+        # Still gather local-only data
+        $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
+        $enrich.Ram            = Get-RamDetail
+        return [pscustomobject]$enrich
+    }
+
+    Write-Stage "Fetching live online data (PassMark, winget, vendor feeds)..."
+
+    $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
+    $enrich.Ram            = Get-RamDetail
+
+    $enrich.CpuScore = Get-CpuPassMarkScore -CpuName $System.CPU
+
+    foreach ($g in $System.GPUs) {
+        if ($g.Kind -eq 'Integrated') { continue }
+        $score = Get-GpuPassMarkScore -GpuName $g.Name
+        $enrich.GpuScores += [pscustomobject]@{
+            Name  = $g.Name
+            Score = $score
+        }
+    }
+
+    $hasNvidia = @($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' }).Count -gt 0
+    $hasAmd    = @($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' }).Count -gt 0
+    if ($hasNvidia) {
+        $nvName = ($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1).Name
+        $enrich.LatestNvidia = Get-NvidiaLatestDriver -GpuName $nvName
+    }
+    if ($hasAmd) {
+        $amdName = ($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' } | Select-Object -First 1).Name
+        $enrich.LatestAmd = Get-AmdLatestDriver -GpuName $amdName
+    }
+
+    $enrich.Upgradeable = @(Get-WingetUpgradeable)
+
+    if (-not $enrich.CpuScore -and $enrich.GpuScores.Count -eq 0 -and $enrich.Upgradeable.Count -eq 0) {
+        $enrich.OnlineAvailable = $false
+    }
+
+    Write-Ok
+    return [pscustomobject]$enrich
+}
+
+# =============================================================================
 # 7. HEALTH SCORE
 # =============================================================================
 function Get-HealthScore {
@@ -1965,18 +2245,44 @@ function Get-HealthScore {
         [string]$NetFx,
         [array]$VC,
         [pscustomobject]$WindowsHealth,
-        [pscustomobject]$NetworkHealth
+        [pscustomobject]$NetworkHealth,
+        [pscustomobject]$Enrichment
     )
 
     $cats = [ordered]@{}
 
-    $hw = 100
-    if ($System.RAM_GB -lt 16) { $hw -= 30 }
-    elseif ($System.RAM_GB -lt 32) { $hw -= 10 }
-    if ($System.LogicalCPUs -lt 8) { $hw -= 20 }
-    if (-not $System.HasDiscreteGPU) { $hw -= 25 }
+    # -----------------------------------------------------------------
+    # HARDWARE — uses PassMark CPU score when available
+    # -----------------------------------------------------------------
+    $ramScore = 100
+    if ($System.RAM_GB -lt 16)                        { $ramScore -= 30 }
+    elseif ($System.RAM_GB -lt 32)                    { $ramScore -= 10 }
+    if ($Enrichment -and $Enrichment.Ram) {
+        if ($Enrichment.Ram.Type -eq 'DDR3')          { $ramScore -= 15 }
+        elseif ($Enrichment.Ram.SpeedMHz -lt 2400)    { $ramScore -= 10 }
+        elseif ($Enrichment.Ram.SpeedMHz -lt 3200 -and $Enrichment.Ram.Type -eq 'DDR4') { $ramScore -= 5 }
+    }
+
+    $cpuScore = 100
+    if ($Enrichment -and $Enrichment.CpuScore) {
+        $mark = $Enrichment.CpuScore
+        $cpuScore = if     ($mark -ge 35000) { 100 }
+                    elseif ($mark -ge 20000) { 95 }
+                    elseif ($mark -ge 12000) { 85 }
+                    elseif ($mark -ge 7000)  { 70 }
+                    elseif ($mark -ge 3500)  { 55 }
+                    else                     { 30 }
+    } else {
+        if ($System.LogicalCPUs -lt 8)  { $cpuScore = 60 }
+        elseif ($System.LogicalCPUs -ge 16) { $cpuScore = 95 }
+    }
+
+    $hw = [int](($ramScore * 0.4) + ($cpuScore * 0.6))
     $cats['Hardware'] = [math]::Max(0, $hw)
 
+    # -----------------------------------------------------------------
+    # STORAGE
+    # -----------------------------------------------------------------
     $st = 100
     if ($System.Disks.Count -gt 0) {
         $worst = ($System.Disks | Sort-Object FreePct | Select-Object -First 1).FreePct
@@ -1984,46 +2290,104 @@ function Get-HealthScore {
         elseif ($worst -lt 10) { $st = 55 }
         elseif ($worst -lt 20) { $st = 80 }
     }
+    if ($Enrichment -and $Enrichment.DiskMediaTypes.Count -gt 0) {
+        $hasNvme = @($Enrichment.DiskMediaTypes | Where-Object BusType -eq 'NVMe').Count -gt 0
+        $hasSsd  = @($Enrichment.DiskMediaTypes | Where-Object MediaType -eq 'SSD').Count -gt 0
+        if (-not $hasNvme -and -not $hasSsd) { $st = [math]::Max(0, $st - 25) }
+        elseif (-not $hasNvme -and $hasSsd)  { $st = [math]::Max(0, $st - 10) }
+    }
     $cats['Storage'] = $st
 
+    # -----------------------------------------------------------------
+    # ENGINEERING SOFTWARE — penalize outdated installs
+    # -----------------------------------------------------------------
     $rel = @($Results | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') })
     if ($rel.Count -eq 0) {
         $cats['EngineeringSoftware'] = 100
     } else {
         $healthy = @($rel | Where-Object State -eq 'Healthy').Count
-        $cats['EngineeringSoftware'] = [int](100 * $healthy / $rel.Count)
-    }
+        $baseScore = [int](100 * $healthy / $rel.Count)
 
-    $gpuScore = 100
-    $newestDriverDate = $null
-    foreach ($g in $System.GPUs) {
-        if ($g.DriverDate) {
-            try {
-                $d = [datetime]::Parse($g.DriverDate)
-                if (-not $newestDriverDate -or $d -gt $newestDriverDate) { $newestDriverDate = $d }
-            } catch { }
+        if ($Enrichment -and $Enrichment.Upgradeable.Count -gt 0) {
+            $outdatedEng = 0
+            foreach ($up in $Enrichment.Upgradeable) {
+                foreach ($r in $rel) {
+                    if ($r.Name -and $up.Name -and ($up.Name -like "*$($r.Name)*" -or $r.Name -like "*$($up.Name)*")) {
+                        $outdatedEng++
+                        break
+                    }
+                }
+            }
+            if ($outdatedEng -gt 0) {
+                $penalty = [math]::Min(30, $outdatedEng * 3)
+                $baseScore = [math]::Max(0, $baseScore - $penalty)
+            }
         }
+        $cats['EngineeringSoftware'] = $baseScore
     }
-    if ($newestDriverDate) {
-        $ageDays = (New-TimeSpan -Start $newestDriverDate -End (Get-Date)).Days
-        if ($ageDays -gt 365)      { $gpuScore = 55 }
-        elseif ($ageDays -gt 180)  { $gpuScore = 75 }
-        elseif ($ageDays -gt 90)   { $gpuScore = 90 }
-    }
-    $cats['GPU'] = $gpuScore
 
+    # -----------------------------------------------------------------
+    # GPU — PassMark G3D scores + real vendor driver version comparison
+    # -----------------------------------------------------------------
+    $gpuScore = 100
+    if ($Enrichment -and $Enrichment.GpuScores.Count -gt 0) {
+        $best = ($Enrichment.GpuScores | Where-Object Score | Sort-Object Score -Descending | Select-Object -First 1)
+        if ($best -and $best.Score) {
+            $g = $best.Score
+            $gpuScore = if     ($g -ge 25000) { 100 }
+                        elseif ($g -ge 15000) { 95 }
+                        elseif ($g -ge 8000)  { 85 }
+                        elseif ($g -ge 3000)  { 70 }
+                        elseif ($g -ge 1000)  { 50 }
+                        else                  { 25 }
+        }
+    } elseif (-not $System.HasDiscreteGPU) {
+        $gpuScore = 40
+    }
+
+    $driverPenalty = 0
+    $installedNv  = ($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1).DriverVersion
+
+    if ($Enrichment -and $Enrichment.LatestNvidia -and $installedNv) {
+        $nvLatest = $Enrichment.LatestNvidia -replace '\.',''
+        $nvInst   = $installedNv -replace '\.',''
+        if ($nvInst.Length -gt 5) { $nvInst = $nvInst.Substring($nvInst.Length - 5) }
+        try {
+            if ([int]$nvLatest -gt [int]$nvInst) { $driverPenalty = 15 }
+        } catch { }
+    }
+
+    if ($driverPenalty -eq 0 -and $Enrichment -and $Enrichment.Upgradeable.Count -gt 0) {
+        $gpuUp = @($Enrichment.Upgradeable | Where-Object {
+            $_.Name -match 'NVIDIA|GeForce|Radeon|AMD|Intel.*Graphics'
+        }).Count
+        if ($gpuUp -gt 0) { $driverPenalty = 10 }
+    }
+
+    $cats['GPU'] = [math]::Max(0, $gpuScore - $driverPenalty)
+
+    # -----------------------------------------------------------------
+    # DRIVERS
+    # -----------------------------------------------------------------
     $drv = 100
-    if ($NetFx -match '^4\.[0-6]')     { $drv -= 40 }
-    elseif ($NetFx -eq '4.7')          { $drv -= 15 }
-    if (-not $VC -or $VC.Count -eq 0)  { $drv -= 30 }
+    if ($NetFx -match '^4\.[0-6]')    { $drv -= 40 }
+    elseif ($NetFx -eq '4.7')         { $drv -= 15 }
+    if (-not $VC -or $VC.Count -eq 0) { $drv -= 30 }
+    if ($driverPenalty -gt 0)         { $drv -= $driverPenalty }
     $cats['Drivers'] = [math]::Max(0, $drv)
 
+    # -----------------------------------------------------------------
+    # LICENSING
+    # -----------------------------------------------------------------
     $licIssues = @($rel | Where-Object { @($_.Findings | Where-Object Id -match 'LICSVC').Count -gt 0 }).Count
     $cats['Licensing'] = if ($rel.Count -eq 0) { 100 } else { [int](100 - (100 * $licIssues / $rel.Count)) }
 
     $cats['Windows'] = if ($WindowsHealth) { $WindowsHealth.Score } else { 85 }
     $cats['Network'] = if ($NetworkHealth) { $NetworkHealth.Score } else { 90 }
 
+    # -----------------------------------------------------------------
+    # THERMALS
+    # -----------------------------------------------------------------
     $th = 85
     if ($System.ThermalZones -and $System.ThermalZones.Count -gt 0) {
         $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
@@ -2060,6 +2424,11 @@ $windowsHealth = Get-WindowsHealth -System $sys
 $networkHealth = Get-NetworkHealth -System $sys -Catalog $Script:RawCatalog -Installed $installed
 
 # ---------------------------------------------------------------------------
+# Online enrichment
+# ---------------------------------------------------------------------------
+$enrichment = Invoke-OnlineEnrichment -System $sys
+
+# ---------------------------------------------------------------------------
 # Live GPU sample (optional)
 # ---------------------------------------------------------------------------
 $liveGpu = @()
@@ -2070,7 +2439,8 @@ if ($LiveGpuSample) {
 }
 
 $score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx -VC $vc `
-                         -WindowsHealth $windowsHealth -NetworkHealth $networkHealth
+                         -WindowsHealth $windowsHealth -NetworkHealth $networkHealth `
+                         -Enrichment $enrichment
 
 # =============================================================================
 # 8. DISCIPLINE ROLLUP
@@ -2212,7 +2582,6 @@ function Invoke-ProjectGuardian {
         Write-Host ("    {0,-14} {1,6}" -f $_.Key, $_.Value)
     }
 
-    # ---- XREF / reference scan ----
     $dwgFiles = @($scan | Where-Object { $_.Extension -in @('.dwg','.dxf') })
     $maxDwg = 200
     if ($dwgFiles.Count -gt $maxDwg) {
@@ -2311,6 +2680,7 @@ Ensure-Folder $exportPath
     Score         = $score
     WindowsHealth = $windowsHealth
     NetworkHealth = $networkHealth
+    Enrichment    = $enrichment
     LiveGpu       = $liveGpu
     Guardian      = $guardian
     Results       = $allResults
@@ -2362,6 +2732,9 @@ $style = @'
 
  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px 0}
  .legend .chip{font-size:12px;padding:4px 10px}
+
+ .enrich{background:#eef6ff;border-left:5px solid #2b6cb0;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
+ .enrich b{color:#0b5394}
 </style>
 '@
 
@@ -2388,6 +2761,52 @@ foreach ($k in $score.Categories.Keys) {
     [void]$sb.AppendLine("<div><b>$($score.Categories[$k])</b><span>$k</span></div>")
 }
 [void]$sb.AppendLine("</div></div>")
+
+# Online enrichment summary
+[void]$sb.AppendLine("<h2>Online Enrichment</h2><div class='enrich'>")
+if (-not $enrichment.OnlineAvailable) {
+    [void]$sb.AppendLine("<b>Online data unavailable</b> — using local heuristics only. Scores may be less accurate.")
+} else {
+    [void]$sb.AppendLine("<b>Online lookups succeeded.</b> These live values were used in the score:")
+    [void]$sb.AppendLine("<ul>")
+    if ($enrichment.CpuScore) {
+        [void]$sb.AppendLine("<li>CPU PassMark score: <b>$($enrichment.CpuScore)</b></li>")
+    }
+    if ($enrichment.GpuScores.Count -gt 0) {
+        foreach ($gs in $enrichment.GpuScores) {
+            $sc = if ($gs.Score) { $gs.Score } else { 'n/a' }
+            [void]$sb.AppendLine("<li>GPU PassMark G3D — $($gs.Name): <b>$sc</b></li>")
+        }
+    }
+    if ($enrichment.LatestNvidia) {
+        [void]$sb.AppendLine("<li>Latest NVIDIA driver (vendor feed): <b>$($enrichment.LatestNvidia)</b></li>")
+    }
+    if ($enrichment.LatestAmd) {
+        [void]$sb.AppendLine("<li>Latest AMD driver (vendor feed): <b>$($enrichment.LatestAmd)</b></li>")
+    }
+    if ($enrichment.Ram) {
+        [void]$sb.AppendLine("<li>RAM: $($enrichment.Ram.TotalGB) GB $($enrichment.Ram.Type) @ $($enrichment.Ram.SpeedMHz) MHz ($($enrichment.Ram.Modules) modules)</li>")
+    }
+    if ($enrichment.DiskMediaTypes.Count -gt 0) {
+        $media = ($enrichment.DiskMediaTypes | ForEach-Object { "$($_.BusType)/$($_.MediaType) ($($_.SizeGB) GB)" }) -join ', '
+        [void]$sb.AppendLine("<li>Physical disks: $media</li>")
+    }
+    if ($enrichment.Upgradeable.Count -gt 0) {
+        [void]$sb.AppendLine("<li>Outdated packages: <b>$($enrichment.Upgradeable.Count)</b> winget packages have updates available.</li>")
+    }
+    [void]$sb.AppendLine("</ul>")
+}
+[void]$sb.AppendLine("</div>")
+
+# Outdated packages table
+if ($enrichment.Upgradeable.Count -gt 0) {
+    [void]$sb.AppendLine("<h3>Outdated packages (from winget)</h3><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th>Name</th><th>Id</th><th>Installed</th><th>Available</th></tr>")
+    foreach ($u in ($enrichment.Upgradeable | Select-Object -First 50)) {
+        [void]$sb.AppendLine("<tr><td>$($u.Name)</td><td class='small'>$($u.Id)</td><td>$($u.Installed)</td><td><b>$($u.Available)</b></td></tr>")
+    }
+    [void]$sb.AppendLine("</table></div>")
+}
 
 # Legend
 [void]$sb.AppendLine("<h2>Legend</h2>")
