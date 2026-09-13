@@ -3,7 +3,7 @@
 .SYNOPSIS
     Sigma Engineer Toolkit — engineering workstation diagnostic + software installer.
 .DESCRIPTION
-    Diagnostic pass over every engineering discipline.
+    Read-only diagnostic pass over every engineering discipline.
     Detects installed software, checks prerequisites, writes a report.
     Includes health scoring, structured findings, preflight, project guardian,
     Windows/Network health, License Center, live GPU sampling, and a winget-based
@@ -58,7 +58,7 @@ Write-Host "[INFO] The tool can install engineering software." -ForegroundColor 
 Write-Host "[INFO] Online enrichment: PassMark benchmarks, vendor driver feeds, winget." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
-Write-Host "[WARNING] This scanning tool isn't 100% accurate." -ForegroundColor Yellow
+Write-Host "[WARNING] This scaning tool isn't 100% accurate." -ForegroundColor Yellow
 if ($Offline) {
     Write-Host "[INFO] Offline mode: online enrichment disabled." -ForegroundColor Cyan
 }
@@ -146,11 +146,9 @@ function Get-GpuKind {
     if (-not $Name) { return 'Unknown' }
     $n = $Name.ToLower()
     if ($n -match 'microsoft basic')                { return 'Basic' }
-    if ($n -match 'intel.*arc')                     { return 'Discrete' }
     if ($n -match 'intel')                          { return 'Integrated' }
     if ($n -match 'nvidia|geforce|rtx|quadro')      { return 'Discrete' }
     if ($n -match 'radeon pro|radeon rx|firepro')   { return 'Discrete' }
-    if ($n -match 'radeon hd|radeon r[79]|radeon vega') { return 'Discrete' }
     if ($n -match 'radeon|amd')                     { return 'Integrated' }
     return 'Unknown'
 }
@@ -185,17 +183,16 @@ function Get-PowerState {
         $acCodes = @(2, 3, 6, 7, 8, 9, 11)
         $onAc = $acCodes -contains [int]$b.BatteryStatus
         $text = switch ([int]$b.BatteryStatus) {
-            1  { 'Other (typically discharging)' }
-            2  { 'Unknown (typically on AC)' }
+            1  { 'Discharging' }
+            2  { 'On AC' }
             3  { 'Fully charged' }
             4  { 'Low' }
             5  { 'Critical' }
             6  { 'Charging' }
-            7  { 'Charging and High' }
-            8  { 'Charging and Low' }
-            9  { 'Charging and Critical' }
-            10 { 'Undefined' }
-            11 { 'Partially Charged' }
+            7  { 'Charging (High)' }
+            8  { 'Charging (Low)' }
+            9  { 'Charging (Critical)' }
+            11 { 'Partially charged' }
             default { "Unknown ($($b.BatteryStatus))" }
         }
         return [pscustomobject]@{
@@ -2070,12 +2067,11 @@ function Get-NvidiaLatestDriver {
             'gtx10' { 101 }
         }
         try {
-            $osId = if ([Environment]::OSVersion.Version.Build -ge 22000) { 135 } else { 57 }
             $body = @{
                 func = 'DriverManualLookup'
                 psid = $psid
                 pfid = 0
-                osID = $osId
+                osID = 135
                 lid  = 1
                 whql = 1
                 dch  = 1
