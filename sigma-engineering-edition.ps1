@@ -11,13 +11,22 @@
 
 .NOTES
     Accuracy notes (read before trusting findings):
-      * Thermal readings come from MSAcpi_ThermalZoneTemperature, which is often
-        absent or reports motherboard/PCH temperatures on modern hardware.
-      * DWG reference scanning is heuristic — the DWG format is proprietary
-        binary. Verify broken-reference lists in the CAD application.
-      * License port checks only probe localhost. Remote license servers will
-        always appear "closed."
-      * VRAM is read from the display-class registry (QWORD), not AdapterRAM.
+      * Every hardware, software, OS, network and license fact is derived from a
+        documented Windows API.
+      * Thermal readings use ACPI + performance-counter sources. Windows exposes
+        no supported CPU-package sensor. Readings may be absent or wrong on
+        modern hardware. Treat as heuristic.
+      * Intel iGPU VRAM is shared system memory, not dedicated. NVIDIA/AMD
+        discrete VRAM is read from the display-class registry.
+      * DWG reference scanning is heuristic. DWG 2004+ uses compressed sections
+        and is skipped (reported as UNSCANNED) rather than parsed. DXF and
+        DWG 2000-and-earlier are scanned. Verify broken references in the CAD
+        application.
+      * License port checks only probe localhost. "Listening" is informational;
+        it does not mean a license is available. Node-locked licenses never
+        listen on TCP.
+      * The Sigma Heuristic Index is a composite of category scores, not a
+        measurement. Compare machines on the category breakdown, not the total.
 .PARAMETER Disciplines
     Optional filter. If set, only products relevant to these disciplines are
     fully evaluated. Others are marked NotApplicable.
@@ -101,7 +110,6 @@ function Ensure-Folder { param([string]$P)
 }
 function Expand-Env { param([string]$S) [Environment]::ExpandEnvironmentVariables($S) }
 
-# --- FIX #1: HTML escaping helper ---
 function ConvertTo-HtmlSafe {
     param([object]$Text)
     if ($null -eq $Text) { return '' }
@@ -114,13 +122,13 @@ function ConvertTo-HtmlSafe {
     return $s
 }
 
-# --- FIX #2: skip reparse points to avoid junction loops / double-counting ---
+# Skip reparse points (junction loops) — filter on Attributes, not just at the root.
 function Get-FolderSizeGB {
     param([string]$Path)
     try {
         if (-not (Test-Path $Path)) { return 0 }
-        $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File `
-                    -Attributes !ReparsePoint -ErrorAction SilentlyContinue |
+        $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+                  Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
                   Measure-Object -Property Length -Sum).Sum
         if (-not $bytes) { return 0 }
         [math]::Round($bytes / 1GB, 2)
@@ -152,69 +160,127 @@ function Test-TcpPort {
     finally { try { $client.Close() } catch { } }
 }
 
+# --- PCI vendor ID from PNPDeviceID (VEN_xxxx). More reliable than name regex. ---
+function Get-GpuVendorId {
+    param([string]$PNPDeviceID)
+    if (-not $PNPDeviceID) { return '' }
+    if ($PNPDeviceID -match 'VEN_([0-9A-Fa-f]{4})') { return $Matches[1].ToUpper() }
+    return ''
+}
+
+# --- Classification uses PCI vendor ID, with name heuristics for vendor-internal
+#     ambiguity (Intel Arc vs UHD, AMD APU vs dGPU).
 function Get-GpuKind {
-    param([string]$Name)
-    if (-not $Name) { return 'Unknown' }
-    $n = $Name.ToLower()
-    if ($n -match 'microsoft basic')                { return 'Basic' }
-    if ($n -match 'intel')                          { return 'Integrated' }
-    if ($n -match 'nvidia|geforce|rtx|quadro')      { return 'Discrete' }
-    if ($n -match 'radeon pro|radeon rx|firepro')   { return 'Discrete' }
-    if ($n -match 'radeon|amd')                     { return 'Integrated' }
-    return 'Unknown'
-}
+    param([string]$Name, [string]$PNPDeviceID)
+    $n = "$Name".ToLower()
+    if ($n -match 'microsoft basic') { return 'Basic' }
 
-# --- FIX #4: read real VRAM from display-class registry (QWORD, no overflow) ---
-function Get-GpuVramBytes {
-    param([string]$AdapterName)
-    try {
-        $base = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
-        $keys = Get-ChildItem -Path $base -ErrorAction Stop |
-                Where-Object { $_.PSChildName -match '^\d{4}$' }
-        foreach ($k in $keys) {
-            $props = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
-            if (-not $props) { continue }
-            $desc = $props.DriverDesc
-            if (-not $desc) { continue }
-            $match = ($desc -like "*$AdapterName*") -or ($AdapterName -like "*$desc*") `
-                     -or (($AdapterName -split '\s+' | Select-Object -First 2) -join ' ' -like "*$($desc -split '\s+' | Select-Object -First 2)" -join ' ' -like '*')
-            if ($match) {
-                $mem = $props.'HardwareInformation.MemorySize'
-                if ($mem) {
-                    # Can be byte[], DWORD or QWORD depending on driver; handle all.
-                    if ($mem -is [byte[]]) {
-                        if ($mem.Length -ge 8) { return [BitConverter]::ToUInt64($mem, 0) }
-                        elseif ($mem.Length -ge 4) { return [uint64][BitConverter]::ToUInt32($mem, 0) }
-                    } else {
-                        return [uint64]$mem
-                    }
-                }
-            }
+    $ven = Get-GpuVendorId -PNPDeviceID $PNPDeviceID
+    switch ($ven) {
+        '10DE' { return 'Discrete' }          # NVIDIA — all current desktop/mobile parts are discrete
+        '1002' {                               # AMD
+            if ($n -match 'radeon pro|firepro|instinct|radeon rx|radeon vii') { return 'Discrete' }
+            if ($n -match 'radeon graphics|vega \d|renoir|cezanne|rembrandt|phoenix|picasso|raven ridge|lucienne|barcelo') { return 'Integrated' }
+            return 'Unknown'
         }
-    } catch { }
-    return [uint64]0
+        '8086' {                               # Intel
+            if ($n -match 'arc a\d|arc b\d|arc pro|dg1|dg2') { return 'Discrete' }
+            if ($n -match 'iris|uhd|hd graphics')            { return 'Integrated' }
+            return 'Unknown'
+        }
+        '1414' { return 'Basic' }              # Microsoft Basic Render Driver
+        default {
+            if ($n -match 'nvidia|geforce|rtx|quadro') { return 'Discrete' }
+            return 'Unknown'
+        }
+    }
 }
 
-# --- FIX #5: filter invalid thermal zone readings ---
+# --- VRAM read from display-class registry, correlated by MatchingDeviceId
+#     (exact) instead of DriverDesc substring (loose). AdapterRAM is UInt32 and
+#     wraps above ~4 GB; used only as last-resort fallback.
+function Get-GpuVramBytes {
+    param(
+        [string]$PNPDeviceID,
+        [string]$AdapterName,
+        [uint64]$AdapterRamFallback = 0
+    )
+    if (-not $PNPDeviceID) { return $AdapterRamFallback }
+
+    $base = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+    try {
+        $keys = @(Get-ChildItem -Path $base -ErrorAction Stop |
+                  Where-Object { $_.PSChildName -match '^\d{4}$' })
+    } catch { return $AdapterRamFallback }
+
+    foreach ($k in $keys) {
+        $props = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+
+        $mid = $props.MatchingDeviceId
+        if (-not $mid) { continue }
+        if ($PNPDeviceID -notlike "*$mid*") { continue }
+
+        $mem = $props.'HardwareInformation.MemorySize'
+        if ($null -eq $mem) { continue }
+
+        if ($mem -is [byte[]]) {
+            if ($mem.Length -ge 8) { return [BitConverter]::ToUInt64($mem, 0) }
+            elseif ($mem.Length -ge 4) { return [uint64][BitConverter]::ToUInt32($mem, 0) }
+        } else {
+            return [uint64]$mem
+        }
+    }
+    return $AdapterRamFallback
+}
+
+# --- Two CIM sources; each zone tagged with its Source so the report can show
+#     provenance. Null elements are skipped, not fatal.
 function Get-ThermalInfo {
     $zones = @()
+
     try {
-        $t = Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop
+        $t = @(Get-CimInstance -Namespace 'root/WMI' `
+                    -ClassName MSAcpi_ThermalZoneTemperature `
+                    -ErrorAction SilentlyContinue)
         $i = 0
         foreach ($z in $t) {
+            if ($null -eq $z) { continue }
             $i++
             $raw = $z.CurrentTemperature
             if (-not $raw -or $raw -le 0) { continue }
             $c = ($raw / 10) - 273.15
-            # Discard physically implausible readings (WMI is often wrong)
             if ($c -lt -20 -or $c -gt 150) { continue }
             $zones += [pscustomobject]@{
+                Source  = 'ACPI'
                 Zone    = "Zone$i"
                 Celsius = [math]::Round($c, 1)
             }
         }
     } catch { }
-    return $zones
+
+    if ($zones.Count -eq 0) {
+        try {
+            $t2 = @(Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation `
+                        -ErrorAction SilentlyContinue)
+            $i = 0
+            foreach ($z in $t2) {
+                if ($null -eq $z) { continue }
+                $i++
+                $raw = $z.HighPrecisionTemperature
+                if (-not $raw) { continue }
+                $c = ($raw / 10) - 273.15
+                if ($c -lt -20 -or $c -gt 150) { continue }
+                $zones += [pscustomobject]@{
+                    Source  = 'PerfCounter'
+                    Zone    = if ($z.Name) { $z.Name } else { "Zone$i" }
+                    Celsius = [math]::Round($c, 1)
+                }
+            }
+        } catch { }
+    }
+
+    return @($zones)
 }
 
 function Get-PowerState {
@@ -254,7 +320,8 @@ function Get-PowerState {
     }
 }
 
-# --- FIX #3 + #11: include Appx/UWP and per-user installs; don't drop dupes ---
+# --- Appx filtering: exclude framework packages, system-signed components and
+#     known runtime packages. Keeps the count meaningful.
 function Get-InstalledSoftware {
     $rows = New-Object System.Collections.Generic.List[object]
 
@@ -281,7 +348,12 @@ function Get-InstalledSoftware {
     }
 
     try {
-        Get-AppxPackage -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+            -not $_.IsFramework -and
+            $_.SignatureKind -ne 'System' -and
+            $_.Name -notmatch '^Microsoft\.(VCLibs|NET\.Native|UI\.Xaml|WindowsAppRuntime|Services\.Store|Windows\.Client\.)' -and
+            $_.Name -notmatch '\.Framework$'
+        } | ForEach-Object {
             $rows.Add([pscustomobject]@{
                 DisplayName     = $_.Name
                 DisplayVersion  = $_.Version
@@ -293,8 +365,6 @@ function Get-InstalledSoftware {
         }
     } catch { }
 
-    # Do NOT dedupe by DisplayName alone — different versions/vendors can share names.
-    # Sort for stable output but keep every row.
     $rows | Sort-Object DisplayName, DisplayVersion
 }
 
@@ -314,6 +384,13 @@ function Get-DotNetFrameworkVersion {
             default         { return "Unknown ($rel)" }
         }
     } catch { return 'Not found' }
+}
+
+function Get-DotNet35Present {
+    try {
+        $k = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5' -ErrorAction Stop
+        return ($k.Install -eq 1)
+    } catch { return $false }
 }
 
 function Compare-NetVersion {
@@ -356,34 +433,46 @@ function New-Finding {
     }
 }
 
-# --- FIX #6 + #7: sum per-PID engine utilization, and use English counter path ---
+# --- Per-process GPU utilization is the MAX across engines, not the sum.
+#     Summing 3D+Copy+VideoDecode+Compute routinely exceeds 100%. Average the
+#     per-sample per-PID max over the window.
 function Get-LiveGpuSample {
     param([int]$DurationSeconds = 2)
     try {
-        # On non-English Windows, Get-Counter still accepts the English path if
-        # the counter set is registered; otherwise the catch below returns empty.
         $samples = Get-Counter '\GPU Engine(*)\Utilization Percentage' `
                     -SampleInterval 1 -MaxSamples $DurationSeconds -ErrorAction Stop
 
-        # Accumulate summed per-engine usage per PID, then average over samples.
-        # This approximates total GPU utilization for the process.
-        $perPid = @{}
-        foreach ($s in $samples.CounterSamples) {
-            $name = $s.InstanceName
-            if ($name -notmatch 'pid_(\d+)') { continue }
-            $procId = [int]$Matches[1]
-            if (-not $perPid.ContainsKey($procId)) { $perPid[$procId] = 0.0 }
-            $perPid[$procId] += [double]$s.CookedValue
-        }
-        $avgPerPid = @{}
-        foreach ($k in $perPid.Keys) {
-            $avgPerPid[$k] = [math]::Round($perPid[$k] / [math]::Max(1, $DurationSeconds), 1)
+        $sets = @($samples)
+        if ($sets.Count -eq 0) { return @() }
+
+        $perPidHistory = @{}
+        foreach ($set in $sets) {
+            $localMax = @{}
+            foreach ($cs in $set.CounterSamples) {
+                if ($cs.InstanceName -notmatch 'pid_(\d+)') { continue }
+                $procId = [int]$Matches[1]
+                $val    = [double]$cs.CookedValue
+                if (-not $localMax.ContainsKey($procId) -or $val -gt $localMax[$procId]) {
+                    $localMax[$procId] = $val
+                }
+            }
+            foreach ($k in $localMax.Keys) {
+                if (-not $perPidHistory.ContainsKey($k)) { $perPidHistory[$k] = @() }
+                $perPidHistory[$k] += $localMax[$k]
+            }
         }
 
-        $top = $avgPerPid.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
+        $avg = foreach ($k in $perPidHistory.Keys) {
+            [pscustomobject]@{
+                Pid = $k
+                GPU = [math]::Round(($perPidHistory[$k] | Measure-Object -Average).Average, 1)
+            }
+        }
+
+        $top = $avg | Sort-Object GPU -Descending | Select-Object -First 5
         $out = foreach ($t in $top) {
-            $pname = try { (Get-Process -Id $t.Key -ErrorAction Stop).ProcessName } catch { "pid $($t.Key)" }
-            [pscustomobject]@{ Pid = $t.Key; Process = $pname; GPU = [math]::Round($t.Value, 1) }
+            $pname = try { (Get-Process -Id $t.Pid -ErrorAction Stop).ProcessName } catch { "pid $($t.Pid)" }
+            [pscustomobject]@{ Pid = $t.Pid; Process = $pname; GPU = $t.GPU }
         }
         return @($out)
     } catch {
@@ -765,15 +854,22 @@ $sys = & {
     $gpus = @(Get-CimInstance Win32_VideoController)
 
     $gpuInfo = foreach ($g in $gpus) {
-        # FIX #4 / #8: use registry-based VRAM (QWORD) instead of AdapterRAM
-        $vramBytes = Get-GpuVramBytes -AdapterName $g.Name
-        $vramGB = if ($vramBytes -gt 0) { [math]::Round($vramBytes / 1GB, 2) } else { $null }
+        # AdapterRAM is UInt32 and wraps above ~4 GB. Use as fallback only.
+        $ramFallback = [uint64]0
+        if ($g.AdapterRAM) { $ramFallback = [uint64]$g.AdapterRAM }
+
+        $vramBytes = Get-GpuVramBytes `
+                        -PNPDeviceID $g.PNPDeviceID `
+                        -AdapterName  $g.Name `
+                        -AdapterRamFallback $ramFallback
+
         [pscustomobject]@{
             Name          = $g.Name
-            Kind          = Get-GpuKind -Name $g.Name
+            PNPDeviceID   = $g.PNPDeviceID
+            Kind          = Get-GpuKind -Name $g.Name -PNPDeviceID $g.PNPDeviceID
             DriverVersion = $g.DriverVersion
             DriverDate    = if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') } else { '' }
-            VRAM_GB       = $vramGB
+            VRAM_GB       = if ($vramBytes -gt 0) { [math]::Round($vramBytes / 1GB, 2) } else { $null }
             Resolution    = "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
         }
     }
@@ -841,9 +937,10 @@ Write-Ok
 # 5. PREREQUISITES
 # =============================================================================
 Write-Stage "Checking prerequisites..."
-$netFx = Get-DotNetFrameworkVersion
-$vc    = @(Get-VCRedist)
-Write-Host " .NET=$netFx, VC++=$($vc.Count) entries." -ForegroundColor Green
+$netFx   = Get-DotNetFrameworkVersion
+$netFx35 = Get-DotNet35Present
+$vc      = @(Get-VCRedist)
+Write-Host " .NET4=$netFx, .NET3.5=$netFx35, VC++=$($vc.Count) entries." -ForegroundColor Green
 
 # =============================================================================
 # 5b. WINDOWS HEALTH
@@ -887,15 +984,30 @@ function Get-WindowsHealth {
         $r.UpdateService = $wu.Status.ToString()
     } catch { }
 
+    # Defender: distinguish "Windows Defender active", "third-party AV active",
+    # and "no AV at all". Third-party AV that disables Defender is not a fault.
+    $r.Defender = 'Unknown'
+    $defenderEnabled = $null
+    $thirdParty = @()
+
     try {
         $def = Get-MpComputerStatus -ErrorAction Stop
-        $r.Defender = if ($def.AntivirusEnabled) { 'Active' } else { 'Off' }
-    } catch {
-        try {
-            $sc = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
-            $r.Defender = if ($sc) { 'Active' } else { 'Unknown' }
-        } catch { }
-    }
+        $defenderEnabled = [bool]$def.AntivirusEnabled
+    } catch { }
+
+    try {
+        $av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop)
+        foreach ($a in $av) {
+            if ($a.displayName -match 'Windows Defender') { continue }
+            # productState bit 0x1000 = enabled
+            $isOn = if ($a.productState) { (([int]$a.productState) -band 0x1000) -ne 0 } else { $true }
+            if ($isOn) { $thirdParty += $a.displayName }
+        }
+    } catch { }
+
+    if ($defenderEnabled -eq $true)      { $r.Defender = 'Windows Defender (active)' }
+    elseif ($thirdParty.Count -gt 0)     { $r.Defender = "Third-party: $($thirdParty -join ', ')" }
+    elseif ($defenderEnabled -eq $false) { $r.Defender = 'NONE' }
 
     try {
         $fw = Get-NetFirewallProfile -ErrorAction Stop
@@ -928,7 +1040,7 @@ function Get-WindowsHealth {
     $s = 100
     if ($r.PendingReboot)                                   { $s -= 20 }
     if ($r.UpdateService -ne 'Running')                     { $s -= 15 }
-    if ($r.Defender -eq 'Off')                              { $s -= 15 }
+    if ($r.Defender -eq 'NONE')                             { $s -= 15 }
     if ($r.Firewall -eq 'Off')                              { $s -= 10 }
     if ($r.Activation -in @('Unlicensed','Notification','Non-Genuine Grace')) { $s -= 25 }
     if ($r.BuildAgeDays -gt 3 * 365)                        { $s -= 10 }
@@ -954,38 +1066,42 @@ function Get-NetworkHealth {
         Score         = 100
     }
 
+    # .Speed is UInt64 bits-per-second; locale-independent.
     try {
         $nics = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object Status -eq 'Up')
-        $maxMbps = 0
+        $maxBps = [uint64]0
         foreach ($n in $nics) {
-            $mbps = 0
-            if ($n.LinkSpeed -match '([\d\.]+)\s*Gbps')      { $mbps = [double]$Matches[1] * 1000 }
-            elseif ($n.LinkSpeed -match '([\d\.]+)\s*Mbps')  { $mbps = [double]$Matches[1] }
-            if ($mbps -gt $maxMbps) { $maxMbps = $mbps }
+            $bps = [uint64]0
+            try { $bps = [uint64]$n.Speed } catch { }
+            if ($bps -gt $maxBps) { $maxBps = $bps }
             $r.Adapters += [pscustomobject]@{
                 Name      = $n.Name
-                LinkSpeed = $n.LinkSpeed
+                LinkSpeed = if ($bps -gt 0) {
+                                if ($bps -ge 1GB) { "$([math]::Round($bps/1GB,1)) Gbps" }
+                                else { "$([math]::Round($bps/1MB,0)) Mbps" }
+                            } else { '' }
                 Mac       = $n.MacAddress
             }
         }
-        $r.LinkSpeedMbps = [int]$maxMbps
-        $r.LinkSpeedText = if ($maxMbps -ge 1000) { "$([math]::Round($maxMbps/1000,1)) Gbps" }
-                           elseif ($maxMbps -gt 0) { "$maxMbps Mbps" } else { '' }
+        $r.LinkSpeedMbps = [int][math]::Round($maxBps / 1MB, 0)
+        $r.LinkSpeedText = if ($maxBps -ge 1GB) { "$([math]::Round($maxBps/1GB,1)) Gbps" }
+                           elseif ($maxBps -gt 0) { "$([math]::Round($maxBps/1MB,0)) Mbps" } else { '' }
     } catch { }
 
-    # FIX #14: try two resolvers; only report Failed if both fail
+    # Multi-resolver DNS check; wait on the async task to avoid cmdlet version issues.
     $dnsOk = $false
-    foreach ($host in @('microsoft.com','cloudflare.com')) {
+    foreach ($h in @('microsoft.com','cloudflare.com','google.com','quad9.net')) {
         try {
-            $null = Resolve-DnsName $host -ErrorAction Stop -QuickTimeout
-            $dnsOk = $true
-            break
+            $task = [System.Net.Dns]::GetHostAddressesAsync($h)
+            if ($task.Wait(3000) -and $task.Result.Count -gt 0) { $dnsOk = $true; break }
         } catch { }
     }
     $r.DNS = if ($dnsOk) { 'OK' } else { 'Failed' }
 
     try {
-        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -First 1
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                 Where-Object { $_.NextHop -ne '0.0.0.0' } |
+                 Select-Object -First 1
         if ($route) { $r.DefaultGW = $route.NextHop }
     } catch { }
 
@@ -1028,6 +1144,7 @@ function Invoke-Preflight {
         [array]$Catalog,
         [pscustomobject]$System,
         [string]$NetFx,
+        [bool]$NetFx35,
         [array]$VC,
         [array]$Installed
     )
@@ -1048,21 +1165,26 @@ function Invoke-Preflight {
         return
     }
 
-    $script:pass = 0; $script:warn = 0; $script:fail = 0
+    $counters = @{ OK = 0; WARN = 0; FAIL = 0 }
     function Report {
         param([string]$State, [string]$Label, [string]$Detail = '')
         switch ($State) {
-            'OK'   { Write-Host "  [ OK ]  " -ForegroundColor Green -NoNewline; $script:pass++ }
-            'WARN' { Write-Host "  [WARN]  " -ForegroundColor Yellow -NoNewline; $script:warn++ }
-            'FAIL' { Write-Host "  [FAIL]  " -ForegroundColor Red -NoNewline; $script:fail++ }
+            'OK'   { Write-Host "  [ OK ]  " -ForegroundColor Green -NoNewline;  $counters.OK++ }
+            'WARN' { Write-Host "  [WARN]  " -ForegroundColor Yellow -NoNewline; $counters.WARN++ }
+            'FAIL' { Write-Host "  [FAIL]  " -ForegroundColor Red -NoNewline;    $counters.FAIL++ }
         }
         Write-Host $Label -NoNewline
         if ($Detail) { Write-Host "  ($Detail)" -ForegroundColor DarkGray } else { Write-Host "" }
     }
 
+    $minRam = 0
+    if ($entry.MinRAM) { $minRam = [int]$entry.MinRAM }
+
     if ($entry.RAM) {
         if ($System.RAM_GB -ge $entry.RAM) {
             Report 'OK' "RAM installed" "$($System.RAM_GB) GB >= $($entry.RAM) GB recommended"
+        } elseif ($minRam -gt 0 -and $System.RAM_GB -lt $minRam) {
+            Report 'FAIL' "RAM below vendor minimum" "$($System.RAM_GB) GB installed, $minRam GB minimum"
         } else {
             Report 'WARN' "RAM below recommendation" "$($System.RAM_GB) GB installed, $($entry.RAM) GB recommended"
         }
@@ -1086,7 +1208,10 @@ function Invoke-Preflight {
     }
 
     if ($entry.Net) {
-        if (Compare-NetVersion -Have $NetFx -Need $entry.Net) {
+        if ($entry.Net -like '3.5*') {
+            if ($NetFx35) { Report 'OK' ".NET Framework 3.5" "present" }
+            else          { Report 'FAIL' ".NET Framework 3.5" "not installed" }
+        } elseif (Compare-NetVersion -Have $NetFx -Need $entry.Net) {
             Report 'OK' ".NET Framework" "$NetFx >= $($entry.Net)"
         } else {
             Report 'FAIL' ".NET Framework" "have $NetFx, need $($entry.Net)"
@@ -1111,8 +1236,10 @@ function Invoke-Preflight {
     }
 
     if ($entry.Lsvc) {
+        # Require licensing-related token in the service name/display name.
         $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
-            $n = $_.Name + ' ' + $_.DisplayName
+            $n = "$($_.Name) $($_.DisplayName)"
+            if ($n -notmatch 'licens|lmgrd|flexnet|sentinel|hasplm|selectserver') { return $false }
             foreach ($pat in $entry.Lsvc) { if ($n -like $pat) { return $true } }
             return $false
         })
@@ -1129,21 +1256,23 @@ function Invoke-Preflight {
         $open = @()
         foreach ($p in $entry.Lport) { if (Test-TcpPort -Port $p -TimeoutMs 800) { $open += $p } }
         if ($open.Count -gt 0) {
-            Report 'OK' "License port(s) open" ($open -join ', ')
+            Report 'OK' "License port(s) listening locally" ($open -join ', ')
         } else {
-            Report 'WARN' "License ports closed locally" "normal for node-locked or remote servers"
+            Report 'WARN' "No license ports listening locally" "normal for node-locked or remote servers"
         }
     }
 
     if ($System.ThermalZones -and $System.ThermalZones.Count -gt 0) {
         $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
         if ($max -lt 80) {
-            Report 'OK' "CPU temperature" "$max C"
+            Report 'OK' "Thermal zone reading" "$max C (heuristic)"
         } elseif ($max -lt 95) {
-            Report 'WARN' "CPU temperature elevated" "$max C"
+            Report 'WARN' "Thermal zone reading elevated" "$max C (heuristic)"
         } else {
-            Report 'FAIL' "CPU temperature critical" "$max C"
+            Report 'FAIL' "Thermal zone reading critical" "$max C (heuristic)"
         }
+    } else {
+        Report 'OK' "No thermal zone exposed" "Windows does not provide one on this system"
     }
 
     if ($System.Power.HasBattery) {
@@ -1154,36 +1283,44 @@ function Invoke-Preflight {
         }
     }
 
-    $heavyNames = @('chrome','msedge','firefox','teams','slack','discord','zoom',
-                    'photoshop','illustrator','premiere','aftereffects',
-                    'code','devenv','rider','webstorm','pycharm','idea',
-                    'excel','powerpnt','winword','outlook','spotify','obs','blender')
+    # Private working set is what actually frees up when a process exits.
+    $heavyNames = @(
+        'chrome','msedge','firefox','brave','opera',
+        'teams','ms-teams','slack','discord','zoom','webexmta',
+        'spotify','obs64','obs32',
+        'photoshop','illustrator','premiere','aftereffects','indesign',
+        'code','devenv','rider64','webstorm64','pycharm64','idea64','goland64',
+        'excel','powerpnt','winword','outlook','onenote',
+        'blender','unity','unrealengine','ue4editor','ue5editor',
+        'matlab','ansyswb2','maple','mathematica'
+    )
     $heavy = @()
     $recoverGB = 0
     try {
-        $procs = Get-Process -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            if ($heavyNames -contains $p.ProcessName.ToLower()) {
-                $gb = [math]::Round($p.WorkingSet64 / 1GB, 2)
-                $heavy += [pscustomobject]@{ Name = $p.ProcessName; GB = $gb }
-                $recoverGB += $gb
-            }
+        foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+            if ($heavyNames -notcontains $p.ProcessName.ToLower()) { continue }
+            $gb = [math]::Round($p.PrivateMemorySize64 / 1GB, 2)
+            if ($gb -le 0) { continue }
+            $heavy += [pscustomobject]@{ Name = $p.ProcessName; GB = $gb }
+            $recoverGB += $gb
         }
     } catch { }
     if ($heavy.Count -eq 0) {
         Report 'OK' "No heavy background apps detected"
     } else {
         $recoverGB = [math]::Round($recoverGB, 1)
-        Report 'WARN' "$($heavy.Count) heavy application(s) open" "closing them recovers ~$recoverGB GB"
+        Report 'WARN' "$($heavy.Count) heavy application(s) open" "closing them frees up to ~$recoverGB GB of private working set"
         foreach ($h in ($heavy | Sort-Object GB -Descending | Select-Object -First 5)) {
             Write-Host ("           - {0,-14} {1,5} GB" -f $h.Name, $h.GB) -ForegroundColor DarkGray
         }
     }
 
     Write-Host ""
-    $verdict = if ($fail -gt 0) { 'NOT READY' } elseif ($warn -gt 2) { 'CAUTION' } else { 'READY' }
-    $col = if ($fail -gt 0) { 'Red' } elseif ($warn -gt 2) { 'Yellow' } else { 'Green' }
-    Write-Host ("  $script:pass OK   $script:warn WARN   $script:fail FAIL   ->  $verdict") -ForegroundColor $col
+    $verdict = if ($counters.FAIL -gt 0) { 'NOT READY' }
+               elseif ($counters.WARN -gt 2) { 'CAUTION' }
+               else { 'READY' }
+    $col = if ($counters.FAIL -gt 0) { 'Red' } elseif ($counters.WARN -gt 2) { 'Yellow' } else { 'Green' }
+    Write-Host ("  $($counters.OK) OK   $($counters.WARN) WARN   $($counters.FAIL) FAIL   ->  $verdict") -ForegroundColor $col
     Write-Host ""
 }
 
@@ -1215,7 +1352,6 @@ function Invoke-WhySlow {
                   }
     } catch { }
 
-    # FIX #10: skip System Idle Process and filter sub-0.5% CPU noise
     $topCpu = @()
     try {
         $s1 = @{}
@@ -1303,7 +1439,8 @@ function Invoke-WhySlow {
 # =============================================================================
 if ($Preflight) {
     Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog `
-                     -System $sys -NetFx $netFx -VC $vc -Installed $installed
+                     -System $sys -NetFx $netFx -NetFx35 $netFx35 `
+                     -VC $vc -Installed $installed
     exit 0
 }
 
@@ -1785,6 +1922,7 @@ function Get-ProductStatus {
         [array]$Installed,
         [pscustomobject]$System,
         [string]$NetFx,
+        [bool]$NetFx35,
         [array]$VC,
         [string[]]$ActiveDisciplines,
         [switch]$DeepScan
@@ -1819,7 +1957,6 @@ function Get-ProductStatus {
     foreach ($pat in @($Entry.P)) {
         $hits += $Installed | Where-Object { $_.DisplayName -like $pat }
     }
-    # Dedupe by DisplayName + Version (not by DisplayName alone)
     $hits = @($hits | Sort-Object DisplayName, DisplayVersion -Unique)
 
     if ($hits.Count -eq 0) {
@@ -1832,11 +1969,9 @@ function Get-ProductStatus {
                           Where-Object { $_ } | Sort-Object -Unique) -join ', ')
     $status.Match     = (($hits.DisplayName | Sort-Object -Unique) -join ' | ')
 
-    # RAM check: honor explicit MinRAM if the catalog declares it; otherwise
-    # derive a conservative floor of 50% of the recommended figure.
+    # RAM: vendor MinRAM is critical; below catalog RAM is warn. No invented floor.
     $minRam = 0
     if ($Entry.MinRAM) { $minRam = [int]$Entry.MinRAM }
-    elseif ($Entry.RAM) { $minRam = [int][math]::Ceiling($Entry.RAM * 0.5) }
 
     if ($Entry.RAM -and $System.RAM_GB -lt $Entry.RAM) {
         $sev = if ($minRam -gt 0 -and $System.RAM_GB -lt $minRam) { 'critical' } else { 'warn' }
@@ -1850,11 +1985,13 @@ function Get-ProductStatus {
         } else {
             "Close memory-heavy applications before running large models."
         }
+        $detected = "$($System.RAM_GB) GB installed; $($Entry.RAM) GB recommended"
+        if ($minRam -gt 0) { $detected += " (vendor minimum $minRam GB)" }
         $status.Findings.Add((New-Finding `
             -Id "$($Entry.N).RAM_LOW" `
             -Software $Entry.N `
             -Problem "$($Entry.N) may experience slow performance or instability." `
-            -Detected "$($System.RAM_GB) GB installed; $($Entry.RAM) GB recommended (min $minRam GB)." `
+            -Detected $detected `
             -WhyItMatters $why `
             -Recommendation $rec `
             -Optional "Consider upgrading to $($Entry.RAM) GB or more for large workloads." `
@@ -1876,18 +2013,14 @@ function Get-ProductStatus {
         }
     }
 
-    # FIX #8: use real VRAM (registry-based) instead of AdapterRAM
     if ($Entry.GPU) {
-        $hasDedicated = $false
-        foreach ($g in $System.GPUs) {
-            if ($g.VRAM_GB -and $g.VRAM_GB -ge 2) { $hasDedicated = $true }
-        }
+        $hasDedicated = @($System.GPUs | Where-Object Kind -eq 'Discrete').Count -gt 0
         if (-not $hasDedicated) {
             $status.Findings.Add((New-Finding `
                 -Id "$($Entry.N).GPU_LOW" `
                 -Software $Entry.N `
                 -Problem "$($Entry.N) prefers a dedicated GPU." `
-                -Detected "No dedicated GPU with 2 GB or more VRAM detected." `
+                -Detected "No discrete GPU detected." `
                 -WhyItMatters "3D views, rendering, and GPU-accelerated solvers will be slow." `
                 -Recommendation "Install a dedicated GPU (NVIDIA RTX / AMD Radeon Pro class)." `
                 -Severity 'warn'))
@@ -1895,7 +2028,18 @@ function Get-ProductStatus {
     }
 
     if ($Entry.Net) {
-        if (-not (Compare-NetVersion -Have $NetFx -Need $Entry.Net)) {
+        if ($Entry.Net -like '3.5*') {
+            if (-not $NetFx35) {
+                $status.Findings.Add((New-Finding `
+                    -Id "$($Entry.N).DOTNET35" `
+                    -Software $Entry.N `
+                    -Problem "$($Entry.N) may not start." `
+                    -Detected ".NET Framework 3.5 is not installed." `
+                    -WhyItMatters "Applications built on .NET 2.0/3.5 require the 3.5 feature." `
+                    -Recommendation "Enable .NET Framework 3.5 in 'Turn Windows features on or off'." `
+                    -Severity 'critical'))
+            }
+        } elseif (-not (Compare-NetVersion -Have $NetFx -Need $Entry.Net)) {
             $status.Findings.Add((New-Finding `
                 -Id "$($Entry.N).DOTNET" `
                 -Software $Entry.N `
@@ -1919,8 +2063,11 @@ function Get-ProductStatus {
     }
 
     if ($Entry.Lsvc) {
+        # Require a licensing token in the service name/display to avoid
+        # matching unrelated vendor services on broad patterns like *Siemens*.
         $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
-            $n = $_.Name + ' ' + $_.DisplayName
+            $n = "$($_.Name) $($_.DisplayName)"
+            if ($n -notmatch 'licens|lmgrd|flexnet|sentinel|hasplm|selectserver') { return $false }
             foreach ($pat in $Entry.Lsvc) { if ($n -like $pat) { return $true } }
             return $false
         })
@@ -1931,7 +2078,7 @@ function Get-ProductStatus {
                     -Id "$($Entry.N).LICSVC" `
                     -Software $Entry.N `
                     -Problem "$($Entry.N) license service is not running." `
-                    -Detected "$($svc.Count) vendor service(s) installed; 0 running." `
+                    -Detected "$($svc.Count) licensing service(s) installed; 0 running." `
                     -WhyItMatters "The application will fail to acquire a license and may not launch." `
                     -Recommendation "Start the vendor license service or repair the install." `
                     -Severity 'critical'))
@@ -1945,7 +2092,7 @@ function Get-ProductStatus {
             if (Test-TcpPort -Port $p -TimeoutMs 800) { $openAny = $true; break }
         }
         if (-not $openAny) {
-            $status.Notes += "License ports not open locally ($($Entry.Lport -join ', ')) - normal for node-locked or remote license servers."
+            $status.Notes += "No license ports listening locally ($($Entry.Lport -join ', ')) - normal for node-locked or remote license servers."
         }
     }
 
@@ -1999,7 +2146,8 @@ Write-Stage "Checking every product in the catalog..."
 $allResults = New-Object System.Collections.Generic.List[object]
 foreach ($entry in $Script:RawCatalog) {
     $allResults.Add((Get-ProductStatus -Entry $entry -Installed $installed -System $sys `
-                                        -NetFx $netFx -VC $vc -ActiveDisciplines $Disciplines `
+                                        -NetFx $netFx -NetFx35 $netFx35 -VC $vc `
+                                        -ActiveDisciplines $Disciplines `
                                         -DeepScan:$DeepScan))
 }
 
@@ -2018,9 +2166,11 @@ function Get-HealthScore {
         [array]$Results,
         [pscustomobject]$System,
         [string]$NetFx,
+        [bool]$NetFx35,
         [array]$VC,
         [pscustomobject]$WindowsHealth,
-        [pscustomobject]$NetworkHealth
+        [pscustomobject]$NetworkHealth,
+        [switch]$IncludeProjectSafety
     )
 
     $cats = [ordered]@{}
@@ -2070,6 +2220,7 @@ function Get-HealthScore {
     $drv = 100
     if ($NetFx -match '^4\.[0-6]')     { $drv -= 40 }
     elseif ($NetFx -eq '4.7')          { $drv -= 15 }
+    if (-not $NetFx35)                 { $drv -= 5 }
     if (-not $VC -or $VC.Count -eq 0)  { $drv -= 30 }
     $cats['Drivers'] = [math]::Max(0, $drv)
 
@@ -2089,21 +2240,38 @@ function Get-HealthScore {
     }
     $cats['Thermals'] = $th
 
-    $cats['ProjectSafety'] = 100
+    # ProjectSafety is only scored when the guardian actually ran. Including it
+    # with a default of 100 would silently inflate the total on every plain run.
+    if ($IncludeProjectSafety) { $cats['ProjectSafety'] = 100 }
 
     $weights = @{
-        Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
-        GPU = 0.08; Drivers = 0.10; Licensing = 0.07
-        Windows = 0.05; Thermals = 0.05; Network = 0.05; ProjectSafety = 0.05
+        Hardware = 0.21; Storage = 0.16; EngineeringSoftware = 0.21
+        GPU = 0.08; Drivers = 0.11; Licensing = 0.07
+        Windows = 0.05; Thermals = 0.05; Network = 0.06
     }
+    if ($IncludeProjectSafety) { $weights['ProjectSafety'] = 0.05 }
+
+    # Renormalize so weights sum to 1 regardless of ProjectSafety presence.
+    $wsum = 0
+    foreach ($w in $weights.Values) { $wsum += $w }
+    if ($wsum -gt 0) {
+        foreach ($k in @($weights.Keys)) { $weights[$k] = $weights[$k] / $wsum }
+    }
+
     $overall = 0
     foreach ($k in $cats.Keys) {
         $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
         $overall += $cats[$k] * $w
     }
 
+    $band = if ($overall -ge 85) { 'Excellent' }
+            elseif ($overall -ge 70) { 'Good' }
+            elseif ($overall -ge 50) { 'Fair' }
+            else { 'Poor' }
+
     [pscustomobject]@{
         Overall    = [int][math]::Round($overall)
+        Band       = $band
         Categories = $cats
     }
 }
@@ -2118,7 +2286,7 @@ if ($LiveGpuSample) {
     Write-Ok
 }
 
-$score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx -VC $vc `
+$score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx -NetFx35 $netFx35 -VC $vc `
                          -WindowsHealth $windowsHealth -NetworkHealth $networkHealth
 
 # =============================================================================
@@ -2145,7 +2313,8 @@ foreach ($d in $byDisc.Keys | Sort-Object) {
 }
 
 Write-Host ""
-Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100" -f $score.Overall) -ForegroundColor Green
+Write-Host ("  SIGMA HEURISTIC INDEX: {0}/100  ({1})" -f $score.Overall, $score.Band) -ForegroundColor Green
+Write-Host "  (Composite of the categories below; not a measurement.)" -ForegroundColor DarkGray
 foreach ($k in $score.Categories.Keys) {
     Write-Host ("    {0,-22} {1,3}/100" -f $k, $score.Categories[$k])
 }
@@ -2153,9 +2322,9 @@ foreach ($k in $score.Categories.Keys) {
 # =============================================================================
 # 9. PROJECT GUARDIAN
 # =============================================================================
-# NOTE: DWG XREF scanning is heuristic. The DWG format is proprietary binary;
-# the regex approach catches many XREFs but is not equivalent to AutoCAD's
-# Reference Manager. Treat broken-reference counts as guidance only.
+# NOTE: DWG 2004+ uses compressed sections and is skipped rather than scanned.
+# DXF and DWG 2000-and-earlier are scanned with a heuristic regex. Treat
+# broken-reference counts as guidance, not as a completeness measure.
 
 function Get-DwgReferences {
     param([string]$FilePath)
@@ -2165,34 +2334,53 @@ function Get-DwgReferences {
 
     try {
         if ($ext -eq '.dxf') {
-            if ((Get-Item -LiteralPath $FilePath).Length -gt 200MB) { return $refs }
+            if ((Get-Item -LiteralPath $FilePath).Length -gt 100MB) { return $refs }
             $text = Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
-            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"BLOCK"\)[\s\S]{0,4000}?\(2\s*\.\s*"\*X[^"]*"\)[\s\S]{0,4000}?\(1\s*\.\s*"([^"]+)"\)')) {
+            foreach ($m in [regex]::Matches($text,
+                '\(0\s*\.\s*"BLOCK"\)[\s\S]{0,2000}?\(2\s*\.\s*"\*X[^"]*"\)[\s\S]{0,2000}?\(1\s*\.\s*"([^"]+)"\)')) {
                 $refs.Add([pscustomobject]@{ Type = 'XREF'; Path = $m.Groups[1].Value })
             }
-            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"IMAGEDEF"\)[\s\S]{0,3000}?\(1\s*\.\s*"([^"]+)"\)')) {
+            foreach ($m in [regex]::Matches($text,
+                '\(0\s*\.\s*"IMAGEDEF"\)[\s\S]{0,1500}?\(1\s*\.\s*"([^"]+)"\)')) {
                 $refs.Add([pscustomobject]@{ Type = 'IMAGE'; Path = $m.Groups[1].Value })
             }
-            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"PDFDEFINITION"\)[\s\S]{0,3000}?\(1\s*\.\s*"([^"]+)"\)')) {
+            foreach ($m in [regex]::Matches($text,
+                '\(0\s*\.\s*"PDFDEFINITION"\)[\s\S]{0,1500}?\(1\s*\.\s*"([^"]+)"\)')) {
                 $refs.Add([pscustomobject]@{ Type = 'PDF'; Path = $m.Groups[1].Value })
             }
         } elseif ($ext -eq '.dwg') {
             $fi = Get-Item -LiteralPath $FilePath
+            if ($fi.Length -lt 6) { return $refs }
+
+            $header = New-Object byte[] 6
+            $fs = [System.IO.File]::OpenRead($FilePath)
+            try { $null = $fs.Read($header, 0, 6) } finally { $fs.Close() }
+            $sig = [System.Text.Encoding]::ASCII.GetString($header)
+
+            # AC1018 = AutoCAD 2004 and later use compressed sections.
+            $compressed = $sig -match '^AC10(18|21|24|27|32)$'
+            if ($compressed) {
+                $refs.Add([pscustomobject]@{
+                    Type = 'UNSCANNED'
+                    Path = "DWG version $sig uses compressed sections; reference scan skipped."
+                })
+                return $refs
+            }
+
+            # DWG 2000 (AC1015) and earlier: references are plain ASCII.
             if ($fi.Length -gt 250MB) { return $refs }
             $bytes = [System.IO.File]::ReadAllBytes($FilePath)
             $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
             $extPat = '(dwg|dxf|pdf|jpg|jpeg|png|tif|tiff|shx|ttf|shp|dgn|dwf|dwfx)'
 
-            # FIX #9: require either a drive letter or a UNC prefix, and a
-            # minimum path length, to reduce false positives from in-file
-            # compressed data that happens to look like a path.
-            foreach ($m in [regex]::Matches($ascii, "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{6,250}\.$extPat", 'IgnoreCase')) {
+            foreach ($m in [regex]::Matches($ascii,
+                "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{6,250}\.$extPat", 'IgnoreCase')) {
                 $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
             }
-            foreach ($m in [regex]::Matches($ascii, "\\\\\\\\[^\x00-\x1F`"<>|]{6,250}\.$extPat", 'IgnoreCase')) {
+            foreach ($m in [regex]::Matches($ascii,
+                "\\\\\\\\[^\x00-\x1F`"<>|]{6,250}\.$extPat", 'IgnoreCase')) {
                 $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
             }
-            # Dedupe on path + type
             $refs = [System.Collections.Generic.List[object]]@(
                 $refs | Sort-Object Type, Path -Unique
             )
@@ -2281,6 +2469,7 @@ function Invoke-ProjectGuardian {
 
     $refTotal = 0
     $refMissing = 0
+    $unscanned = 0
     $refMissingList = @()
 
     if ($dwgFiles.Count -gt 0) {
@@ -2289,6 +2478,7 @@ function Invoke-ProjectGuardian {
         foreach ($dwg in $dwgFiles) {
             $refs = Get-DwgReferences -FilePath $dwg.FullName
             foreach ($r in $refs) {
+                if ($r.Type -eq 'UNSCANNED') { $unscanned++; continue }
                 $refTotal++
                 $p = $r.Path -replace '/', '\'
                 if (-not [System.IO.Path]::IsPathRooted($p)) {
@@ -2306,6 +2496,7 @@ function Invoke-ProjectGuardian {
         }
         Write-Host ("    References found:   {0}" -f $refTotal)
         Write-Host ("    Missing / broken:   {0}" -f $refMissing) -ForegroundColor $(if ($refMissing -gt 0) { 'Yellow' } else { 'Green' })
+        Write-Host ("    Drawings skipped:   {0} (compressed DWG, not scannable)" -f $unscanned) -ForegroundColor DarkGray
     }
 
     if ($refTotal -gt 0) {
@@ -2332,6 +2523,7 @@ function Invoke-ProjectGuardian {
         ByExtension      = $byExt
         RefTotal         = $refTotal
         RefMissing       = $refMissing
+        RefUnscanned     = $unscanned
         RefMissingList   = $refMissingList
         Health           = $health
     }
@@ -2341,18 +2533,32 @@ $guardian = $null
 if ($ProjectGuardian) {
     $guardian = Invoke-ProjectGuardian -Root $ProjectGuardian
     if ($guardian) {
+        # Recompute score with ProjectSafety included.
+        $score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx `
+                                 -NetFx35 $netFx35 -VC $vc `
+                                 -WindowsHealth $windowsHealth `
+                                 -NetworkHealth $networkHealth `
+                                 -IncludeProjectSafety
         $score.Categories['ProjectSafety'] = $guardian.Health
+
+        # Recalculate overall with the guardian's ProjectSafety value.
         $weights = @{
-            Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
-            GPU = 0.08; Drivers = 0.10; Licensing = 0.07
-            Windows = 0.05; Thermals = 0.05; Network = 0.05; ProjectSafety = 0.05
+            Hardware = 0.21; Storage = 0.16; EngineeringSoftware = 0.21
+            GPU = 0.08; Drivers = 0.11; Licensing = 0.07
+            Windows = 0.05; Thermals = 0.05; Network = 0.06; ProjectSafety = 0.05
         }
+        $wsum = 0; foreach ($w in $weights.Values) { $wsum += $w }
+        foreach ($k in @($weights.Keys)) { $weights[$k] = $weights[$k] / $wsum }
         $recalc = 0
         foreach ($k in $score.Categories.Keys) {
             $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
             $recalc += $score.Categories[$k] * $w
         }
         $score.Overall = [int][math]::Round($recalc)
+        $score.Band = if ($score.Overall -ge 85) { 'Excellent' }
+                      elseif ($score.Overall -ge 70) { 'Good' }
+                      elseif ($score.Overall -ge 50) { 'Fair' }
+                      else { 'Poor' }
     }
 }
 
@@ -2366,6 +2572,7 @@ Ensure-Folder $exportPath
     GeneratedAt   = (Get-Date).ToString('s')
     System        = $sys
     NetFx         = $netFx
+    NetFx35       = $netFx35
     VCRedist      = $vc
     Score         = $score
     WindowsHealth = $windowsHealth
@@ -2418,6 +2625,7 @@ $style = @'
  .finding-body td{border:none;padding:3px 0}
  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px 0}
  .legend .chip{font-size:12px;padding:4px 10px}
+ .note{background:#fffbe6;border-left:4px solid #d18b00;padding:8px 12px;font-size:12px;border-radius:4px;margin:8px 0}
 </style>
 '@
 
@@ -2437,12 +2645,13 @@ $sb = New-Object System.Text.StringBuilder
 
 [void]$sb.AppendLine("<div class='hero'>")
 [void]$sb.AppendLine("<div class='hero-num'>$(ConvertTo-HtmlSafe $score.Overall)<span>/100</span></div>")
-[void]$sb.AppendLine("<div class='hero-label'>Sigma Engineering Score</div>")
+[void]$sb.AppendLine("<div class='hero-label'>Sigma Heuristic Index &mdash; $(ConvertTo-HtmlSafe $score.Band)</div>")
 [void]$sb.AppendLine("<div class='hero-cats'>")
 foreach ($k in $score.Categories.Keys) {
     [void]$sb.AppendLine("<div><b>$(ConvertTo-HtmlSafe $score.Categories[$k])</b><span>$(ConvertTo-HtmlSafe $k)</span></div>")
 }
 [void]$sb.AppendLine("</div></div>")
+[void]$sb.AppendLine("<p class='sub'>The Index is a composite of the categories above, not a measurement. Compare machines on the category breakdown, not the total.</p>")
 
 [void]$sb.AppendLine("<h2>Legend</h2>")
 [void]$sb.AppendLine("<div class='legend'>")
@@ -2487,7 +2696,8 @@ foreach ($kv in @(
     @('OS', $sys.OS), @('Architecture', $sys.Arch),
     @('CPU', "$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T)"),
     @('RAM', "$($sys.RAM_GB) GB (free $($sys.FreeRAM_GB) GB)"),
-    @('.NET Framework', $netFx),
+    @('.NET Framework 4.x', $netFx),
+    @('.NET Framework 3.5', $netFx35),
     @('VC++ Redistributables', $vc.Count),
     @('PowerShell', $PSVersionTable.PSVersion.ToString()),
     @('Admin', $sys.IsAdmin),
@@ -2502,14 +2712,14 @@ foreach ($kv in @(
 foreach ($g in $sys.GPUs) {
     [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $g.Name)</td><td>$(ConvertTo-HtmlSafe $g.Kind)</td><td>$(ConvertTo-HtmlSafe $g.DriverVersion)</td><td>$(ConvertTo-HtmlSafe $g.DriverDate)</td><td>$(ConvertTo-HtmlSafe $g.VRAM_GB)</td></tr>")
 }
-[void]$sb.AppendLine("</table><p class='small'>VRAM is read from the display class registry (QWORD). Some drivers report less than physical for shared memory.</p></div>")
+[void]$sb.AppendLine("</table><p class='small'>VRAM is read from the display class registry and correlated to the adapter by MatchingDeviceId. Intel iGPU values are shared system memory, not dedicated.</p></div>")
 
 if ($LiveGpu -and $LiveGpu.Count -gt 0) {
     [void]$sb.AppendLine("<h2>Live GPU Sample</h2><div class='card'><table><tr><th>PID</th><th>Process</th><th>GPU %</th></tr>")
     foreach ($g in $LiveGpu) {
         [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $g.Pid)</td><td>$(ConvertTo-HtmlSafe $g.Process)</td><td>$(ConvertTo-HtmlSafe $g.GPU)%</td></tr>")
     }
-    [void]$sb.AppendLine("</table><p class='small'>Per-process % is the sum of all GPU engine counters for that PID, averaged over the sample window.</p></div>")
+    [void]$sb.AppendLine("</table><p class='small'>Per-process % is the maximum across GPU engines for that PID, averaged over the sample window.</p></div>")
 }
 
 [void]$sb.AppendLine("<h2>Disks</h2><div class='card'><table><tr><th>Drive</th><th>Label</th><th>FS</th><th>Size GB</th><th>Free GB</th><th>Free %</th></tr>")
@@ -2523,7 +2733,7 @@ foreach ($d in $sys.Disks) {
 $rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $(ConvertTo-HtmlSafe $windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
 [void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
 [void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$(ConvertTo-HtmlSafe $windowsHealth.UpdateService)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Defender</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Defender)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Anti-virus</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Defender)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Firewall</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Firewall)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Activation</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Activation)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Build age</th><td>$(ConvertTo-HtmlSafe $windowsHealth.BuildAgeDays) days</td></tr>")
@@ -2541,12 +2751,12 @@ if ($sys.Power.Percent -ne $null) {
 [void]$sb.AppendLine("</table></div>")
 
 if ($sys.ThermalZones.Count -gt 0) {
-    [void]$sb.AppendLine("<h2>Thermals</h2><div class='card'><table><tr><th>Zone</th><th>Temperature</th></tr>")
+    [void]$sb.AppendLine("<h2>Thermals</h2><div class='card'><table><tr><th>Source</th><th>Zone</th><th>Temperature</th></tr>")
     foreach ($z in $sys.ThermalZones) {
         $cls = if ($z.Celsius -lt 70) { 'green' } elseif ($z.Celsius -lt 85) { 'yellow' } else { 'red' }
-        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $z.Zone)</td><td><span class='chip $cls'>$(ConvertTo-HtmlSafe $z.Celsius) C</span></td></tr>")
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $z.Source)</td><td>$(ConvertTo-HtmlSafe $z.Zone)</td><td><span class='chip $cls'>$(ConvertTo-HtmlSafe $z.Celsius) C</span></td></tr>")
     }
-    [void]$sb.AppendLine("</table><p class='small'>ACPI thermal zone readings are frequently unavailable or inaccurate on modern hardware. Do not rely on these for thermal diagnosis.</p></div>")
+    [void]$sb.AppendLine("</table><div class='note'>Windows exposes no supported CPU-package sensor. ACPI and performance-counter sources are frequently wrong or absent on modern hardware. Treat as heuristic.</div></div>")
 }
 
 [void]$sb.AppendLine("<h2>Network</h2><div class='card'><table>")
@@ -2568,12 +2778,12 @@ if ($networkHealth.Adapters.Count -gt 0) {
 
 if ($networkHealth.License.Count -gt 0) {
     [void]$sb.AppendLine("<h2>License Center</h2><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th>Product</th><th>Ports</th><th>Local</th></tr>")
+    [void]$sb.AppendLine("<tr><th>Product</th><th>Ports</th><th>Local state</th></tr>")
     foreach ($l in $networkHealth.License) {
-        $chip = if ($l.Local) { "<span class='chip green'>OPEN</span>" } else { "<span class='chip gray'>CLOSED</span>" }
+        $chip = if ($l.Local) { "<span class='chip green'>listening</span>" } else { "<span class='chip gray'>not listening</span>" }
         [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $l.Product)</td><td>$(ConvertTo-HtmlSafe $l.Ports)</td><td>$chip</td></tr>")
     }
-    [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers. This check only probes localhost.</p></div>")
+    [void]$sb.AppendLine("</table><p class='small'>Listening state is informational. Node-locked licenses never listen on TCP, and a listening port does not mean a license is available. Remote license servers are not probed.</p></div>")
 }
 
 if ($guardian) {
@@ -2588,8 +2798,10 @@ if ($guardian) {
     [void]$sb.AppendLine("<tr><th>Large files</th><td>$(ConvertTo-HtmlSafe $guardian.LargeFiles) ($(ConvertTo-HtmlSafe $guardian.LargeGB) GB)</td></tr>")
     [void]$sb.AppendLine("<tr><th>References scanned</th><td>$(ConvertTo-HtmlSafe $guardian.RefTotal)</td></tr>")
     [void]$sb.AppendLine("<tr><th>Broken references (heuristic)</th><td>$(ConvertTo-HtmlSafe $guardian.RefMissing)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Drawings skipped (compressed DWG)</th><td>$(ConvertTo-HtmlSafe $guardian.RefUnscanned)</td></tr>")
     [void]$sb.AppendLine("<tr><th>Project Health</th><td><b>$(ConvertTo-HtmlSafe $guardian.Health)%</b></td></tr>")
     [void]$sb.AppendLine("</table>")
+    [void]$sb.AppendLine("<div class='note'>DWG 2004 and later use compressed sections; those drawings are reported as skipped rather than scanned. Broken-reference counts cover only DXF and pre-2004 DWG. Verify in the CAD application.</div>")
     if ($guardian.RefMissingList -and $guardian.RefMissingList.Count -gt 0) {
         [void]$sb.AppendLine("<h3 style='margin-top:16px'>Broken references (first 50, heuristic — verify in CAD)</h3>")
         [void]$sb.AppendLine("<table><tr><th>Drawing</th><th>Type</th><th>Reference</th></tr>")
@@ -2627,7 +2839,7 @@ foreach ($d in $byDisc.Keys | Sort-Object) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-[void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors. Thermal, VRAM, and XREF findings are heuristic; verify with vendor tools.</p>")
+[void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors. Thermal, iGPU-VRAM, DWG-reference and GPU-utilization entries are heuristic; verify with vendor tooling.</p>")
 [void]$sb.AppendLine("</body></html>")
 $sb.ToString() | Set-Content "$reportBase.html" -Encoding UTF8
 Write-Ok
