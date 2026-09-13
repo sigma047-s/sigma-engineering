@@ -8,12 +8,21 @@
     Includes health scoring, structured findings, preflight, project guardian,
     Windows/Network health, License Center, live GPU sampling, and a winget-based
     software installer with manual download fallbacks.
+
+.NOTES
+    Accuracy notes (read before trusting findings):
+      * Thermal readings come from MSAcpi_ThermalZoneTemperature, which is often
+        absent or reports motherboard/PCH temperatures on modern hardware.
+      * DWG reference scanning is heuristic — the DWG format is proprietary
+        binary. Verify broken-reference lists in the CAD application.
+      * License port checks only probe localhost. Remote license servers will
+        always appear "closed."
+      * VRAM is read from the display-class registry (QWORD), not AdapterRAM.
 .PARAMETER Disciplines
     Optional filter. If set, only products relevant to these disciplines are
     fully evaluated. Others are marked NotApplicable.
 .PARAMETER Preflight
     Run a single-product preflight readiness check (e.g. -Preflight ANSYS).
-    Skips the full report.
 .PARAMETER ProjectGuardian
     Path to a project folder to inspect for engineering project issues.
 .PARAMETER DeepScan
@@ -27,8 +36,7 @@
 .PARAMETER Install
     Enter interactive software installer (choose discipline, then products).
 .PARAMETER InstallList
-    Non-interactive batch install by product name(s), e.g.
-    -Install -InstallList "Python","Git","KiCad".
+    Non-interactive batch install by product name(s).
 #>
 [CmdletBinding()]
 param(
@@ -93,11 +101,26 @@ function Ensure-Folder { param([string]$P)
 }
 function Expand-Env { param([string]$S) [Environment]::ExpandEnvironmentVariables($S) }
 
+# --- FIX #1: HTML escaping helper ---
+function ConvertTo-HtmlSafe {
+    param([object]$Text)
+    if ($null -eq $Text) { return '' }
+    $s = [string]$Text
+    $s = $s -replace '&','&amp;'
+    $s = $s -replace '<','&lt;'
+    $s = $s -replace '>','&gt;'
+    $s = $s -replace '"','&quot;'
+    $s = $s -replace "'",'&#39;'
+    return $s
+}
+
+# --- FIX #2: skip reparse points to avoid junction loops / double-counting ---
 function Get-FolderSizeGB {
     param([string]$Path)
     try {
         if (-not (Test-Path $Path)) { return 0 }
-        $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+        $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File `
+                    -Attributes !ReparsePoint -ErrorAction SilentlyContinue |
                   Measure-Object -Property Length -Sum).Sum
         if (-not $bytes) { return 0 }
         [math]::Round($bytes / 1GB, 2)
@@ -141,6 +164,38 @@ function Get-GpuKind {
     return 'Unknown'
 }
 
+# --- FIX #4: read real VRAM from display-class registry (QWORD, no overflow) ---
+function Get-GpuVramBytes {
+    param([string]$AdapterName)
+    try {
+        $base = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+        $keys = Get-ChildItem -Path $base -ErrorAction Stop |
+                Where-Object { $_.PSChildName -match '^\d{4}$' }
+        foreach ($k in $keys) {
+            $props = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+            $desc = $props.DriverDesc
+            if (-not $desc) { continue }
+            $match = ($desc -like "*$AdapterName*") -or ($AdapterName -like "*$desc*") `
+                     -or (($AdapterName -split '\s+' | Select-Object -First 2) -join ' ' -like "*$($desc -split '\s+' | Select-Object -First 2)" -join ' ' -like '*')
+            if ($match) {
+                $mem = $props.'HardwareInformation.MemorySize'
+                if ($mem) {
+                    # Can be byte[], DWORD or QWORD depending on driver; handle all.
+                    if ($mem -is [byte[]]) {
+                        if ($mem.Length -ge 8) { return [BitConverter]::ToUInt64($mem, 0) }
+                        elseif ($mem.Length -ge 4) { return [uint64][BitConverter]::ToUInt32($mem, 0) }
+                    } else {
+                        return [uint64]$mem
+                    }
+                }
+            }
+        }
+    } catch { }
+    return [uint64]0
+}
+
+# --- FIX #5: filter invalid thermal zone readings ---
 function Get-ThermalInfo {
     $zones = @()
     try {
@@ -148,7 +203,11 @@ function Get-ThermalInfo {
         $i = 0
         foreach ($z in $t) {
             $i++
-            $c = ($z.CurrentTemperature / 10) - 273.15
+            $raw = $z.CurrentTemperature
+            if (-not $raw -or $raw -le 0) { continue }
+            $c = ($raw / 10) - 273.15
+            # Discard physically implausible readings (WMI is often wrong)
+            if ($c -lt -20 -or $c -gt 150) { continue }
             $zones += [pscustomobject]@{
                 Zone    = "Zone$i"
                 Celsius = [math]::Round($c, 1)
@@ -195,20 +254,48 @@ function Get-PowerState {
     }
 }
 
+# --- FIX #3 + #11: include Appx/UWP and per-user installs; don't drop dupes ---
 function Get-InstalledSoftware {
-    $paths = @(
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    $regPaths = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
-    $out = foreach ($p in $paths) {
+    foreach ($p in $regPaths) {
         try {
             Get-ItemProperty -Path $p -ErrorAction Stop |
                 Where-Object { $_.DisplayName } |
-                Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation
+                ForEach-Object {
+                    $rows.Add([pscustomobject]@{
+                        DisplayName     = $_.DisplayName
+                        DisplayVersion  = $_.DisplayVersion
+                        Publisher       = $_.Publisher
+                        InstallDate     = $_.InstallDate
+                        InstallLocation = $_.InstallLocation
+                        Source          = 'Registry'
+                    })
+                }
         } catch { }
     }
-    $out | Sort-Object DisplayName -Unique
+
+    try {
+        Get-AppxPackage -ErrorAction SilentlyContinue | ForEach-Object {
+            $rows.Add([pscustomobject]@{
+                DisplayName     = $_.Name
+                DisplayVersion  = $_.Version
+                Publisher       = $_.Publisher
+                InstallDate     = $null
+                InstallLocation = $_.InstallLocation
+                Source          = 'Appx'
+            })
+        }
+    } catch { }
+
+    # Do NOT dedupe by DisplayName alone — different versions/vendors can share names.
+    # Sort for stable output but keep every row.
+    $rows | Sort-Object DisplayName, DisplayVersion
 }
 
 function Get-DotNetFrameworkVersion {
@@ -269,27 +356,31 @@ function New-Finding {
     }
 }
 
+# --- FIX #6 + #7: sum per-PID engine utilization, and use English counter path ---
 function Get-LiveGpuSample {
     param([int]$DurationSeconds = 2)
     try {
+        # On non-English Windows, Get-Counter still accepts the English path if
+        # the counter set is registered; otherwise the catch below returns empty.
         $samples = Get-Counter '\GPU Engine(*)\Utilization Percentage' `
                     -SampleInterval 1 -MaxSamples $DurationSeconds -ErrorAction Stop
-        $perInstance = @{}
+
+        # Accumulate summed per-engine usage per PID, then average over samples.
+        # This approximates total GPU utilization for the process.
+        $perPid = @{}
         foreach ($s in $samples.CounterSamples) {
-            $key = $s.InstanceName
-            if (-not $perInstance.ContainsKey($key)) { $perInstance[$key] = @() }
-            $perInstance[$key] += $s.CookedValue
+            $name = $s.InstanceName
+            if ($name -notmatch 'pid_(\d+)') { continue }
+            $procId = [int]$Matches[1]
+            if (-not $perPid.ContainsKey($procId)) { $perPid[$procId] = 0.0 }
+            $perPid[$procId] += [double]$s.CookedValue
         }
-        $perProc = @{}
-        foreach ($k in $perInstance.Keys) {
-            if ($k -match 'pid_(\d+)') {
-                $pid2 = [int]$Matches[1]
-                $avg = ($perInstance[$k] | Measure-Object -Average).Average
-                if (-not $perProc.ContainsKey($pid2)) { $perProc[$pid2] = 0 }
-                if ($avg -gt $perProc[$pid2]) { $perProc[$pid2] = $avg }
-            }
+        $avgPerPid = @{}
+        foreach ($k in $perPid.Keys) {
+            $avgPerPid[$k] = [math]::Round($perPid[$k] / [math]::Max(1, $DurationSeconds), 1)
         }
-        $top = $perProc.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
+
+        $top = $avgPerPid.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
         $out = foreach ($t in $top) {
             $pname = try { (Get-Process -Id $t.Key -ErrorAction Stop).ProcessName } catch { "pid $($t.Key)" }
             [pscustomobject]@{ Pid = $t.Key; Process = $pname; GPU = [math]::Round($t.Value, 1) }
@@ -600,12 +691,6 @@ $Script:RawCatalog = @(
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
 
-# -----------------------------------------------------------------------------
-# FIX: Convert every catalog hashtable into a PSCustomObject so that
-#      Sort-Object N, Where-Object N, -Unique, and -Property all work
-#      reliably. Without this, the installer collapses every discipline
-#      bucket to a single product.
-# -----------------------------------------------------------------------------
 $Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
 $Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
@@ -680,13 +765,15 @@ $sys = & {
     $gpus = @(Get-CimInstance Win32_VideoController)
 
     $gpuInfo = foreach ($g in $gpus) {
-        $mem = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { [math]::Round($g.AdapterRAM / 1GB, 2) } else { $null }
+        # FIX #4 / #8: use registry-based VRAM (QWORD) instead of AdapterRAM
+        $vramBytes = Get-GpuVramBytes -AdapterName $g.Name
+        $vramGB = if ($vramBytes -gt 0) { [math]::Round($vramBytes / 1GB, 2) } else { $null }
         [pscustomobject]@{
             Name          = $g.Name
             Kind          = Get-GpuKind -Name $g.Name
             DriverVersion = $g.DriverVersion
             DriverDate    = if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') } else { '' }
-            VRAM_GB       = $mem
+            VRAM_GB       = $vramGB
             Resolution    = "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
         }
     }
@@ -886,12 +973,16 @@ function Get-NetworkHealth {
                            elseif ($maxMbps -gt 0) { "$maxMbps Mbps" } else { '' }
     } catch { }
 
-    try {
-        $null = Resolve-DnsName 'microsoft.com' -ErrorAction Stop -QuickTimeout
-        $r.DNS = 'OK'
-    } catch {
-        $r.DNS = 'Failed'
+    # FIX #14: try two resolvers; only report Failed if both fail
+    $dnsOk = $false
+    foreach ($host in @('microsoft.com','cloudflare.com')) {
+        try {
+            $null = Resolve-DnsName $host -ErrorAction Stop -QuickTimeout
+            $dnsOk = $true
+            break
+        } catch { }
     }
+    $r.DNS = if ($dnsOk) { 'OK' } else { 'Failed' }
 
     try {
         $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -First 1
@@ -1124,6 +1215,7 @@ function Invoke-WhySlow {
                   }
     } catch { }
 
+    # FIX #10: skip System Idle Process and filter sub-0.5% CPU noise
     $topCpu = @()
     try {
         $s1 = @{}
@@ -1131,11 +1223,12 @@ function Invoke-WhySlow {
         Start-Sleep -Milliseconds 800
         $cores = [math]::Max(1, $System.LogicalCPUs)
         $topCpu = Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.ProcessName -eq 'Idle') { return }
             $prev = if ($s1.ContainsKey($_.Id)) { $s1[$_.Id] } else { 0 }
             $delta = $_.TotalProcessorTime.TotalMilliseconds - $prev
             $pct = [math]::Round(($delta / 800) * 100 / $cores, 1)
             [pscustomobject]@{ Name = $_.ProcessName; CPU = $pct }
-        } | Sort-Object CPU -Descending | Select-Object -First 8
+        } | Where-Object { $_.CPU -ge 0.5 } | Sort-Object CPU -Descending | Select-Object -First 8
     } catch { }
 
     $verdicts = [ordered]@{
@@ -1186,7 +1279,6 @@ function Invoke-WhySlow {
     if ($topCpu.Count -gt 0) {
         Write-Host "  Top CPU consumers (last 0.8s)" -ForegroundColor Cyan
         foreach ($p in $topCpu) {
-            if ($p.CPU -lt 0.5) { continue }
             Write-Host ("    {0,-22} {1,6}%" -f $p.Name, $p.CPU)
         }
         Write-Host ""
@@ -1223,10 +1315,7 @@ if ($WhySlow) {
 # =============================================================================
 # 5g. SOFTWARE INSTALLER
 # =============================================================================
-
-# --- winget-only mapping for products that support silent auto-install ---
 $Script:WingetMap = @{
-    # --- developer / general tools present in the catalog ---
     'Python'             = 'Python.Python.3.12'
     'Anaconda'           = 'Anaconda.Anaconda3'
     'Git'                = 'Git.Git'
@@ -1234,8 +1323,6 @@ $Script:WingetMap = @{
     'Visual Studio'      = 'Microsoft.VisualStudio.2022.Community'
     'Docker Desktop'     = 'Docker.DockerDesktop'
     'Wireshark'          = 'WiresharkFoundation.Wireshark'
-
-    # --- engineering / free tools ---
     'KiCad'              = 'KiCad.KiCad'
     'QGIS'               = 'QGIS.QGIS'
     'CloudCompare'       = 'CloudCompare.CloudCompare'
@@ -1246,8 +1333,6 @@ $Script:WingetMap = @{
     'DWSIM'              = 'DWSIM.DWSIM'
     '3D Slicer'          = 'Slicer.Slicer'
     'PlatformIO'         = 'PlatformIO.PlatformIO'
-
-    # --- useful adjacent tools sometimes searched by engineers ---
     'FreeCAD'            = 'FreeCAD.FreeCAD'
     'OpenSCAD'           = 'OpenSCAD.OpenSCAD'
     'Blender'            = 'BlenderFoundation.Blender'
@@ -1260,10 +1345,7 @@ $Script:WingetMap = @{
     '7-Zip'              = '7zip.7zip'
 }
 
-# --- Manual download fallbacks for products winget can't install ---
-# NOTE: Every key here MUST be unique. Duplicate keys abort PowerShell parsing.
 $Script:ManualUrls = @{
-    # --- AEC / Autodesk ---
     'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
     'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
     'Civil 3D'            = 'https://www.autodesk.com/products/civil-3d/free-trial'
@@ -1285,8 +1367,6 @@ $Script:ManualUrls = @{
     'Bluebeam Revu'       = 'https://www.bluebeam.com/'
     'Rhino'               = 'https://www.rhino3d.com/download/'
     'Grasshopper'         = 'https://www.grasshopper3d.com/'
-
-    # --- Dassault / Siemens PLM ---
     'SOLIDWORKS'          = 'https://www.solidworks.com/sw/support/downloads.htm'
     'SOLIDWORKS Electrical' = 'https://www.solidworks.com/sw/support/downloads.htm'
     'CATIA'               = 'https://www.3ds.com/products/catia'
@@ -1300,8 +1380,6 @@ $Script:ManualUrls = @{
     'Solid Edge'          = 'https://solidedge.siemens.com/'
     'Siemens Xpedition'   = 'https://eda.sw.siemens.com/en-US/pcb/xpedition/'
     'PADS Professional'   = 'https://eda.sw.siemens.com/en-US/pcb/pads/'
-
-    # --- Simulation / CAE ---
     'ANSYS'               = 'https://www.ansys.com/products'
     'ANSYS HFSS'          = 'https://www.ansys.com/products/electronics/ansys-hfss'
     'ANSYS Fluent'        = 'https://www.ansys.com/products/fluids/ansys-fluent'
@@ -1319,8 +1397,6 @@ $Script:ManualUrls = @{
     'FactSage'            = 'https://www.factsage.com/'
     'Thermo-Calc'         = 'https://thermocalc.com/'
     'JMatPro'             = 'https://www.sentesoftware.co.uk/jmatpro'
-
-    # --- Electrical / Electronics ---
     'Altium Designer'     = 'https://www.altium.com/'
     'ETAP'                = 'https://etap.com/'
     'EPLAN Electric P8'   = 'https://www.eplan-software.com/'
@@ -1339,8 +1415,6 @@ $Script:ManualUrls = @{
     'Keysight ADS'        = 'https://www.keysight.com/us/en/products/software/pathwave-design-software/pathwave-advanced-design-system.html'
     'NI LabVIEW'          = 'https://www.ni.com/en-us/support/downloads/software-products/download.labview.html'
     'NI Multisim'         = 'https://www.ni.com/en-us/support/downloads/software-products/download.multisim.html'
-
-    # --- Automation / PLC / SCADA ---
     'Siemens TIA Portal'  = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
     'STEP 7'              = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
     'WinCC'               = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
@@ -1355,8 +1429,6 @@ $Script:ManualUrls = @{
     'CODESYS'             = 'https://www.codesys.com/download.html'
     'Ignition'            = 'https://inductiveautomation.com/downloads/'
     'Factory I/O'         = 'https://factoryio.com/downloads/'
-
-    # --- Embedded / FPGA ---
     'Xilinx Vivado'       = 'https://www.xilinx.com/support/download.html'
     'Intel Quartus Prime' = 'https://www.intel.com/content/www/us/en/software-kit/'
     'ModelSim'            = 'https://www.intel.com/content/www/us/en/software/programmable/quartus-prime/model-sim.html'
@@ -1364,8 +1436,6 @@ $Script:ManualUrls = @{
     'STM32CubeIDE'        = 'https://www.st.com/en/development-tools/stm32cubeide.html'
     'IAR Embedded Workbench' = 'https://www.iar.com/products/architectures/arm/iar-embedded-workbench-for-arm/'
     'Keil uVision'        = 'https://www.keil.com/demo/eval/arm.htm'
-
-    # --- Structural / Geotech / Mining ---
     'STAAD.Pro'           = 'https://www.bentley.com/software/staad-pro/'
     'Tekla Structures'    = 'https://www.tekla.com/products/tekla-structures'
     'Tekla Tedds'         = 'https://www.tekla.com/products/tekla-tedds'
@@ -1395,8 +1465,6 @@ $Script:ManualUrls = @{
     'Leapfrog Geo'        = 'https://www.seequent.com/products-solutions/leapfrog-geo/'
     'Bentley OpenRail'    = 'https://www.bentley.com/software/openrail-designer/'
     'RailSys'             = 'https://www.rmcon.de/en/'
-
-    # --- Water / Environmental / GIS ---
     'HEC-RAS'             = 'https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
     'HEC-HMS'             = 'https://www.hec.usace.army.mil/software/hec-hms/downloads.aspx'
     'EPA SWMM'            = 'https://www.epa.gov/water-research/storm-water-management-model-swmm'
@@ -1418,13 +1486,9 @@ $Script:ManualUrls = @{
     'Leica Infinity'      = 'https://leica-geosystems.com/products/software/leica-infinity'
     'Leica Cyclone'       = 'https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
     'Carlson Survey'      = 'https://www.carlsonsw.com/'
-
-    # --- Chemical / Petroleum ---
     'Aspen Plus'          = 'https://www.aspentech.com/en/products/engineering/aspen-plus'
     'Aspen HYSYS'         = 'https://www.aspentech.com/en/products/engineering/aspen-hysys'
     'Petrel'              = 'https://www.software.slb.com/products/petrel'
-
-    # --- Marine / Fire / HVAC ---
     'ShipConstructor'     = 'https://www.ssi-corporate.com/'
     'Maxsurf'             = 'https://www.bentley.com/software/maxsurf/'
     'NAPA'                = 'https://www.napa.fi/'
@@ -1443,31 +1507,23 @@ $Script:ManualUrls = @{
     'DesignBuilder'       = 'https://designbuilder.co.uk/'
     'DIALux evo'          = 'https://www.dialux.com/en-GB/download'
     'AGi32'               = 'https://lightinganalysts.com/software-products/agi32/'
-
-    # --- Nuclear / Biomedical / Materials ---
     'MCNP'                = 'https://mcnp.lanl.gov/'
     'SCALE'               = 'https://www.ornl.gov/scale'
     'RELAP5'              = 'https://www.nrc.gov/about-nrc/regulatory/research/safetycodes.html'
     'OpenMC'              = 'https://docs.openmc.org/'
     'Mimics Innovation Suite' = 'https://www.materialise.com/en/medical/mimics-innovation-suite'
     'Simpleware'          = 'https://www.synopsys.com/simpleware.html'
-
-    # --- Renewable ---
     'PVsyst'              = 'https://www.pvsyst.com/'
     'HOMER Pro'           = 'https://www.homerenergy.com/products/pro/'
     'SAM'                 = 'https://sam.nrel.gov/download'
     'RETScreen Expert'    = 'https://www.nrcan.gc.ca/maps-tools-and-publications/tools/modelling-tools/retscreen/7465'
     'WindPRO'             = 'https://www.emdt.co.uk/product/windpro'
     'WAsP'                = 'https://www.wasp.dk/'
-
-    # --- Math / Data ---
     'Wolfram Mathematica' = 'https://www.wolfram.com/mathematica/'
     'Maple'               = 'https://www.maplesoft.com/products/Maple/'
     'Mathcad Prime'       = 'https://www.ptc.com/en/products/mathcad'
     'OriginPro'           = 'https://www.originlab.com/'
     'GNU Radio'           = 'https://wiki.gnuradio.org/index.php/InstallingGR'
-
-    # --- CAM / Metrology / PM ---
     'Mastercam'           = 'https://www.mastercam.com/'
     'SolidCAM'            = 'https://www.solidcam.com/'
     'VERICUT'             = 'https://www.cgtech.com/'
@@ -1480,8 +1536,6 @@ $Script:ManualUrls = @{
     'Oracle Aconex'       = 'https://www.oracle.com/construction-engineering/aconex/'
     'CostX'               = 'https://www.exactal.com/'
     'PlanSwift'           = 'https://www.planswift.com/'
-
-    # --- Systems / MBSE ---
     'IBM Engineering DOORS' = 'https://www.ibm.com/products/requirements-management-doors'
     'Capella'             = 'https://www.eclipse.org/capella/'
     'Enterprise Architect'= 'https://sparxsystems.com/products/ea/'
@@ -1555,7 +1609,6 @@ function Install-OneProduct {
 function Show-DisciplineInstaller {
     param([bool]$HasWinget)
 
-    # Index every catalog product by every discipline it belongs to
     $byDisc = @{}
     foreach ($e in $Script:RawCatalog) {
         foreach ($d in $e.D) {
@@ -1679,7 +1732,6 @@ function Invoke-Installer {
         Write-Host "  [INFO] Manual download pages will still be offered." -ForegroundColor Yellow
     }
 
-    # ---- Non-interactive batch ----
     if ($InstallList.Count -gt 0) {
         Write-Host ""
         Write-Host "  Batch mode: $($InstallList -join ', ')" -ForegroundColor Cyan
@@ -1708,7 +1760,6 @@ function Invoke-Installer {
         return
     }
 
-    # ---- Interactive loop ----
     while ($true) {
         Show-DisciplineInstaller -HasWinget $hasWinget
         Write-Host ""
@@ -1768,7 +1819,8 @@ function Get-ProductStatus {
     foreach ($pat in @($Entry.P)) {
         $hits += $Installed | Where-Object { $_.DisplayName -like $pat }
     }
-    $hits = @($hits | Sort-Object DisplayName -Unique)
+    # Dedupe by DisplayName + Version (not by DisplayName alone)
+    $hits = @($hits | Sort-Object DisplayName, DisplayVersion -Unique)
 
     if ($hits.Count -eq 0) {
         $status.State = 'NotInstalled'
@@ -1778,8 +1830,10 @@ function Get-ProductStatus {
     $status.Installed = $true
     $status.Version   = (($hits | ForEach-Object { $_.DisplayVersion } |
                           Where-Object { $_ } | Sort-Object -Unique) -join ', ')
-    $status.Match     = ($hits.DisplayName -join ' | ')
+    $status.Match     = (($hits.DisplayName | Sort-Object -Unique) -join ' | ')
 
+    # RAM check: honor explicit MinRAM if the catalog declares it; otherwise
+    # derive a conservative floor of 50% of the recommended figure.
     $minRam = 0
     if ($Entry.MinRAM) { $minRam = [int]$Entry.MinRAM }
     elseif ($Entry.RAM) { $minRam = [int][math]::Ceiling($Entry.RAM * 0.5) }
@@ -1822,6 +1876,7 @@ function Get-ProductStatus {
         }
     }
 
+    # FIX #8: use real VRAM (registry-based) instead of AdapterRAM
     if ($Entry.GPU) {
         $hasDedicated = $false
         foreach ($g in $System.GPUs) {
@@ -2053,15 +2108,9 @@ function Get-HealthScore {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Windows / Network health
-# ---------------------------------------------------------------------------
 $windowsHealth = Get-WindowsHealth -System $sys
 $networkHealth = Get-NetworkHealth -System $sys -Catalog $Script:RawCatalog -Installed $installed
 
-# ---------------------------------------------------------------------------
-# Live GPU sample (optional)
-# ---------------------------------------------------------------------------
 $liveGpu = @()
 if ($LiveGpuSample) {
     Write-Stage "Sampling live GPU utilization..."
@@ -2104,6 +2153,10 @@ foreach ($k in $score.Categories.Keys) {
 # =============================================================================
 # 9. PROJECT GUARDIAN
 # =============================================================================
+# NOTE: DWG XREF scanning is heuristic. The DWG format is proprietary binary;
+# the regex approach catches many XREFs but is not equivalent to AutoCAD's
+# Reference Manager. Treat broken-reference counts as guidance only.
+
 function Get-DwgReferences {
     param([string]$FilePath)
 
@@ -2130,12 +2183,19 @@ function Get-DwgReferences {
             $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
             $extPat = '(dwg|dxf|pdf|jpg|jpeg|png|tif|tiff|shx|ttf|shp|dgn|dwf|dwfx)'
 
-            foreach ($m in [regex]::Matches($ascii, "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{0,250}\.$extPat", 'IgnoreCase')) {
+            # FIX #9: require either a drive letter or a UNC prefix, and a
+            # minimum path length, to reduce false positives from in-file
+            # compressed data that happens to look like a path.
+            foreach ($m in [regex]::Matches($ascii, "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{6,250}\.$extPat", 'IgnoreCase')) {
                 $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
             }
-            foreach ($m in [regex]::Matches($ascii, "\\\\\\\\[^\x00-\x1F`"<>|]{0,250}\.$extPat", 'IgnoreCase')) {
+            foreach ($m in [regex]::Matches($ascii, "\\\\\\\\[^\x00-\x1F`"<>|]{6,250}\.$extPat", 'IgnoreCase')) {
                 $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
             }
+            # Dedupe on path + type
+            $refs = [System.Collections.Generic.List[object]]@(
+                $refs | Sort-Object Type, Path -Unique
+            )
         }
     } catch {
         Add-Diagnostic 'XREF' "Failed to parse ${FilePath}: $_"
@@ -2212,7 +2272,6 @@ function Invoke-ProjectGuardian {
         Write-Host ("    {0,-14} {1,6}" -f $_.Key, $_.Value)
     }
 
-    # ---- XREF / reference scan ----
     $dwgFiles = @($scan | Where-Object { $_.Extension -in @('.dwg','.dxf') })
     $maxDwg = 200
     if ($dwgFiles.Count -gt $maxDwg) {
@@ -2226,7 +2285,7 @@ function Invoke-ProjectGuardian {
 
     if ($dwgFiles.Count -gt 0) {
         Write-Host ""
-        Write-Host "  Scanning drawing references..." -ForegroundColor Cyan
+        Write-Host "  Scanning drawing references (heuristic)..." -ForegroundColor Cyan
         foreach ($dwg in $dwgFiles) {
             $refs = Get-DwgReferences -FilePath $dwg.FullName
             foreach ($r in $refs) {
@@ -2322,7 +2381,7 @@ $allResults | Select-Object Name, Disciplines, Kind, State, Version, Installed,
     Export-Csv "$reportBase.csv" -NoTypeInformation -Encoding UTF8
 
 # ---------------------------------------------------------------------------
-# HTML
+# HTML — every interpolated value goes through ConvertTo-HtmlSafe
 # ---------------------------------------------------------------------------
 $style = @'
 <style>
@@ -2341,7 +2400,6 @@ $style = @'
  .chip.gray{background:#8b95a5}.chip.darkgray{background:#4a5568}.chip.blue{background:#2b6cb0}
  .small{font-size:12px;color:#666}
  .disc{border-left:4px solid #0b5394;padding-left:10px;margin-top:22px}
-
  .hero{background:linear-gradient(135deg,#0b5394,#0a3d6e);color:#fff;border-radius:12px;padding:28px 24px;margin:10px 0 20px 0;text-align:center;box-shadow:0 6px 20px rgba(11,83,148,.25)}
  .hero-num{font-size:64px;font-weight:800;line-height:1;letter-spacing:-2px}
  .hero-num span{font-size:22px;font-weight:400;opacity:.55}
@@ -2350,7 +2408,6 @@ $style = @'
  .hero-cats > div{background:rgba(255,255,255,.12);padding:10px 14px;border-radius:8px;min-width:100px}
  .hero-cats b{display:block;font-size:20px;font-weight:700}
  .hero-cats span{font-size:10px;text-transform:uppercase;letter-spacing:1px;opacity:.8}
-
  .finding{background:#fff;border-left:5px solid #8b95a5;border-radius:6px;padding:14px 18px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.05)}
  .finding.sev-critical{border-left-color:#c23636}
  .finding.sev-warn{border-left-color:#d18b00}
@@ -2359,7 +2416,6 @@ $style = @'
  .finding-body{width:100%;border:none;font-size:12px;margin:0}
  .finding-body th{background:transparent;border:none;color:#8b95a5;text-transform:uppercase;font-size:10px;letter-spacing:1.2px;width:150px;padding:3px 12px 3px 0;vertical-align:top;font-weight:700}
  .finding-body td{border:none;padding:3px 0}
-
  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px 0}
  .legend .chip{font-size:12px;padding:4px 10px}
 </style>
@@ -2377,19 +2433,17 @@ $chipClass = @{
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Engineer Toolkit - Report</title>$style</head><body>")
 [void]$sb.AppendLine("<h1>Sigma Engineer Toolkit</h1>")
-[void]$sb.AppendLine("<p class='sub'>Generated $(Get-Date) on $($sys.ComputerName) by $($sys.User)</p>")
+[void]$sb.AppendLine("<p class='sub'>Generated $(ConvertTo-HtmlSafe (Get-Date)) on $(ConvertTo-HtmlSafe $sys.ComputerName) by $(ConvertTo-HtmlSafe $sys.User)</p>")
 
-# Hero
 [void]$sb.AppendLine("<div class='hero'>")
-[void]$sb.AppendLine("<div class='hero-num'>$($score.Overall)<span>/100</span></div>")
+[void]$sb.AppendLine("<div class='hero-num'>$(ConvertTo-HtmlSafe $score.Overall)<span>/100</span></div>")
 [void]$sb.AppendLine("<div class='hero-label'>Sigma Engineering Score</div>")
 [void]$sb.AppendLine("<div class='hero-cats'>")
 foreach ($k in $score.Categories.Keys) {
-    [void]$sb.AppendLine("<div><b>$($score.Categories[$k])</b><span>$k</span></div>")
+    [void]$sb.AppendLine("<div><b>$(ConvertTo-HtmlSafe $score.Categories[$k])</b><span>$(ConvertTo-HtmlSafe $k)</span></div>")
 }
 [void]$sb.AppendLine("</div></div>")
 
-# Legend
 [void]$sb.AppendLine("<h2>Legend</h2>")
 [void]$sb.AppendLine("<div class='legend'>")
 [void]$sb.AppendLine("<span class='chip green'>Healthy</span>")
@@ -2400,7 +2454,6 @@ foreach ($k in $score.Categories.Keys) {
 [void]$sb.AppendLine("<span class='chip blue'>Unknown</span>")
 [void]$sb.AppendLine("</div>")
 
-# Findings
 $topFindings = @()
 foreach ($r in $allResults) {
     foreach ($f in $r.Findings) { $topFindings += $f }
@@ -2416,20 +2469,19 @@ if ($topFindings.Count -eq 0) {
         $chipCls = if ($f.Severity -eq 'critical') { 'red' } else { 'yellow' }
         $chipTxt = if ($f.Severity -eq 'critical') { 'CRITICAL' } else { 'ATTENTION' }
         [void]$sb.AppendLine("<div class='finding $sevCls'>")
-        [void]$sb.AppendLine("<div class='finding-head'><span class='finding-title'>$($f.Problem)</span><span class='chip $chipCls'>$chipTxt</span></div>")
+        [void]$sb.AppendLine("<div class='finding-head'><span class='finding-title'>$(ConvertTo-HtmlSafe $f.Problem)</span><span class='chip $chipCls'>$chipTxt</span></div>")
         [void]$sb.AppendLine("<table class='finding-body'>")
-        [void]$sb.AppendLine("<tr><th>Software</th><td>$($f.Software)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Detected</th><td>$($f.Detected)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Why it matters</th><td>$($f.WhyItMatters)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Recommended</th><td>$($f.Recommendation)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Software</th><td>$(ConvertTo-HtmlSafe $f.Software)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Detected</th><td>$(ConvertTo-HtmlSafe $f.Detected)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Why it matters</th><td>$(ConvertTo-HtmlSafe $f.WhyItMatters)</td></tr>")
+        [void]$sb.AppendLine("<tr><th>Recommended</th><td>$(ConvertTo-HtmlSafe $f.Recommendation)</td></tr>")
         if ($f.Optional) {
-            [void]$sb.AppendLine("<tr><th>Optional</th><td>$($f.Optional)</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Optional</th><td>$(ConvertTo-HtmlSafe $f.Optional)</td></tr>")
         }
         [void]$sb.AppendLine("</table></div>")
     }
 }
 
-# Machine
 [void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
 foreach ($kv in @(
     @('OS', $sys.OS), @('Architecture', $sys.Arch),
@@ -2442,151 +2494,140 @@ foreach ($kv in @(
     @('Power', $sys.Power.StatusText),
     @('Discrete GPU', $sys.HasDiscreteGPU)
 )) {
-    [void]$sb.AppendLine("<tr><th style='width:220px'>$($kv[0])</th><td>$($kv[1])</td></tr>")
+    [void]$sb.AppendLine("<tr><th style='width:220px'>$(ConvertTo-HtmlSafe $kv[0])</th><td>$(ConvertTo-HtmlSafe $kv[1])</td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Graphics
 [void]$sb.AppendLine("<h2>Graphics</h2><div class='card'><table><tr><th>GPU</th><th>Kind</th><th>Driver</th><th>Date</th><th>VRAM (GB)</th></tr>")
 foreach ($g in $sys.GPUs) {
-    [void]$sb.AppendLine("<tr><td>$($g.Name)</td><td>$($g.Kind)</td><td>$($g.DriverVersion)</td><td>$($g.DriverDate)</td><td>$($g.VRAM_GB)</td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $g.Name)</td><td>$(ConvertTo-HtmlSafe $g.Kind)</td><td>$(ConvertTo-HtmlSafe $g.DriverVersion)</td><td>$(ConvertTo-HtmlSafe $g.DriverDate)</td><td>$(ConvertTo-HtmlSafe $g.VRAM_GB)</td></tr>")
 }
-[void]$sb.AppendLine("</table></div>")
+[void]$sb.AppendLine("</table><p class='small'>VRAM is read from the display class registry (QWORD). Some drivers report less than physical for shared memory.</p></div>")
 
-# Live GPU sample
 if ($LiveGpu -and $LiveGpu.Count -gt 0) {
     [void]$sb.AppendLine("<h2>Live GPU Sample</h2><div class='card'><table><tr><th>PID</th><th>Process</th><th>GPU %</th></tr>")
     foreach ($g in $LiveGpu) {
-        [void]$sb.AppendLine("<tr><td>$($g.Pid)</td><td>$($g.Process)</td><td>$($g.GPU)%</td></tr>")
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $g.Pid)</td><td>$(ConvertTo-HtmlSafe $g.Process)</td><td>$(ConvertTo-HtmlSafe $g.GPU)%</td></tr>")
     }
-    [void]$sb.AppendLine("</table></div>")
+    [void]$sb.AppendLine("</table><p class='small'>Per-process % is the sum of all GPU engine counters for that PID, averaged over the sample window.</p></div>")
 }
 
-# Disks
 [void]$sb.AppendLine("<h2>Disks</h2><div class='card'><table><tr><th>Drive</th><th>Label</th><th>FS</th><th>Size GB</th><th>Free GB</th><th>Free %</th></tr>")
 foreach ($d in $sys.Disks) {
     $cls = if ($d.FreePct -lt 10) { 'red' } elseif ($d.FreePct -lt 20) { 'yellow' } else { 'green' }
-    [void]$sb.AppendLine("<tr><td>$($d.Drive)</td><td>$($d.Label)</td><td>$($d.FS)</td><td>$($d.SizeGB)</td><td>$($d.FreeGB)</td><td><span class='chip $cls'>$($d.FreePct)%</span></td></tr>")
+    [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $d.Drive)</td><td>$(ConvertTo-HtmlSafe $d.Label)</td><td>$(ConvertTo-HtmlSafe $d.FS)</td><td>$(ConvertTo-HtmlSafe $d.SizeGB)</td><td>$(ConvertTo-HtmlSafe $d.FreeGB)</td><td><span class='chip $cls'>$(ConvertTo-HtmlSafe $d.FreePct)%</span></td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Windows Health
 [void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
-$rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
+$rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $(ConvertTo-HtmlSafe $windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
 [void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
-[void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$($windowsHealth.UpdateService)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Defender</th><td>$($windowsHealth.Defender)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Activation</th><td>$($windowsHealth.Activation)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Build age</th><td>$($windowsHealth.BuildAgeDays) days</td></tr>")
-[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$($windowsHealth.Score)/100</b></td></tr>")
+[void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$(ConvertTo-HtmlSafe $windowsHealth.UpdateService)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Defender</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Defender)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Firewall</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Firewall)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Activation</th><td>$(ConvertTo-HtmlSafe $windowsHealth.Activation)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Build age</th><td>$(ConvertTo-HtmlSafe $windowsHealth.BuildAgeDays) days</td></tr>")
+[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$(ConvertTo-HtmlSafe $windowsHealth.Score)/100</b></td></tr>")
 [void]$sb.AppendLine("</table></div>")
 
-# Power
 [void]$sb.AppendLine("<h2>Power</h2><div class='card'><table>")
-[void]$sb.AppendLine("<tr><th style='width:220px'>Has battery</th><td>$($sys.Power.HasBattery)</td></tr>")
+[void]$sb.AppendLine("<tr><th style='width:220px'>Has battery</th><td>$(ConvertTo-HtmlSafe $sys.Power.HasBattery)</td></tr>")
 $acChip = if ($sys.Power.OnAC) { 'Yes' } else { "<span class='chip yellow'>No</span>" }
 [void]$sb.AppendLine("<tr><th>On AC power</th><td>$acChip</td></tr>")
 if ($sys.Power.Percent -ne $null) {
-    [void]$sb.AppendLine("<tr><th>Charge</th><td>$($sys.Power.Percent)%</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Charge</th><td>$(ConvertTo-HtmlSafe $sys.Power.Percent)%</td></tr>")
 }
-[void]$sb.AppendLine("<tr><th>Status</th><td>$($sys.Power.StatusText)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Status</th><td>$(ConvertTo-HtmlSafe $sys.Power.StatusText)</td></tr>")
 [void]$sb.AppendLine("</table></div>")
 
-# Thermals
 if ($sys.ThermalZones.Count -gt 0) {
     [void]$sb.AppendLine("<h2>Thermals</h2><div class='card'><table><tr><th>Zone</th><th>Temperature</th></tr>")
     foreach ($z in $sys.ThermalZones) {
         $cls = if ($z.Celsius -lt 70) { 'green' } elseif ($z.Celsius -lt 85) { 'yellow' } else { 'red' }
-        [void]$sb.AppendLine("<tr><td>$($z.Zone)</td><td><span class='chip $cls'>$($z.Celsius) C</span></td></tr>")
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $z.Zone)</td><td><span class='chip $cls'>$(ConvertTo-HtmlSafe $z.Celsius) C</span></td></tr>")
     }
-    [void]$sb.AppendLine("</table></div>")
+    [void]$sb.AppendLine("</table><p class='small'>ACPI thermal zone readings are frequently unavailable or inaccurate on modern hardware. Do not rely on these for thermal diagnosis.</p></div>")
 }
 
-# Network
 [void]$sb.AppendLine("<h2>Network</h2><div class='card'><table>")
-[void]$sb.AppendLine("<tr><th style='width:220px'>Link speed</th><td>$($networkHealth.LinkSpeedText)</td></tr>")
-$dnsChip = if ($networkHealth.DNS -eq 'OK') { "<span class='chip green'>OK</span>" } else { "<span class='chip red'>$($networkHealth.DNS)</span>" }
+[void]$sb.AppendLine("<tr><th style='width:220px'>Link speed</th><td>$(ConvertTo-HtmlSafe $networkHealth.LinkSpeedText)</td></tr>")
+$dnsChip = if ($networkHealth.DNS -eq 'OK') { "<span class='chip green'>OK</span>" } else { "<span class='chip red'>$(ConvertTo-HtmlSafe $networkHealth.DNS)</span>" }
 [void]$sb.AppendLine("<tr><th>DNS</th><td>$dnsChip</td></tr>")
-[void]$sb.AppendLine("<tr><th>Default gateway</th><td>$($networkHealth.DefaultGW)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$($networkHealth.Score)/100</b></td></tr>")
+[void]$sb.AppendLine("<tr><th>Default gateway</th><td>$(ConvertTo-HtmlSafe $networkHealth.DefaultGW)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$(ConvertTo-HtmlSafe $networkHealth.Score)/100</b></td></tr>")
 [void]$sb.AppendLine("</table>")
 if ($networkHealth.Adapters.Count -gt 0) {
     [void]$sb.AppendLine("<h3 style='margin-top:16px'>Adapters</h3>")
     [void]$sb.AppendLine("<table><tr><th>Name</th><th>Link speed</th><th>MAC</th></tr>")
     foreach ($a in $networkHealth.Adapters) {
-        [void]$sb.AppendLine("<tr><td>$($a.Name)</td><td>$($a.LinkSpeed)</td><td>$($a.Mac)</td></tr>")
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $a.Name)</td><td>$(ConvertTo-HtmlSafe $a.LinkSpeed)</td><td>$(ConvertTo-HtmlSafe $a.Mac)</td></tr>")
     }
     [void]$sb.AppendLine("</table>")
 }
 [void]$sb.AppendLine("</div>")
 
-# License Center
 if ($networkHealth.License.Count -gt 0) {
     [void]$sb.AppendLine("<h2>License Center</h2><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Product</th><th>Ports</th><th>Local</th></tr>")
     foreach ($l in $networkHealth.License) {
         $chip = if ($l.Local) { "<span class='chip green'>OPEN</span>" } else { "<span class='chip gray'>CLOSED</span>" }
-        [void]$sb.AppendLine("<tr><td>$($l.Product)</td><td>$($l.Ports)</td><td>$chip</td></tr>")
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $l.Product)</td><td>$(ConvertTo-HtmlSafe $l.Ports)</td><td>$chip</td></tr>")
     }
-    [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers.</p></div>")
+    [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers. This check only probes localhost.</p></div>")
 }
 
-# Guardian
 if ($guardian) {
     [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'>")
-    [void]$sb.AppendLine("<p><b>$($guardian.Root)</b></p>")
+    [void]$sb.AppendLine("<p><b>$(ConvertTo-HtmlSafe $guardian.Root)</b></p>")
     [void]$sb.AppendLine("<table>")
-    [void]$sb.AppendLine("<tr><th style='width:220px'>Total files</th><td>$($guardian.TotalFiles)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Total size</th><td>$($guardian.TotalGB) GB</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Engineering files</th><td>$($guardian.EngineeringFiles)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Long paths</th><td>$($guardian.LongPaths)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Backup/temp files</th><td>$($guardian.BackupFiles) (old: $($guardian.OldBackups))</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Large files</th><td>$($guardian.LargeFiles) ($($guardian.LargeGB) GB)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>References scanned</th><td>$($guardian.RefTotal)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Broken references</th><td>$($guardian.RefMissing)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Project Health</th><td><b>$($guardian.Health)%</b></td></tr>")
+    [void]$sb.AppendLine("<tr><th style='width:220px'>Total files</th><td>$(ConvertTo-HtmlSafe $guardian.TotalFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Total size</th><td>$(ConvertTo-HtmlSafe $guardian.TotalGB) GB</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Engineering files</th><td>$(ConvertTo-HtmlSafe $guardian.EngineeringFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Long paths</th><td>$(ConvertTo-HtmlSafe $guardian.LongPaths)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Backup/temp files</th><td>$(ConvertTo-HtmlSafe $guardian.BackupFiles) (old: $(ConvertTo-HtmlSafe $guardian.OldBackups))</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Large files</th><td>$(ConvertTo-HtmlSafe $guardian.LargeFiles) ($(ConvertTo-HtmlSafe $guardian.LargeGB) GB)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>References scanned</th><td>$(ConvertTo-HtmlSafe $guardian.RefTotal)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Broken references (heuristic)</th><td>$(ConvertTo-HtmlSafe $guardian.RefMissing)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Project Health</th><td><b>$(ConvertTo-HtmlSafe $guardian.Health)%</b></td></tr>")
     [void]$sb.AppendLine("</table>")
     if ($guardian.RefMissingList -and $guardian.RefMissingList.Count -gt 0) {
-        [void]$sb.AppendLine("<h3 style='margin-top:16px'>Broken references (first 50)</h3>")
+        [void]$sb.AppendLine("<h3 style='margin-top:16px'>Broken references (first 50, heuristic — verify in CAD)</h3>")
         [void]$sb.AppendLine("<table><tr><th>Drawing</th><th>Type</th><th>Reference</th></tr>")
         foreach ($ref in ($guardian.RefMissingList | Select-Object -First 50)) {
-            [void]$sb.AppendLine("<tr><td class='small'>$($ref.Drawing)</td><td>$($ref.Type)</td><td class='small'>$($ref.Ref)</td></tr>")
+            [void]$sb.AppendLine("<tr><td class='small'>$(ConvertTo-HtmlSafe $ref.Drawing)</td><td>$(ConvertTo-HtmlSafe $ref.Type)</td><td class='small'>$(ConvertTo-HtmlSafe $ref.Ref)</td></tr>")
         }
         [void]$sb.AppendLine("</table>")
     }
     [void]$sb.AppendLine("</div>")
 }
 
-# Overall
 [void]$sb.AppendLine("<h2>Overall</h2><div class='card'>")
 [void]$sb.AppendLine("<p><span class='chip green'>$gCount healthy</span> &nbsp; <span class='chip yellow'>$yCount attention</span> &nbsp; <span class='chip red'>$rCount critical</span> &nbsp; <span class='chip gray'>$nCount not installed</span> &nbsp; <span class='chip darkgray'>$aCount not applicable</span></p>")
 [void]$sb.AppendLine("</div>")
 
-# Disciplines
 [void]$sb.AppendLine("<h2>Disciplines</h2>")
 foreach ($d in $byDisc.Keys | Sort-Object) {
     $rs = $byDisc[$d] | Sort-Object State, Name
     $g  = @($rs | Where-Object State -eq 'Healthy').Count
     $y  = @($rs | Where-Object State -eq 'Attention').Count
     $rr = @($rs | Where-Object State -eq 'Critical').Count
-    [void]$sb.AppendLine("<div class='disc'><h3>$d <span class='small'>($g healthy / $y attention / $rr critical)</span></h3>")
+    [void]$sb.AppendLine("<div class='disc'><h3>$(ConvertTo-HtmlSafe $d) <span class='small'>($g healthy / $y attention / $rr critical)</span></h3>")
     [void]$sb.AppendLine("<table><tr><th>Software</th><th>Kind</th><th>Status</th><th>Version</th><th>Findings</th></tr>")
     foreach ($p in $rs) {
         $cls = if ($chipClass.ContainsKey($p.State)) { $chipClass[$p.State] } else { 'gray' }
         $msg = @()
         foreach ($f in $p.Findings) {
             $mark = if ($f.Severity -eq 'critical') { '!!' } else { '!' }
-            $msg += "$mark $($f.Problem)"
+            $msg += "$mark $(ConvertTo-HtmlSafe $f.Problem)"
         }
-        foreach ($n in $p.Notes) { $msg += ". $n" }
+        foreach ($n in $p.Notes) { $msg += ". $(ConvertTo-HtmlSafe $n)" }
         $msg = $msg -join '<br>'
-        [void]$sb.AppendLine("<tr><td><b>$($p.Name)</b></td><td>$($p.Kind)</td><td><span class='chip $cls'>$($p.State)</span></td><td>$($p.Version)</td><td class='small'>$msg</td></tr>")
+        [void]$sb.AppendLine("<tr><td><b>$(ConvertTo-HtmlSafe $p.Name)</b></td><td>$(ConvertTo-HtmlSafe $p.Kind)</td><td><span class='chip $cls'>$(ConvertTo-HtmlSafe $p.State)</span></td><td>$(ConvertTo-HtmlSafe $p.Version)</td><td class='small'>$msg</td></tr>")
     }
     [void]$sb.AppendLine("</table></div>")
 }
 
-[void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors.</p>")
+[void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors. Thermal, VRAM, and XREF findings are heuristic; verify with vendor tools.</p>")
 [void]$sb.AppendLine("</body></html>")
 $sb.ToString() | Set-Content "$reportBase.html" -Encoding UTF8
 Write-Ok
