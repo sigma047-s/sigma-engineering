@@ -50,6 +50,7 @@ Write-Host "[INFO] Detects installed software, checks prerequisites, writes a re
 Write-Host "[INFO] The tool can install engineering software." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
 Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
+Write-Host "[WARNING] This scaning tool isn't 100% accurate." -ForegroundColor Yellow
 if ($Disciplines.Count -gt 0) {
     Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan
 }
