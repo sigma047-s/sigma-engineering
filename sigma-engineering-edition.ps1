@@ -4,12 +4,10 @@
     Sigma Engineer Toolkit - engineering workstation diagnostic + software installer.
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
-    Fixes vs previous version:
-      * Thermals and ProjectSafety removed from scoring and reporting
-      * Data confidence excludes N/A categories from the denominator
-      * Recent Hardware / System Events section removed from report
-      * Event log penalty row removed (penalty still applies to score)
-      * Non-fatal warning at end of run suppressed
+    Changes vs previous version:
+      * System Health section removed from HTML report
+      * Data confidence counts N/A categories at 0.5 (honest, not inflated)
+      * Brackets [N/A] / [High] / [Medium] / [Low] removed from console output
 #>
 [CmdletBinding()]
 param(
@@ -833,7 +831,7 @@ $installed = Get-InstalledSoftware
 Write-Host " $($installed.Count) entries." -ForegroundColor Green
 
 # =============================================================================
-# 4. SYSTEM INVENTORY - no thermal scanning
+# 4. SYSTEM INVENTORY
 # =============================================================================
 Write-Stage "Capturing system inventory..."
 $sys = & {
@@ -1318,7 +1316,7 @@ function Invoke-Preflight {
 }
 
 # =============================================================================
-# 5e. WHY-SLOW - Thermals removed
+# 5e. WHY-SLOW
 # =============================================================================
 function Invoke-WhySlow {
     param([pscustomobject]$System)
@@ -2179,7 +2177,7 @@ function Get-Cached {
 function Invoke-SafeWebRequest {
     param([string]$Url, [int]$TimeoutSec = 8, [hashtable]$Headers = @{})
     if (-not $Headers.ContainsKey('User-Agent')) {
-        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.4'
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.5'
     }
     try {
         return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing `
@@ -2683,7 +2681,7 @@ function Invoke-SystemOnlineVerification {
 }
 
 # =============================================================================
-# 7. HEALTH SCORE - Thermals and ProjectSafety removed; DataConfidence excludes N/A
+# 7. HEALTH SCORE - honest DataConfidence (N/A counts as 0.5)
 # =============================================================================
 function Get-HealthScore {
     param(
@@ -2950,7 +2948,7 @@ function Get-HealthScore {
     $cats['Network'] = $netScore
     $conf['Network'] = $netConf
 
-    # Event log adjustments - Windows and Storage only
+    # Event log adjustments
     if ($EventLogs) {
         if ($EventLogs.WheaCount -gt 0) {
             $cats['Hardware'] = [math]::Max(0, $cats['Hardware'] - 15)
@@ -2974,7 +2972,7 @@ function Get-HealthScore {
         }
     }
 
-    # Overall - Thermals and ProjectSafety removed from weights
+    # Overall
     $weights = @{
         Hardware = 0.25; Storage = 0.20; EngineeringSoftware = 0.25
         GPU = 0.10; Drivers = 0.12; Licensing = 0.08
@@ -2991,13 +2989,19 @@ function Get-HealthScore {
     }
     $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
 
-    # DataConfidence - N/A categories excluded from the denominator
-    $confMap = @{ 'High' = 1.0; 'Medium' = 0.6; 'Low' = 0.3 }
+    # DataConfidence - HONEST:
+    #   High   = 1.0 (we measured it and it worked)
+    #   Medium = 0.7 (partial / offline heuristic)
+    #   Low    = 0.4 (weak signal)
+    #   N/A    = 0.5 (we could not measure it at all - so confidence is only partial)
+    # This means N/A categories drag the confidence down instead of being excluded
+    # (which would inflate it to 100%). It also does not go to 0 like before.
+    $confMap = @{ 'High' = 1.0; 'Medium' = 0.7; 'Low' = 0.4; 'N/A' = 0.5 }
     $confSum = 0
     $confWeight = 0
     foreach ($k in $conf.Keys) {
         $c = $conf[$k]
-        if ($c -eq 'N/A' -or $c -eq $null) { continue }
+        if ($c -eq $null) { $c = 'N/A' }
         $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
         $confWeight += $w
         $confSum += $w * $confMap[$c]
@@ -3035,7 +3039,8 @@ Write-Ok
 $defenderExcl = Get-DefenderExclusions
 
 # =============================================================================
-# 6a-bis. EVENT LOG FINDINGS
+# 6a-bis. EVENT LOG FINDINGS (attached to $allResults, but System Health section
+# is no longer rendered in the report)
 # =============================================================================
 function Add-EventLogFindings {
     param([pscustomobject]$EventLogs, [pscustomobject]$SystemVerification)
@@ -3163,12 +3168,12 @@ foreach ($d in $byDisc.Keys | Sort-Object) {
                 -f $d, $green, $total, $yell, $red, $bar) -ForegroundColor Cyan
 }
 
+# Console score display - no brackets
 Write-Host ""
 Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100  (Data confidence: {1}%)" -f $score.Overall, $score.DataConfidence) -ForegroundColor Green
 foreach ($k in $score.Categories.Keys) {
-    $v = if ($score.Categories[$k] -eq $null) { ' N/A' } else { "{0,3}" -f $score.Categories[$k] }
-    $c = $score.Confidence[$k]
-    Write-Host ("    {0,-22} {1}/100  [{2}]" -f $k, $v, $c)
+    $v = if ($score.Categories[$k] -eq $null) { 'N/A' } else { "{0,3}" -f $score.Categories[$k] }
+    Write-Host ("    {0,-22} {1}/100" -f $k, $v)
 }
 
 # =============================================================================
@@ -3583,9 +3588,10 @@ if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
 [void]$sb.AppendLine("<span class='chip blue'>Unknown</span>")
 [void]$sb.AppendLine("</div>")
 
-# Findings
+# Findings (from real products only - exclude synthetic System Health)
 $topFindings = @()
 foreach ($r in $allResults) {
+    if ($r.IsSynthetic) { continue }
     foreach ($f in $r.Findings) { $topFindings += $f }
 }
 $topFindings = @($topFindings | Sort-Object @{e={ if ($_.Severity -eq 'critical') { 0 } else { 1 } }}, Id)
@@ -3654,7 +3660,7 @@ foreach ($d in $sys.Disks) {
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Windows Health - no event log penalty row
+# Windows Health
 [void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
 $rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
 [void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
@@ -3723,7 +3729,7 @@ if ($networkHealth.License.Count -gt 0) {
     [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers.</p></div>")
 }
 
-# Project Guardian output if it was run
+# Project Guardian output
 if ($guardian) {
     [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'>")
     [void]$sb.AppendLine("<p><b>$($guardian.Root)</b></p>")
@@ -3783,30 +3789,6 @@ if ($realInstalled.Count -eq 0) {
     }
 }
 
-# System Health findings (from synthetic product)
-$systemFindings = @()
-foreach ($r in $allResults) {
-    if ($r.IsSynthetic -and $r.Findings) {
-        foreach ($f in $r.Findings) { $systemFindings += $f }
-    }
-}
-if ($systemFindings.Count -gt 0) {
-    [void]$sb.AppendLine("<h2>System Health</h2>")
-    foreach ($f in $systemFindings) {
-        $sevCls = if ($f.Severity -eq 'critical') { 'sev-critical' } else { 'sev-warn' }
-        $chipCls = if ($f.Severity -eq 'critical') { 'red' } else { 'yellow' }
-        $chipTxt = if ($f.Severity -eq 'critical') { 'CRITICAL' } else { 'ATTENTION' }
-        [void]$sb.AppendLine("<div class='finding $sevCls'>")
-        [void]$sb.AppendLine("<div class='finding-head'><span class='finding-title'>$($f.Problem)</span><span class='chip $chipCls'>$chipTxt</span></div>")
-        [void]$sb.AppendLine("<table class='finding-body'>")
-        [void]$sb.AppendLine("<tr><th>Software</th><td>$($f.Software)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Detected</th><td>$($f.Detected)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Why it matters</th><td>$($f.WhyItMatters)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Recommended</th><td>$($f.Recommendation)</td></tr>")
-        [void]$sb.AppendLine("</table></div>")
-    }
-}
-
 [void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors.</p>")
 [void]$sb.AppendLine("</body></html>")
 $sb.ToString() | Set-Content "$reportBase.html" -Encoding UTF8
@@ -3819,7 +3801,6 @@ Write-Stage "Finalising..."
 $null = Get-Item "$reportBase.html" -ErrorAction SilentlyContinue
 Write-Ok
 
-# Silently remove error log
 if (Test-Path $errorLog) { Remove-Item $errorLog -Force -ErrorAction SilentlyContinue }
 
 Write-Host "[SUCCESS] Engineering diagnostic complete." -ForegroundColor Green
