@@ -4,10 +4,8 @@
     Sigma Engineer Toolkit - engineering workstation diagnostic + software installer.
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
-    Changes vs previous version:
-      * System Health section removed from HTML report
-      * Data confidence counts N/A categories at 0.5 (honest, not inflated)
-      * Brackets [N/A] / [High] / [Medium] / [Low] removed from console output
+    GPU and Drivers categories removed from scoring.
+    Data confidence counts N/A at 0.5 (honest).
 #>
 [CmdletBinding()]
 param(
@@ -2177,7 +2175,7 @@ function Get-Cached {
 function Invoke-SafeWebRequest {
     param([string]$Url, [int]$TimeoutSec = 8, [hashtable]$Headers = @{})
     if (-not $Headers.ContainsKey('User-Agent')) {
-        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.5'
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.6'
     }
     try {
         return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing `
@@ -2681,7 +2679,7 @@ function Invoke-SystemOnlineVerification {
 }
 
 # =============================================================================
-# 7. HEALTH SCORE - honest DataConfidence (N/A counts as 0.5)
+# 7. HEALTH SCORE - GPU and Drivers categories removed
 # =============================================================================
 function Get-HealthScore {
     param(
@@ -2803,104 +2801,6 @@ function Get-HealthScore {
         $conf['EngineeringSoftware'] = if ($Enrichment -and $Enrichment.Upgradeable.Count -gt 0) { 'High' } else { 'Medium' }
     }
 
-    # GPU
-    $gpuScore = 100
-    $gpuConf  = 'N/A'
-    if ($Enrichment -and $Enrichment.GpuScores.Count -gt 0) {
-        $best = ($Enrichment.GpuScores | Where-Object Score | Sort-Object Score -Descending | Select-Object -First 1)
-        if ($best -and $best.Score) {
-            $g = $best.Score
-            $gpuScore = if     ($g -ge 25000) { 100 }
-                        elseif ($g -ge 15000) { 95 }
-                        elseif ($g -ge 8000)  { 85 }
-                        elseif ($g -ge 3000)  { 70 }
-                        elseif ($g -ge 1000)  { 50 }
-                        else                  { 25 }
-            $gpuConf = 'High'
-        }
-    } elseif (-not $System.HasDiscreteGPU) {
-        $gpuScore = 40
-        $gpuConf  = 'Medium'
-    } elseif (-not $Script:OnlineEnabled) {
-        $gpuConf = 'Medium'
-    }
-
-    $driverPenalty = 0
-
-    $nvGpu = $System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1
-    $amdGpu = $System.GPUs | Where-Object { $_.Name -match 'Radeon' } | Select-Object -First 1
-    $intelGpu = $System.GPUs | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1
-
-    foreach ($g in @($nvGpu, $amdGpu, $intelGpu)) {
-        if ($g -and $g.DriverDate) {
-            try {
-                $ageDays = (New-TimeSpan -Start ([datetime]$g.DriverDate) -End (Get-Date)).TotalDays
-                if ($ageDays -gt 730)     { $driverPenalty = [math]::Max($driverPenalty, 20) }
-                elseif ($ageDays -gt 365) { $driverPenalty = [math]::Max($driverPenalty, 12) }
-                elseif ($ageDays -gt 180) { $driverPenalty = [math]::Max($driverPenalty, 6) }
-            } catch { }
-        }
-    }
-
-    $installedNv  = $nvGpu.DriverVersion
-    $installedAmd = $amdGpu.DriverVersion
-
-    if ($Enrichment -and $Enrichment.LatestNvidia -and $installedNv) {
-        $nvLatest = $Enrichment.LatestNvidia -replace '\.',''
-        $nvInst   = $installedNv -replace '\.',''
-        if ($nvInst.Length -gt 5) { $nvInst = $nvInst.Substring($nvInst.Length - 5) }
-        try {
-            if ([int]$nvLatest -gt [int]$nvInst) { $driverPenalty = [math]::Max($driverPenalty, 15) }
-        } catch { }
-    }
-
-    if ($Enrichment -and $Enrichment.Upgradeable.Count -gt 0) {
-        $gpuUp = @($Enrichment.Upgradeable | Where-Object {
-            $_.Name -match 'NVIDIA|GeForce|Radeon|AMD|Intel.*Graphics'
-        }).Count
-        if ($gpuUp -gt 0) { $driverPenalty = [math]::Max($driverPenalty, 10) }
-    }
-
-    $cats['GPU'] = [math]::Max(0, $gpuScore - $driverPenalty)
-    $conf['GPU'] = $gpuConf
-
-    # DRIVERS
-    $drv = 100
-    $drvConf = 'N/A'
-    if ($NetFx -match '^4\.[0-6]')    { $drv -= 40 }
-    elseif ($NetFx -eq '4.7')         { $drv -= 15 }
-    if (-not $VC -or $VC.Count -eq 0) { $drv -= 30 }
-
-    if ($SystemVerification) {
-        if ($SystemVerification.LatestDefenderSig -and $WindowsHealth.DefenderSig) {
-            try {
-                $haveSig = [version]($WindowsHealth.DefenderSig)
-                $wantSig = [version]($SystemVerification.LatestDefenderSig)
-                if ($wantSig -gt $haveSig) { $drv -= 5 }
-            } catch { }
-        }
-        if ($SystemVerification.LatestVCRedist -and $VC.Count -gt 0) {
-            try {
-                $haveVC = ($VC | ForEach-Object { $_.DisplayVersion } |
-                           Where-Object { $_ -match '^\d+\.' } |
-                           Sort-Object { [version]($_ -replace '[^0-9\.]','') } |
-                           Select-Object -Last 1)
-                if ($haveVC -and ([version]($haveVC -replace '[^0-9\.]','') -lt [version]($SystemVerification.LatestVCRedist))) {
-                    $drv -= 5
-                }
-                $drvConf = 'High'
-            } catch { }
-        }
-        if ($Motherboard -and $Motherboard.BiosReleaseDate) {
-            try {
-                $biosAge = (New-TimeSpan -Start ([datetime]$Motherboard.BiosReleaseDate) -End (Get-Date)).TotalDays
-                if ($biosAge -gt 3 * 365) { $drv -= 5 }
-            } catch { }
-        }
-    }
-    $cats['Drivers'] = [math]::Max(0, $drv)
-    $conf['Drivers'] = $drvConf
-
     # LICENSING
     if ($rel.Count -eq 0) {
         $cats['Licensing'] = $null
@@ -2972,11 +2872,10 @@ function Get-HealthScore {
         }
     }
 
-    # Overall
+    # Overall - GPU and Drivers removed; weights redistributed
     $weights = @{
-        Hardware = 0.25; Storage = 0.20; EngineeringSoftware = 0.25
-        GPU = 0.10; Drivers = 0.12; Licensing = 0.08
-        Windows = 0.05; Network = 0.05
+        Hardware = 0.30; Storage = 0.22; EngineeringSoftware = 0.30
+        Licensing = 0.08; Windows = 0.05; Network = 0.05
     }
 
     $sumW = 0
@@ -2989,13 +2888,7 @@ function Get-HealthScore {
     }
     $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
 
-    # DataConfidence - HONEST:
-    #   High   = 1.0 (we measured it and it worked)
-    #   Medium = 0.7 (partial / offline heuristic)
-    #   Low    = 0.4 (weak signal)
-    #   N/A    = 0.5 (we could not measure it at all - so confidence is only partial)
-    # This means N/A categories drag the confidence down instead of being excluded
-    # (which would inflate it to 100%). It also does not go to 0 like before.
+    # DataConfidence - N/A counts as 0.5
     $confMap = @{ 'High' = 1.0; 'Medium' = 0.7; 'Low' = 0.4; 'N/A' = 0.5 }
     $confSum = 0
     $confWeight = 0
@@ -3039,8 +2932,7 @@ Write-Ok
 $defenderExcl = Get-DefenderExclusions
 
 # =============================================================================
-# 6a-bis. EVENT LOG FINDINGS (attached to $allResults, but System Health section
-# is no longer rendered in the report)
+# 6a-bis. EVENT LOG FINDINGS
 # =============================================================================
 function Add-EventLogFindings {
     param([pscustomobject]$EventLogs, [pscustomobject]$SystemVerification)
@@ -3168,7 +3060,7 @@ foreach ($d in $byDisc.Keys | Sort-Object) {
                 -f $d, $green, $total, $yell, $red, $bar) -ForegroundColor Cyan
 }
 
-# Console score display - no brackets
+# Console score display - no brackets, no GPU/Drivers
 Write-Host ""
 Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100  (Data confidence: {1}%)" -f $score.Overall, $score.DataConfidence) -ForegroundColor Green
 foreach ($k in $score.Categories.Keys) {
@@ -3588,7 +3480,7 @@ if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
 [void]$sb.AppendLine("<span class='chip blue'>Unknown</span>")
 [void]$sb.AppendLine("</div>")
 
-# Findings (from real products only - exclude synthetic System Health)
+# Findings
 $topFindings = @()
 foreach ($r in $allResults) {
     if ($r.IsSynthetic) { continue }
