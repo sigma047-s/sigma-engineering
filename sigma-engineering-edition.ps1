@@ -1087,7 +1087,7 @@ function Invoke-OnlineEnrichment {
 }
 
 # =============================================================================
-# INSTALLER (WINGET + VENDOR URLS) - NO DUPLICATE KEYS
+# INSTALLER (WINGET + VENDOR URLS)
 # =============================================================================
 $Script:WingetMap = @{
     'Python'='Python.Python.3.12'; 'Anaconda'='Anaconda.Anaconda3'; 'Git'='Git.Git'
@@ -1102,7 +1102,7 @@ $Script:WingetMap = @{
     'Inkscape'='Inkscape.Inkscape'; '7-Zip'='7zip.7zip'
 }
 
-# NOTE: only one entry per key. 'Advance Steel' appears once (below).
+# Only ONE entry per key. 'Advance Steel' appears exactly once.
 $Script:ManualUrls = @{
     'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
     'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
@@ -1248,7 +1248,7 @@ function New-ReqResult {
     [pscustomobject]@{ Type=$Type; Component=$Component; Required=$Required; Actual=$Actual; Status=$Status; Note=$Note }
 }
 
-# DirectX from OS build number - the registry value is unreliable.
+# DirectX from OS build number.
 function Get-DirectXVersion {
     try {
         $build = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber
@@ -1601,6 +1601,7 @@ function Select-ScanTargets {
     }
 }
 
+# Install menu lists EVERY scanned app, any verdict can be picked.
 function Show-InstallMenu {
     param([array]$ScanResults)
     if ($ScanResults.Count -eq 0) {
@@ -1899,7 +1900,7 @@ $lastScanResults = @()
 $lastDisciplines = @($Disciplines)
 $lastApps        = @($CheckApps)
 
-# Non-interactive path (or batch -Install) runs once and exits
+# Non-interactive / batch install path
 if ($NonInteractive -or $Install -or $Disciplines.Count -gt 0 -or $CheckApps.Count -gt 0) {
     if (-not $Disciplines -and -not $CheckApps) {
         Write-Host "[INFO] Non-interactive with no filters. Skipping scan." -ForegroundColor DarkGray
