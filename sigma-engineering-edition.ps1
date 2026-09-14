@@ -4,25 +4,12 @@
     Sigma Engineer Toolkit - engineering workstation diagnostic + software installer.
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
-    Fixes applied vs previous version:
-      * Synthetic System Health product no longer counted as an installed
-        engineering product (fixes EngineeringSoftware=0 and Licensing=100)
-      * Windows Health section shows effective (post-penalty) score
-      * NVIDIA driver regex rejects non-NVIDIA version strings
-      * VC++ Redist online regex requires v14.3x+ (rejects stale 14.0.x)
-      * Wi-Fi fallback no longer abuses NetworkCategory as RadioType
-      * Disconnected adapters render grey, not green
-      * Disciplines section shows a clean empty state
-      * Network link speed sourced from the same sample as capability list
-    Removed from report output:
-      * Confidence pills (High/Medium/Low/N/A) in hero and tables
-      * Wi-Fi Details section
-      * Thermal events row in event log table
-      * Online / Expected column in Verified Components
-      * Status column in Verified Components
-      * Source column in Verified Components
-      * Outdated packages (from winget) section
-      * Thermals section
+    Fixes vs previous version:
+      * Thermals and ProjectSafety removed from scoring and reporting
+      * Data confidence excludes N/A categories from the denominator
+      * Recent Hardware / System Events section removed from report
+      * Event log penalty row removed (penalty still applies to score)
+      * Non-fatal warning at end of run suppressed
 #>
 [CmdletBinding()]
 param(
@@ -174,60 +161,6 @@ function Resolve-GpuVram {
         }
     }
     return $null
-}
-
-function Get-ThermalInfo {
-    $zones = @()
-
-    foreach ($ns in @('root\LibreHardwareMonitor','root\OpenHardwareMonitor')) {
-        try {
-            $sensors = Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop |
-                       Where-Object { $_.SensorType -eq 'Temperature' }
-            foreach ($s in $sensors) {
-                $zones += [pscustomobject]@{
-                    Zone    = "$($s.Parent)/$($s.Name)"
-                    Celsius = [math]::Round([double]$s.Value, 1)
-                    Source  = $ns.Split('\')[-1]
-                }
-            }
-            if ($zones.Count -gt 0) { break }
-        } catch { }
-    }
-
-    if ($zones.Count -eq 0) {
-        try {
-            $t = Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop
-            $i = 0
-            foreach ($z in $t) {
-                $i++
-                $c = ($z.CurrentTemperature / 10) - 273.15
-                if ($c -gt 0 -and $c -lt 200) {
-                    $zones += [pscustomobject]@{
-                        Zone    = "ACPI Zone$i"
-                        Celsius = [math]::Round($c, 1)
-                        Source  = 'ACPI'
-                    }
-                }
-            }
-        } catch { }
-    }
-
-    try {
-        foreach ($d in Get-PhysicalDisk -ErrorAction Stop) {
-            try {
-                $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop
-                if ($rc -and $rc.Temperature -ne $null -and $rc.Temperature -gt 0) {
-                    $zones += [pscustomobject]@{
-                        Zone    = "Disk $($d.FriendlyName)"
-                        Celsius = [double]$rc.Temperature
-                        Source  = 'SMART'
-                    }
-                }
-            } catch { }
-        }
-    } catch { }
-
-    return $zones
 }
 
 function Get-PowerState {
@@ -407,7 +340,6 @@ function Get-WifiDetails {
         if ($block.Count -gt 0) { $r.Interfaces += [pscustomobject]$block }
     } catch { }
 
-    # Fallback: SSID from connection profile. Do NOT abuse NetworkCategory as RadioType.
     if ($r.Interfaces.Count -eq 0) {
         try {
             $cp = Get-NetConnectionProfile -InterfaceAlias 'Wi-Fi' -ErrorAction Stop
@@ -901,7 +833,7 @@ $installed = Get-InstalledSoftware
 Write-Host " $($installed.Count) entries." -ForegroundColor Green
 
 # =============================================================================
-# 4. SYSTEM INVENTORY
+# 4. SYSTEM INVENTORY - no thermal scanning
 # =============================================================================
 Write-Stage "Capturing system inventory..."
 $sys = & {
@@ -998,7 +930,7 @@ $sys = & {
         HasIntegrated  = $hasIntegrated
         Disks          = $disks
         PageFile       = $pf
-        ThermalZones   = @(Get-ThermalInfo)
+        ThermalZones   = @()
         Power          = Get-PowerState
         Battery        = Get-BatteryHealth
         IsAdmin        = (Test-IsAdmin)
@@ -1344,17 +1276,6 @@ function Invoke-Preflight {
         }
     }
 
-    if ($System.ThermalZones -and $System.ThermalZones.Count -gt 0) {
-        $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
-        if ($max -lt 80) {
-            Report 'OK' "Max temperature" "$max C"
-        } elseif ($max -lt 95) {
-            Report 'WARN' "Temperature elevated" "$max C"
-        } else {
-            Report 'FAIL' "Temperature critical" "$max C"
-        }
-    }
-
     if ($System.Power.HasBattery) {
         if ($System.Power.OnAC) {
             Report 'OK' "AC power" "battery at $($System.Power.Percent)% ($($System.Power.StatusText))"
@@ -1397,7 +1318,7 @@ function Invoke-Preflight {
 }
 
 # =============================================================================
-# 5e. WHY-SLOW
+# 5e. WHY-SLOW - Thermals removed
 # =============================================================================
 function Invoke-WhySlow {
     param([pscustomobject]$System)
@@ -1444,15 +1365,14 @@ function Invoke-WhySlow {
         CPU    = if (($topCpu | Select-Object -First 1).CPU -gt 60) { 'ELEVATED' } else { 'OK' }
         GPU    = if ($System.HasDiscreteGPU) { 'OK' } else { 'ELEVATED' }
         Power  = if ($System.Power.HasBattery -and -not $System.Power.OnAC) { 'ELEVATED' } else { 'OK' }
-        Thermal= if ($System.ThermalZones.Count -gt 0 -and (($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum) -gt 85) { 'ELEVATED' } else { 'OK' }
     }
 
     $primary = 'None detected'
-    foreach ($k in @('RAM','Disk','Thermal','Power','CPU','GPU')) {
+    foreach ($k in @('RAM','Disk','Power','CPU','GPU')) {
         if ($verdicts[$k] -eq 'CRITICAL') { $primary = $k; break }
     }
     if ($primary -eq 'None detected') {
-        foreach ($k in @('RAM','Disk','Thermal','Power','CPU','GPU')) {
+        foreach ($k in @('RAM','Disk','Power','CPU','GPU')) {
             if ($verdicts[$k] -eq 'ELEVATED') { $primary = $k; break }
         }
     }
@@ -1462,8 +1382,6 @@ function Invoke-WhySlow {
     Write-Host ("    CPU cores           {0} logical" -f $System.LogicalCPUs)
     Write-Host ("    Worst disk free     {0} GB ({1}% on {2})" -f $critDisk.FreeGB, $critDisk.FreePct, $critDisk.Drive)
     Write-Host ("    Power               {0}" -f $System.Power.StatusText)
-    $thMax = if ($System.ThermalZones.Count -gt 0) { "$((($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum)) C max" } else { 'not exposed' }
-    Write-Host ("    Thermals            {0}" -f $thMax)
     Write-Host ""
 
     Write-Host "  Verdicts" -ForegroundColor Cyan
@@ -1495,7 +1413,6 @@ function Invoke-WhySlow {
     $rec = switch ($primary) {
         'RAM'    { "Close unused applications or upgrade RAM. Currently $ramPctFree% free." }
         'Disk'   { "Free space on $($critDisk.Drive). Engineering tools need scratch headroom." }
-        'Thermal'{ "Check cooling. Consider limiting solver threads until temperatures fall." }
         'Power'  { "Plug in AC power. Laptop battery mode throttles CPU and GPU." }
         'CPU'    { "A background process is consuming CPU. See the list above." }
         'GPU'    { "No discrete GPU detected. Some 3D and solver workloads will be slow." }
@@ -2262,7 +2179,7 @@ function Get-Cached {
 function Invoke-SafeWebRequest {
     param([string]$Url, [int]$TimeoutSec = 8, [hashtable]$Headers = @{})
     if (-not $Headers.ContainsKey('User-Agent')) {
-        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.3'
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.4'
     }
     try {
         return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing `
@@ -2326,7 +2243,6 @@ function Get-GpuPassMarkScore {
     }
 }
 
-# Real NVIDIA versions look like 5XX.XX or 32.0.15.XXXX. Reject other numbers.
 function Get-NvidiaLatestDriver {
     param([string]$GpuName)
     $key = 'nvidia_latest_v3'
@@ -2601,7 +2517,6 @@ function Get-LatestDotNetFrameworkVersion {
     }
 }
 
-# Require v14.3x+ to avoid stale 14.0.x rows on the Learn page
 function Get-LatestVCRedistVersion {
     $key = 'ms_latest_vcredist_v3'
     Get-Cached -Key $key -TtlHours 168 -Fetch {
@@ -2768,7 +2683,7 @@ function Invoke-SystemOnlineVerification {
 }
 
 # =============================================================================
-# 7. HEALTH SCORE
+# 7. HEALTH SCORE - Thermals and ProjectSafety removed; DataConfidence excludes N/A
 # =============================================================================
 function Get-HealthScore {
     param(
@@ -2860,7 +2775,7 @@ function Get-HealthScore {
     $cats['Storage'] = $st
     $conf['Storage'] = $stConf
 
-    # ENGINEERING SOFTWARE - filter out synthetic System Health
+    # ENGINEERING SOFTWARE
     $rel = @($Results | Where-Object {
         $_.State -notin @('NotInstalled','NotApplicable') -and -not $_.IsSynthetic
     })
@@ -2988,7 +2903,7 @@ function Get-HealthScore {
     $cats['Drivers'] = [math]::Max(0, $drv)
     $conf['Drivers'] = $drvConf
 
-    # LICENSING - also filter out synthetic
+    # LICENSING
     if ($rel.Count -eq 0) {
         $cats['Licensing'] = $null
         $conf['Licensing'] = 'N/A'
@@ -3035,39 +2950,7 @@ function Get-HealthScore {
     $cats['Network'] = $netScore
     $conf['Network'] = $netConf
 
-    # THERMALS
-    $th = 85
-    $thConf = 'N/A'
-    $realThermal = @($System.ThermalZones | Where-Object { $_.Source -and $_.Source -ne 'ACPI' })
-    if ($realThermal.Count -gt 0) {
-        $max = ($realThermal | Measure-Object Celsius -Maximum).Maximum
-        if ($max -lt 60)      { $th = 100 }
-        elseif ($max -lt 80)  { $th = 88 }
-        elseif ($max -lt 95)  { $th = 60 }
-        else                  { $th = 30 }
-        $thConf = 'High'
-        $cats['Thermals'] = $th
-        $conf['Thermals'] = $thConf
-    } elseif ($System.ThermalZones.Count -gt 0) {
-        $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
-        if ($max -lt 60)      { $th = 100 }
-        elseif ($max -lt 80)  { $th = 88 }
-        elseif ($max -lt 95)  { $th = 60 }
-        else                  { $th = 30 }
-        $cats['Thermals'] = $th
-        $conf['Thermals'] = 'Medium'
-    } else {
-        $cats['Thermals'] = $null
-        $conf['Thermals'] = 'N/A'
-    }
-
-    # PROJECT SAFETY
-    if (-not $Script:GuardianRan) {
-        $cats['ProjectSafety'] = $null
-        $conf['ProjectSafety'] = 'N/A'
-    }
-
-    # Event log adjustments
+    # Event log adjustments - Windows and Storage only
     if ($EventLogs) {
         if ($EventLogs.WheaCount -gt 0) {
             $cats['Hardware'] = [math]::Max(0, $cats['Hardware'] - 15)
@@ -3083,9 +2966,6 @@ function Get-HealthScore {
         } elseif ($EventLogs.DiskErrors -ge 1) {
             $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 10)
         }
-        if ($EventLogs.ThermalEvents -gt 0 -and $cats['Thermals'] -ne $null) {
-            $cats['Thermals'] = [math]::Max(0, $cats['Thermals'] - 15)
-        }
     }
 
     if ($Battery -and $Battery.HealthPercent -ne $null -and $System.Power.HasBattery) {
@@ -3094,11 +2974,11 @@ function Get-HealthScore {
         }
     }
 
-    # Overall
+    # Overall - Thermals and ProjectSafety removed from weights
     $weights = @{
-        Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
-        GPU = 0.08; Drivers = 0.10; Licensing = 0.07
-        Windows = 0.05; Thermals = 0.05; Network = 0.05; ProjectSafety = 0.05
+        Hardware = 0.25; Storage = 0.20; EngineeringSoftware = 0.25
+        GPU = 0.10; Drivers = 0.12; Licensing = 0.08
+        Windows = 0.05; Network = 0.05
     }
 
     $sumW = 0
@@ -3111,15 +2991,18 @@ function Get-HealthScore {
     }
     $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
 
-    $confMap = @{ 'High' = 1.0; 'Medium' = 0.6; 'Low' = 0.3; 'N/A' = 0.0 }
+    # DataConfidence - N/A categories excluded from the denominator
+    $confMap = @{ 'High' = 1.0; 'Medium' = 0.6; 'Low' = 0.3 }
     $confSum = 0
+    $confWeight = 0
     foreach ($k in $conf.Keys) {
+        $c = $conf[$k]
+        if ($c -eq 'N/A' -or $c -eq $null) { continue }
         $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
-        $c = $confMap[$conf[$k]]
-        if ($c -eq $null) { $c = 0 }
-        $confSum += $w * $c
+        $confWeight += $w
+        $confSum += $w * $confMap[$c]
     }
-    $dataConfidence = if ($sumW -gt 0) { [int][math]::Round(100 * $confSum / $sumW) } else { 0 }
+    $dataConfidence = if ($confWeight -gt 0) { [int][math]::Round(100 * $confSum / $confWeight) } else { 0 }
 
     [pscustomobject]@{
         Overall        = $overall
@@ -3197,17 +3080,6 @@ function Add-EventLogFindings {
             -WhyItMatters "WHEA errors indicate machine-check exceptions from CPU, PCIe, or memory - often unstable overclocks or failing hardware." `
             -Recommendation "Check RAM with MemTest86, verify XMP/EXPO is stable, and update BIOS/chipset drivers." `
             -Severity 'critical'))
-    }
-
-    if ($EventLogs.ThermalEvents -gt 0) {
-        $list.Add((New-Finding `
-            -Id 'SYS.THERMAL_THROTTLE' `
-            -Software 'Thermals' `
-            -Problem "CPU thermal throttling events detected ($($EventLogs.ThermalEvents) in 7 days)." `
-            -Detected "Kernel-Processor-Power events 86/87/88 = $($EventLogs.ThermalEvents)." `
-            -WhyItMatters "Throttling stretches solve times 2-5x and often indicates dried paste or a blocked fan." `
-            -Recommendation "Clean fans and heatsinks; consider repasting on a 3+ year old laptop." `
-            -Severity 'warn'))
     }
 
     if ($EventLogs.AppCrashes -ge 5) {
@@ -3480,32 +3352,6 @@ if ($ProjectGuardian) {
     $guardian = Invoke-ProjectGuardian -Root $ProjectGuardian
     if ($guardian) {
         $Script:GuardianRan = $true
-        $score.Categories['ProjectSafety'] = $guardian.Health
-        $score.Confidence['ProjectSafety'] = 'High'
-
-        $weights = @{
-            Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
-            GPU = 0.08; Drivers = 0.10; Licensing = 0.07
-            Windows = 0.05; Thermals = 0.05; Network = 0.05; ProjectSafety = 0.05
-        }
-        $sumW = 0; $sumWS = 0
-        foreach ($k in $score.Categories.Keys) {
-            if ($score.Categories[$k] -eq $null) { continue }
-            $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
-            $sumW += $w
-            $sumWS += $score.Categories[$k] * $w
-        }
-        $score.Overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
-
-        $confMap = @{ 'High' = 1.0; 'Medium' = 0.6; 'Low' = 0.3; 'N/A' = 0.0 }
-        $confSum = 0
-        foreach ($k in $score.Confidence.Keys) {
-            $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
-            $c = $confMap[$score.Confidence[$k]]
-            if ($c -eq $null) { $c = 0 }
-            $confSum += $w * $c
-        }
-        $score.DataConfidence = if ($sumW -gt 0) { [int][math]::Round(100 * $confSum / $sumW) } else { 0 }
     }
 }
 
@@ -3578,8 +3424,6 @@ $style = @'
  .finding-body td{border:none;padding:3px 0}
  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px 0}
  .legend .chip{font-size:12px;padding:4px 10px}
- .enrich{background:#eef6ff;border-left:5px solid #2b6cb0;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
- .enrich b{color:#0b5394}
  .verify{background:#f0fbf1;border-left:5px solid #1c9b4b;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
  .verify b{color:#0f7233}
 </style>
@@ -3611,7 +3455,7 @@ foreach ($k in $score.Categories.Keys) {
 }
 [void]$sb.AppendLine("</div></div>")
 
-# Verified Components - without Online/Expected, Status, Source columns
+# Verified Components
 [void]$sb.AppendLine("<h2>Verified Components</h2>")
 [void]$sb.AppendLine("<div class='verify'>")
 if (-not $systemVerify.Available) {
@@ -3626,7 +3470,6 @@ if (-not $systemVerify.Available) {
 
 $winLocal = if ($sys.OSBuild) { $sys.OSBuild } else { 'n/a' }
 [void]$sb.AppendLine("<tr><td><b>Windows Build</b></td><td>$winLocal</td></tr>")
-
 [void]$sb.AppendLine("<tr><td><b>.NET Framework</b></td><td>$netFx</td></tr>")
 
 $vcLocal = if ($vc.Count -gt 0) { ($vc | ForEach-Object { $_.DisplayVersion } | Sort-Object -Unique) -join ', ' } else { 'none' }
@@ -3692,7 +3535,7 @@ if ($systemVerify.DiskReliability.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Network Adapter Capabilities - grey out disconnected
+# Network Adapter Capabilities
 if ($systemVerify.AdapterCapabilities.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Network Adapter Capabilities</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Adapter</th><th>Description</th><th>Running</th><th>Capability</th><th>Driver</th></tr>")
@@ -3717,25 +3560,6 @@ if ($sys.Battery -and $sys.Battery.HealthPercent -ne $null) {
     [void]$sb.AppendLine("<tr><th>Cycle count</th><td>$($sys.Battery.CycleCount)</td></tr>")
     [void]$sb.AppendLine("<tr><th>Chemistry</th><td>$($sys.Battery.Chemistry)</td></tr>")
     [void]$sb.AppendLine("</table></div>")
-}
-
-# Event log - Thermal events row removed
-if ($eventLogs) {
-    [void]$sb.AppendLine("<h3>Recent Hardware / System Events (7 days)</h3><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th style='width:220px'>WHEA errors</th><td>$(if ($eventLogs.WheaCount -gt 0) { "<span class='chip red'>$($eventLogs.WheaCount)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Disk errors</th><td>$(if ($eventLogs.DiskErrors -gt 0) { "<span class='chip yellow'>$($eventLogs.DiskErrors)</span> $(if ($eventLogs.DiskErrorDevices.Count -gt 0) { "(Harddisk" + ($eventLogs.DiskErrorDevices -join ', Harddisk') + ")" })" } else { "<span class='chip green'>0</span>" })</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Unexpected shutdowns</th><td>$(if ($eventLogs.UnexpectedShutdown -gt 0) { "<span class='chip red'>$($eventLogs.UnexpectedShutdown)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Application crashes (Event 1000)</th><td>$(if ($eventLogs.AppCrashes -gt 0) { "<span class='chip yellow'>$($eventLogs.AppCrashes)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
-    [void]$sb.AppendLine("</table>")
-    if ($eventLogs.Samples.Count -gt 0) {
-        [void]$sb.AppendLine("<h3 style='margin-top:16px'>Event samples</h3>")
-        [void]$sb.AppendLine("<table><tr><th>Type</th><th>Id</th><th>Time</th><th>Message</th></tr>")
-        foreach ($s in $eventLogs.Samples) {
-            [void]$sb.AppendLine("<tr><td>$($s.Type)</td><td>$($s.Id)</td><td class='small'>$($s.Time)</td><td class='small'>$($s.Msg)</td></tr>")
-        }
-        [void]$sb.AppendLine("</table>")
-    }
-    [void]$sb.AppendLine("</div>")
 }
 
 # Defender exclusions
@@ -3830,7 +3654,7 @@ foreach ($d in $sys.Disks) {
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Windows Health - show effective score, no confidence pills
+# Windows Health - no event log penalty row
 [void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
 $rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
 [void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
@@ -3841,16 +3665,10 @@ $wuCls = if ($windowsHealth.UpdateService -eq 'Disabled') { 'red' } elseif ($win
 [void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Activation</th><td>$($windowsHealth.Activation)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Build age</th><td>$($windowsHealth.BuildAgeDays) days</td></tr>")
-
 $effectiveWin = if ($score.Categories.Contains('Windows') -and $score.Categories['Windows'] -ne $null) {
     $score.Categories['Windows']
 } else { $windowsHealth.Score }
-$winPenalty = $windowsHealth.Score - $effectiveWin
-[void]$sb.AppendLine("<tr><th>Score (before event log)</th><td>$($windowsHealth.Score)/100</td></tr>")
-if ($winPenalty -ne 0) {
-    [void]$sb.AppendLine("<tr><th>Event log penalty</th><td><span class='chip red'>-$winPenalty</span></td></tr>")
-}
-[void]$sb.AppendLine("<tr><th>Effective score</th><td><b>$effectiveWin/100</b></td></tr>")
+[void]$sb.AppendLine("<tr><th>Score</th><td><b>$effectiveWin/100</b></td></tr>")
 [void]$sb.AppendLine("</table></div>")
 
 # Power
@@ -3905,7 +3723,7 @@ if ($networkHealth.License.Count -gt 0) {
     [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers.</p></div>")
 }
 
-# Project Guardian
+# Project Guardian output if it was run
 if ($guardian) {
     [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'>")
     [void]$sb.AppendLine("<p><b>$($guardian.Root)</b></p>")
@@ -3936,7 +3754,7 @@ if ($guardian) {
 [void]$sb.AppendLine("<p><span class='chip green'>$gCount healthy</span> &nbsp; <span class='chip yellow'>$yCount attention</span> &nbsp; <span class='chip red'>$rCount critical</span> &nbsp; <span class='chip gray'>$nCount not installed</span> &nbsp; <span class='chip darkgray'>$aCount not applicable</span></p>")
 [void]$sb.AppendLine("</div>")
 
-# Disciplines - clean empty state if nothing installed
+# Disciplines
 $realInstalled = @($allResults | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') -and -not $_.IsSynthetic })
 if ($realInstalled.Count -eq 0) {
     [void]$sb.AppendLine("<h2>Disciplines</h2>")
@@ -3965,7 +3783,7 @@ if ($realInstalled.Count -eq 0) {
     }
 }
 
-# System Health findings section (from synthetic product)
+# System Health findings (from synthetic product)
 $systemFindings = @()
 foreach ($r in $allResults) {
     if ($r.IsSynthetic -and $r.Findings) {
@@ -4001,15 +3819,8 @@ Write-Stage "Finalising..."
 $null = Get-Item "$reportBase.html" -ErrorAction SilentlyContinue
 Write-Ok
 
-Write-Host ""
-if (Test-Path $errorLog) {
-    $errorCount = (Get-Content $errorLog | Measure-Object -Line).Lines
-    if ($errorCount -gt 0) {
-        Write-Host "[WARNING] $errorCount non-fatal issues logged: $errorLog" -ForegroundColor Yellow
-    } else {
-        Remove-Item $errorLog -Force
-    }
-}
+# Silently remove error log
+if (Test-Path $errorLog) { Remove-Item $errorLog -Force -ErrorAction SilentlyContinue }
 
 Write-Host "[SUCCESS] Engineering diagnostic complete." -ForegroundColor Green
 Write-Host "[INFO] HTML : $reportBase.html" -ForegroundColor Cyan
