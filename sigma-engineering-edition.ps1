@@ -292,13 +292,11 @@ $Script:RawCatalog = @(
     @{N='Primavera P6';         D=@('Project Mgmt');                     P=@('Primavera P6*','Oracle Primavera*');                  K='PM';         RAM=8;  Disk=20;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*Primavera*','*Oracle*')}
     @{N='Mastercam';            D=@('Manufacturing','CAM');              P=@('Mastercam*');                                         K='CAM';        RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='FlexLM/Node'; Lsvc=@('*Mastercam*','*Sentinel*')}
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
-    @{N='Advance Steel';        D=@('Steel','Structural');               P=@('Advance Steel*');                                     K='Detailing';  RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='Node'}
     @{N='Carlson Survey';       D=@('Survey','Civil');                   P=@('Carlson Survey*');                                    K='Survey';     RAM=8;  Disk=15;  Lic='Node'}
     @{N='SewerGEMS';            D=@('Water','Civil');                    P=@('SewerGEMS*');                                         K='Sewer';      RAM=8;  Disk=20;  Lic='Bentley'}
     @{N='InfoWorks ICM';        D=@('Water','Civil');                    P=@('InfoWorks*');                                         K='Hydraulic';  RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='MIKE+';                D=@('Water','Civil');                    P=@('MIKE+*','DHI MIKE*');                                 K='Hydraulic';  RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='GEO5';                 D=@('Geotech','Civil');                  P=@('GEO5*');                                              K='Geo';        RAM=4;  Disk=10;  Lic='Node'}
-    @{N='Fusion 360';           D=@('Mechanical');                       P=@('Autodesk Fusion*');                                   K='CAD/CAM';    RAM=8;  Disk=15;  GPU=$true}
 )
 $Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
 Write-Ok
@@ -1089,7 +1087,7 @@ function Invoke-OnlineEnrichment {
 }
 
 # =============================================================================
-# INSTALLER (WINGET + VENDOR URLS)
+# INSTALLER (WINGET + VENDOR URLS) - NO DUPLICATE KEYS
 # =============================================================================
 $Script:WingetMap = @{
     'Python'='Python.Python.3.12'; 'Anaconda'='Anaconda.Anaconda3'; 'Git'='Git.Git'
@@ -1103,92 +1101,93 @@ $Script:WingetMap = @{
     'CMake'='Kitware.CMake'; 'Notepad++'='Notepad++.Notepad++'; 'GIMP'='GIMP.GIMP'
     'Inkscape'='Inkscape.Inkscape'; '7-Zip'='7zip.7zip'
 }
+
+# NOTE: only one entry per key. 'Advance Steel' appears once (below).
 $Script:ManualUrls = @{
-    'AutoCAD'='https://www.autodesk.com/products/autocad/free-trial'
-    'Revit'='https://www.autodesk.com/products/revit/free-trial'
-    'Civil 3D'='https://www.autodesk.com/products/civil-3d/free-trial'
-    'Navisworks'='https://www.autodesk.com/products/navisworks/free-trial'
-    'Advance Steel'='https://www.autodesk.com/products/advance-steel/free-trial'
-    'Autodesk Inventor'='https://www.autodesk.com/products/inventor/free-trial'
-    'Fusion 360'='https://www.autodesk.com/products/fusion-360/free-trial'
-    'Revit MEP'='https://www.autodesk.com/products/revit/free-trial'
-    'SOLIDWORKS'='https://www.solidworks.com/sw/support/downloads.htm'
-    'CATIA'='https://www.3ds.com/products/catia'
-    'Abaqus'='https://www.3ds.com/products/simulia/abaqus'
-    'Siemens NX'='https://plm.sw.siemens.com/en-US/nx/'
-    'Siemens Teamcenter'='https://plm.sw.siemens.com/en-US/teamcenter/'
-    'Simcenter STAR-CCM+'='https://plm.sw.siemens.com/en-US/simcenter/fluids-thermal-simulation/star-ccm/'
-    'Solid Edge'='https://solidedge.siemens.com/'
-    'ANSYS'='https://www.ansys.com/products'
-    'ANSYS HFSS'='https://www.ansys.com/products/electronics/ansys-hfss'
-    'ANSYS Fluent'='https://www.ansys.com/products/fluids/ansys-fluent'
-    'LS-DYNA'='https://www.ansys.com/products/structures/ansys-ls-dyna'
-    'COMSOL Multiphysics'='https://www.comsol.com/'
-    'MATLAB'='https://www.mathworks.com/products/matlab.html'
-    'Simulink'='https://www.mathworks.com/products/simulink.html'
-    'MSC Nastran'='https://www.mscsoftware.com/product/msc-nastran'
-    'MSC Adams'='https://www.mscsoftware.com/product/adams'
-    'Altair HyperWorks'='https://altair.com/hyperworks'
-    'HyperMesh'='https://altair.com/hypermesh'
-    'OpenFOAM'='https://openfoam.org/download/'
-    'Thermo-Calc'='https://thermocalc.com/'
-    'Altium Designer'='https://www.altium.com/'
-    'Cadence Allegro'='https://www.cadence.com/en_US/home/tools/pcb-design-and-analysis/allegro.html'
-    'OrCAD'='https://www.orcad.com/'
-    'NI LabVIEW'='https://www.ni.com/en-us/support/downloads/software-products/download.labview.html'
-    'NI Multisim'='https://www.ni.com/en-us/support/downloads/software-products/download.multisim.html'
-    'Siemens TIA Portal'='https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
-    'Rockwell Studio 5000'='https://www.rockwellautomation.com/en-us/products/software/factorytalk/designsuite/studio-5000.html'
-    'Xilinx Vivado'='https://www.xilinx.com/support/download.html'
-    'Intel Quartus Prime'='https://www.intel.com/content/www/us/en/software-kit/'
-    'STM32CubeIDE'='https://www.st.com/en/development-tools/stm32cubeide.html'
-    'STAAD.Pro'='https://www.bentley.com/software/staad-pro/'
-    'Tekla Structures'='https://www.tekla.com/products/tekla-structures'
-    'SAP2000'='https://www.csiamerica.com/products/sap2000'
-    'ETABS'='https://www.csiamerica.com/products/etabs'
-    'SAFE'='https://www.csiamerica.com/products/safe'
-    'PLAXIS 2D'='https://www.bentley.com/software/plaxis-2d/'
-    'PLAXIS 3D'='https://www.bentley.com/software/plaxis-3d/'
-    'GeoStudio'='https://www.geoslope.com/'
-    'HEC-RAS'='https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
-    'HEC-HMS'='https://www.hec.usace.army.mil/software/hec-hms/downloads.aspx'
-    'EPA SWMM'='https://www.epa.gov/water-research/storm-water-management-model-swmm'
-    'EPANET'='https://www.epa.gov/water-research/epanet'
-    'WaterGEMS'='https://www.bentley.com/software/watergems/'
-    'SewerGEMS'='https://www.bentley.com/software/sewergems/'
-    'ArcGIS Pro'='https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview'
-    'Agisoft Metashape'='https://www.agisoft.com/downloads/installer/'
-    'Pix4Dmapper'='https://www.pix4d.com/product/pix4dmapper-photogrammetry-software'
-    'Leica Cyclone'='https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
-    'Aspen Plus'='https://www.aspentech.com/en/products/engineering/aspen-plus'
-    'Petrel'='https://www.software.slb.com/products/petrel'
-    'PyroSim'='https://www.thunderheadeng.com/pyrosim/'
-    'FDS'='https://pages.nist.gov/fds-smv/downloads.html'
-    'EnergyPlus'='https://energyplus.net/downloads'
-    'DIALux evo'='https://www.dialux.com/en-GB/download'
-    'MCNP'='https://mcnp.lanl.gov/'
-    'OpenMC'='https://docs.openmc.org/'
-    'Mimics Innovation Suite'='https://www.materialise.com/en/medical/mimics-innovation-suite'
-    'ImageJ'='https://imagej.net/downloads'
-    '3D Slicer'='https://download.slicer.org/'
-    'Wolfram Mathematica'='https://www.wolfram.com/mathematica/'
-    'Maple'='https://www.maplesoft.com/products/Maple/'
-    'PVsyst'='https://www.pvsyst.com/'
-    'WindPRO'='https://www.emdt.co.uk/product/windpro'
-    'Microsoft Project'='https://www.microsoft.com/en-us/microsoft-365/project/project-management-software'
-    'Primavera P6'='https://www.oracle.com/industries/construction-engineering/primavera-p6/'
-    'Mastercam'='https://www.mastercam.com/'
-    'Bluebeam Revu'='https://www.bluebeam.com/'
-    'Archicad'='https://www.graphisoft.com/archicad/'
-    'Rhino'='https://www.rhino3d.com/download/'
-    'BricsCAD'='https://www.bricsys.com/en-intl/bricscad/'
-    'Enterprise Architect'='https://sparxsystems.com/products/ea/'
-    'Bentley OpenRail'='https://www.bentley.com/software/openrail-designer/'
-    'InfoWorks ICM'='https://www.autodesk.com/products/infoworks-icm'
-    'MIKE+'='https://www.dhigroup.com/technologies/mikepoweredbydhi'
-    'GEO5'='https://www.finesoftware.eu/geotechnical-software/'
-    'Carlson Survey'='https://www.carlsonsw.com/'
-    'Advance Steel'='https://www.autodesk.com/products/advance-steel/free-trial'
+    'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
+    'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
+    'Civil 3D'            = 'https://www.autodesk.com/products/civil-3d/free-trial'
+    'Autodesk Inventor'   = 'https://www.autodesk.com/products/inventor/free-trial'
+    'Fusion 360'          = 'https://www.autodesk.com/products/fusion-360/free-trial'
+    'Navisworks'          = 'https://www.autodesk.com/products/navisworks/free-trial'
+    'Advance Steel'       = 'https://www.autodesk.com/products/advance-steel/free-trial'
+    'Revit MEP'           = 'https://www.autodesk.com/products/revit/free-trial'
+    'SOLIDWORKS'          = 'https://www.solidworks.com/sw/support/downloads.htm'
+    'CATIA'               = 'https://www.3ds.com/products/catia'
+    'Abaqus'              = 'https://www.3ds.com/products/simulia/abaqus'
+    'Siemens NX'          = 'https://plm.sw.siemens.com/en-US/nx/'
+    'Siemens Teamcenter'  = 'https://plm.sw.siemens.com/en-US/teamcenter/'
+    'Simcenter STAR-CCM+' = 'https://plm.sw.siemens.com/en-US/simcenter/fluids-thermal-simulation/star-ccm/'
+    'Solid Edge'          = 'https://solidedge.siemens.com/'
+    'ANSYS'               = 'https://www.ansys.com/products'
+    'ANSYS HFSS'          = 'https://www.ansys.com/products/electronics/ansys-hfss'
+    'ANSYS Fluent'        = 'https://www.ansys.com/products/fluids/ansys-fluent'
+    'LS-DYNA'             = 'https://www.ansys.com/products/structures/ansys-ls-dyna'
+    'COMSOL Multiphysics' = 'https://www.comsol.com/'
+    'MATLAB'              = 'https://www.mathworks.com/products/matlab.html'
+    'Simulink'            = 'https://www.mathworks.com/products/simulink.html'
+    'MSC Nastran'         = 'https://www.mscsoftware.com/product/msc-nastran'
+    'MSC Adams'           = 'https://www.mscsoftware.com/product/adams'
+    'Altair HyperWorks'   = 'https://altair.com/hyperworks'
+    'HyperMesh'           = 'https://altair.com/hypermesh'
+    'OpenFOAM'            = 'https://openfoam.org/download/'
+    'Thermo-Calc'         = 'https://thermocalc.com/'
+    'Altium Designer'     = 'https://www.altium.com/'
+    'Cadence Allegro'     = 'https://www.cadence.com/en_US/home/tools/pcb-design-and-analysis/allegro.html'
+    'OrCAD'               = 'https://www.orcad.com/'
+    'NI LabVIEW'          = 'https://www.ni.com/en-us/support/downloads/software-products/download.labview.html'
+    'NI Multisim'         = 'https://www.ni.com/en-us/support/downloads/software-products/download.multisim.html'
+    'Siemens TIA Portal'  = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
+    'Rockwell Studio 5000'= 'https://www.rockwellautomation.com/en-us/products/software/factorytalk/designsuite/studio-5000.html'
+    'Xilinx Vivado'       = 'https://www.xilinx.com/support/download.html'
+    'Intel Quartus Prime' = 'https://www.intel.com/content/www/us/en/software-kit/'
+    'STM32CubeIDE'        = 'https://www.st.com/en/development-tools/stm32cubeide.html'
+    'STAAD.Pro'           = 'https://www.bentley.com/software/staad-pro/'
+    'Tekla Structures'    = 'https://www.tekla.com/products/tekla-structures'
+    'SAP2000'             = 'https://www.csiamerica.com/products/sap2000'
+    'ETABS'               = 'https://www.csiamerica.com/products/etabs'
+    'SAFE'                = 'https://www.csiamerica.com/products/safe'
+    'PLAXIS 2D'           = 'https://www.bentley.com/software/plaxis-2d/'
+    'PLAXIS 3D'           = 'https://www.bentley.com/software/plaxis-3d/'
+    'GeoStudio'           = 'https://www.geoslope.com/'
+    'HEC-RAS'             = 'https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
+    'HEC-HMS'             = 'https://www.hec.usace.army.mil/software/hec-hms/downloads.aspx'
+    'EPA SWMM'            = 'https://www.epa.gov/water-research/storm-water-management-model-swmm'
+    'EPANET'              = 'https://www.epa.gov/water-research/epanet'
+    'WaterGEMS'           = 'https://www.bentley.com/software/watergems/'
+    'SewerGEMS'           = 'https://www.bentley.com/software/sewergems/'
+    'ArcGIS Pro'          = 'https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview'
+    'Agisoft Metashape'   = 'https://www.agisoft.com/downloads/installer/'
+    'Pix4Dmapper'         = 'https://www.pix4d.com/product/pix4dmapper-photogrammetry-software'
+    'Leica Cyclone'       = 'https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
+    'Aspen Plus'          = 'https://www.aspentech.com/en/products/engineering/aspen-plus'
+    'Petrel'              = 'https://www.software.slb.com/products/petrel'
+    'PyroSim'             = 'https://www.thunderheadeng.com/pyrosim/'
+    'FDS'                 = 'https://pages.nist.gov/fds-smv/downloads.html'
+    'EnergyPlus'          = 'https://energyplus.net/downloads'
+    'DIALux evo'          = 'https://www.dialux.com/en-GB/download'
+    'MCNP'                = 'https://mcnp.lanl.gov/'
+    'OpenMC'              = 'https://docs.openmc.org/'
+    'Mimics Innovation Suite' = 'https://www.materialise.com/en/medical/mimics-innovation-suite'
+    'ImageJ'              = 'https://imagej.net/downloads'
+    '3D Slicer'           = 'https://download.slicer.org/'
+    'Wolfram Mathematica' = 'https://www.wolfram.com/mathematica/'
+    'Maple'               = 'https://www.maplesoft.com/products/Maple/'
+    'PVsyst'              = 'https://www.pvsyst.com/'
+    'WindPRO'             = 'https://www.emdt.co.uk/product/windpro'
+    'Microsoft Project'   = 'https://www.microsoft.com/en-us/microsoft-365/project/project-management-software'
+    'Primavera P6'        = 'https://www.oracle.com/industries/construction-engineering/primavera-p6/'
+    'Mastercam'           = 'https://www.mastercam.com/'
+    'Bluebeam Revu'       = 'https://www.bluebeam.com/'
+    'Archicad'            = 'https://www.graphisoft.com/archicad/'
+    'Rhino'               = 'https://www.rhino3d.com/download/'
+    'BricsCAD'            = 'https://www.bricsys.com/en-intl/bricscad/'
+    'Enterprise Architect'= 'https://sparxsystems.com/products/ea/'
+    'Bentley OpenRail'    = 'https://www.bentley.com/software/openrail-designer/'
+    'InfoWorks ICM'       = 'https://www.autodesk.com/products/infoworks-icm'
+    'MIKE+'               = 'https://www.dhigroup.com/technologies/mikepoweredbydhi'
+    'GEO5'                = 'https://www.finesoftware.eu/geotechnical-software/'
+    'Carlson Survey'      = 'https://www.carlsonsw.com/'
 }
 
 function Test-WingetAvailable { [bool](Get-Command winget -ErrorAction SilentlyContinue) }
@@ -1286,7 +1285,8 @@ function Test-ReqOS {
         if ($want -and $arch -ne $want) { $fail=$true }
     }
     $s = if ($fail) { 'FAIL' } else { 'PASS' }
-    New-ReqResult 'OS' 'Operating System' ($req -join ', ') "$ed ($ver, $arch)" $s $(if ($fail) { 'OS below minimum' } else { 'Meets OS requirement' })
+    $n = if ($fail) { 'OS below minimum' } else { 'Meets OS requirement' }
+    New-ReqResult 'OS' 'Operating System' ($req -join ', ') "$ed ($ver, $arch)" $s $n
 }
 function Test-ReqCPU {
     param([hashtable]$Spec,[pscustomobject]$System,[pscustomobject]$Enrichment)
@@ -1307,7 +1307,8 @@ function Test-ReqCPU {
     $actual = @("$($cpu.NumberOfCores)C/$($cpu.NumberOfLogicalProcessors)T")
     if ($Enrichment -and $Enrichment.CpuScore) { $actual += "PassMark $($Enrichment.CpuScore)" }
     $s = if ($fail) { 'FAIL' } elseif ($unk) { 'UNKNOWN' } else { 'PASS' }
-    New-ReqResult 'CPU' 'Processor' ($req -join ', ') ($actual -join ', ') $s $(if ($fail) { 'CPU below minimum' } elseif ($unk) { 'Cannot verify' } else { 'Meets requirement' })
+    $n = if ($fail) { 'CPU below minimum' } elseif ($unk) { 'Cannot verify' } else { 'Meets requirement' }
+    New-ReqResult 'CPU' 'Processor' ($req -join ', ') ($actual -join ', ') $s $n
 }
 function Test-ReqRAM {
     param([hashtable]$Spec,[pscustomobject]$System)
@@ -1315,7 +1316,13 @@ function Test-ReqRAM {
     $rec = if ($Spec.Rec) { [int]$Spec.Rec } else { $min }
     $s = if ($have -ge $rec) { 'PASS' } elseif ($have -ge $min) { 'WARN' } else { 'FAIL' }
     $r = if ($rec -ne $min) { "$min GB min / $rec GB rec" } else { "$min GB" }
-    New-ReqResult 'RAM' 'Memory' $r "$have GB" $s (switch ($s) { 'PASS' { 'Meets recommended' } 'WARN' { 'Meets minimum only' } 'FAIL' { 'Below minimum' } })
+    $n = switch ($s) {
+        'PASS' { 'Meets recommended' }
+        'WARN' { 'Meets minimum only' }
+        'FAIL' { 'Below minimum' }
+        default { '' }
+    }
+    New-ReqResult 'RAM' 'Memory' $r "$have GB" $s $n
 }
 function Test-ReqDisk {
     param([hashtable]$Spec,[pscustomobject]$System,[pscustomobject]$Enrichment)
@@ -1324,7 +1331,12 @@ function Test-ReqDisk {
     $have = $sysd.FreeGB; $min = [int]$Spec.Min
     $rec = if ($Spec.Rec) { [int]$Spec.Rec } else { $min }
     $s = if ($have -ge $rec) { 'PASS' } elseif ($have -ge $min) { 'WARN' } else { 'FAIL' }
-    $n = switch ($s) { 'PASS' { 'Meets recommended' } 'WARN' { 'Meets minimum only' } 'FAIL' { 'Insufficient free space' } }
+    $n = switch ($s) {
+        'PASS' { 'Meets recommended' }
+        'WARN' { 'Meets minimum only' }
+        'FAIL' { 'Insufficient free space' }
+        default { '' }
+    }
     if ($Spec.SSD -and $Enrichment -and $Enrichment.DiskMediaTypes) {
         $ssd = @($Enrichment.DiskMediaTypes | Where-Object { $_.MediaType -in @('SSD','NVMe') -or $_.BusType -eq 'NVMe' }).Count -gt 0
         if (-not $ssd) { if ($s -eq 'PASS') { $s='WARN' }; $n += ' · SSD not detected' }
@@ -1364,7 +1376,13 @@ function Test-ReqGPU {
     if ($Spec.RequiresCUDA) { $req += 'CUDA'; if (-not (Test-Path "$env:SystemRoot\System32\nvcuda.dll")) { $fail=$true } }
     $s = if ($fail) { 'FAIL' } elseif ($unk) { 'UNKNOWN' } elseif ($warn) { 'WARN' } else { 'PASS' }
     $actual = if ($bestGPU) { "$($bestGPU.Name) · $best GB" } else { 'no GPU detected' }
-    $n = switch ($s) { 'PASS' { 'Meets GPU requirement' } 'WARN' { 'Meets minimum VRAM only' } 'FAIL' { 'GPU below requirement' } 'UNKNOWN' { 'Cannot verify API locally' } }
+    $n = switch ($s) {
+        'PASS' { 'Meets GPU requirement' }
+        'WARN' { 'Meets minimum VRAM only' }
+        'FAIL' { 'GPU below requirement' }
+        'UNKNOWN' { 'Cannot verify API locally' }
+        default { '' }
+    }
     New-ReqResult 'GPU' 'Graphics' ($req -join ', ') $actual $s $n
 }
 function Test-ReqDisplay {
@@ -1528,7 +1546,6 @@ function Get-VerdictColor {
         default              { return 'Gray' }
     }
 }
-
 function Get-VerdictChip {
     param([string]$Verdict)
     switch ($Verdict) {
@@ -1540,9 +1557,6 @@ function Get-VerdictChip {
     }
 }
 
-# -------------------------------------------------------------------------
-# Scan target picker - loops back on bad input, returns @() to cancel
-# -------------------------------------------------------------------------
 function Select-ScanTargets {
     param([array]$Catalog)
     $byDisc = @{}
@@ -1587,9 +1601,6 @@ function Select-ScanTargets {
     }
 }
 
-# -------------------------------------------------------------------------
-# Install menu - shows ALL scanned apps (any verdict), any can be picked.
-# -------------------------------------------------------------------------
 function Show-InstallMenu {
     param([array]$ScanResults)
     if ($ScanResults.Count -eq 0) {
@@ -1630,7 +1641,6 @@ function Show-InstallMenu {
     }
     if ($picked.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; return }
 
-    # Show plan + warn if anything is not MEETS
     Write-Host ""
     Write-Host "  Install plan:" -ForegroundColor Cyan
     $anyProblem = $false
@@ -1653,9 +1663,6 @@ function Show-InstallMenu {
     Invoke-Installer -Names $picked -HasWinget (Test-WingetAvailable)
 }
 
-# -------------------------------------------------------------------------
-# Browse-catalog installer - install by discipline regardless of scan.
-# -------------------------------------------------------------------------
 function Show-CatalogInstaller {
     $byDisc = @{}
     foreach ($e in $Script:RawCatalog) {
@@ -1733,7 +1740,7 @@ function Show-CatalogInstaller {
 }
 
 # =============================================================================
-# PREFLIGHT / WHYSLOW / PROJECT GUARDIAN (early exits)
+# PREFLIGHT / WHYSLOW
 # =============================================================================
 function Invoke-Preflight {
     param([string]$ProductName,[array]$Catalog,[pscustomobject]$System,[pscustomobject]$Enrichment)
@@ -1895,7 +1902,6 @@ $lastApps        = @($CheckApps)
 # Non-interactive path (or batch -Install) runs once and exits
 if ($NonInteractive -or $Install -or $Disciplines.Count -gt 0 -or $CheckApps.Count -gt 0) {
     if (-not $Disciplines -and -not $CheckApps) {
-        # Non-interactive with no filters: scan nothing special, skip to batch install
         Write-Host "[INFO] Non-interactive with no filters. Skipping scan." -ForegroundColor DarkGray
     } else {
         $targets = Get-ScanTargets -Catalog $Script:RawCatalog -Disciplines $Disciplines -Apps $CheckApps
@@ -1938,7 +1944,7 @@ if ($NonInteractive -or $Install -or $Disciplines.Count -gt 0 -or $CheckApps.Cou
     if ($NonInteractive) { exit 0 }
 }
 
-# Interactive loop
+# Interactive main menu loop
 while ($true) {
     Write-Head "Sigma Engineer Toolkit - main menu"
     Write-Host "  1. Scan disciplines (test this PC against app requirements)" -ForegroundColor Cyan
