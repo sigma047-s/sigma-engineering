@@ -5,9 +5,10 @@
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
     GPU and Drivers categories removed from scoring.
-    Data confidence is measured: the weighted fraction of the score
-    that is backed by real measured data (PassMark, SMART, winget,
-    online verification, adapter capabilities) rather than heuristics.
+    Scoring is derived strictly from measured data (PassMark, SMART, winget,
+    event logs, adapter capabilities, licensing probes). No heuristics are
+    used to fill in missing values - if a metric cannot be measured, the
+    category is reported as N/A rather than guessed.
 #>
 [CmdletBinding()]
 param(
@@ -2700,9 +2701,8 @@ function Get-HealthScore {
     )
 
     $cats = [ordered]@{}
-    $conf = [ordered]@{}
 
-    # HARDWARE
+    # HARDWARE - only measured data. No fallback heuristics.
     $ramScore = 100
     if ($System.RAM_GB -lt 16)                        { $ramScore -= 30 }
     elseif ($System.RAM_GB -lt 32)                    { $ramScore -= 10 }
@@ -2712,8 +2712,7 @@ function Get-HealthScore {
         elseif ($Enrichment.Ram.SpeedMHz -lt 3200 -and $Enrichment.Ram.Type -eq 'DDR4') { $ramScore -= 5 }
     }
 
-    $cpuScore = 100
-    $cpuConf  = 'N/A'
+    $cpuScore = $null
     if ($Enrichment -and $Enrichment.CpuScore) {
         $mark = $Enrichment.CpuScore
         $cpuScore = if     ($mark -ge 35000) { 100 }
@@ -2722,24 +2721,21 @@ function Get-HealthScore {
                     elseif ($mark -ge 7000)  { 70 }
                     elseif ($mark -ge 3500)  { 55 }
                     else                     { 30 }
-        $cpuConf = 'High'
-    } elseif (-not $Script:OnlineEnabled) {
-        if ($System.LogicalCPUs -lt 8)      { $cpuScore = 60 }
-        elseif ($System.LogicalCPUs -ge 16) { $cpuScore = 95 }
-        $cpuConf = 'Medium'
-    } else {
-        if ($System.LogicalCPUs -lt 8)      { $cpuScore = 60 }
-        elseif ($System.LogicalCPUs -ge 16) { $cpuScore = 95 }
-        $cpuConf = 'N/A'
     }
 
-    $hw = [int](($ramScore * 0.4) + ($cpuScore * 0.6))
-    $cats['Hardware'] = [math]::Max(0, $hw)
-    $conf['Hardware'] = $cpuConf
+    $hwParts = @()
+    $hwParts += [pscustomobject]@{ Score = $ramScore; Weight = 0.4 }
+    if ($cpuScore -ne $null) {
+        $hwParts += [pscustomobject]@{ Score = $cpuScore; Weight = 0.6 }
+    }
+    $hwTotalW = ($hwParts | Measure-Object Weight -Sum).Sum
+    $hw = if ($hwTotalW -gt 0) {
+        [int]((($hwParts | ForEach-Object { $_.Score * $_.Weight }) | Measure-Object -Sum).Sum / $hwTotalW)
+    } else { $null }
+    $cats['Hardware'] = if ($hw -ne $null) { [math]::Max(0, $hw) } else { $null }
 
-    # STORAGE
+    # STORAGE - only measured data
     $st = 100
-    $stConf = 'High'
     if ($System.Disks.Count -gt 0) {
         $worst = ($System.Disks | Sort-Object FreePct | Select-Object -First 1).FreePct
         if ($worst -lt 5)      { $st = 30 }
@@ -2754,7 +2750,6 @@ function Get-HealthScore {
     }
 
     if ($SystemVerification -and $SystemVerification.DiskReliability.Count -gt 0) {
-        $smartMissing = 0
         foreach ($disk in $SystemVerification.DiskReliability) {
             if ($disk.HealthStatus -and $disk.HealthStatus -ne 'Healthy') {
                 $st = [math]::Max(0, $st - 25)
@@ -2764,14 +2759,9 @@ function Get-HealthScore {
             if ($disk.Temperature -and $disk.Temperature -ge 65) { $st = [math]::Max(0, $st - 5) }
             if ($disk.ReadErrors -and $disk.ReadErrors -gt 100)  { $st = [math]::Max(0, $st - 5) }
             if ($disk.WriteErrors -and $disk.WriteErrors -gt 100) { $st = [math]::Max(0, $st - 5) }
-            if ($disk.Wear -eq $null -and $disk.PowerOnHours -eq $null) { $smartMissing++ }
         }
-        if ($smartMissing -gt 0) { $stConf = 'Medium' }
-    } else {
-        $stConf = 'Low'
     }
     $cats['Storage'] = $st
-    $conf['Storage'] = $stConf
 
     # ENGINEERING SOFTWARE
     $rel = @($Results | Where-Object {
@@ -2779,7 +2769,6 @@ function Get-HealthScore {
     })
     if ($rel.Count -eq 0) {
         $cats['EngineeringSoftware'] = $null
-        $conf['EngineeringSoftware'] = 'N/A'
     } else {
         $healthy = @($rel | Where-Object State -eq 'Healthy').Count
         $baseScore = [int](100 * $healthy / $rel.Count)
@@ -2800,44 +2789,35 @@ function Get-HealthScore {
             }
         }
         $cats['EngineeringSoftware'] = $baseScore
-        $conf['EngineeringSoftware'] = if ($Enrichment -and $Enrichment.Upgradeable.Count -gt 0) { 'High' } else { 'Medium' }
     }
 
     # LICENSING
     if ($rel.Count -eq 0) {
         $cats['Licensing'] = $null
-        $conf['Licensing'] = 'N/A'
     } else {
         $licIssues = @($rel | Where-Object { @($_.Findings | Where-Object Id -match 'LICSVC').Count -gt 0 }).Count
         $cats['Licensing'] = [int](100 - (100 * $licIssues / $rel.Count))
-        $conf['Licensing'] = 'High'
     }
 
     # WINDOWS
-    $winScore = if ($WindowsHealth) { $WindowsHealth.Score } else { 85 }
-    $winConf  = 'Medium'
+    $winScore = if ($WindowsHealth) { $WindowsHealth.Score } else { $null }
     if ($SystemVerification -and $SystemVerification.LatestWindowsBuild -and $System.OSBuildNumber) {
         try {
             $haveBuildNum = [int]$System.OSBuildNumber
             $wantParts = $SystemVerification.LatestWindowsBuild -split '\.'
             $wantBuildNum = [int]$wantParts[0]
             if ([math]::Abs($wantBuildNum - $haveBuildNum) -lt 1000) {
-                if ($haveBuildNum -lt $wantBuildNum - 5) {
+                if ($haveBuildNum -lt $wantBuildNum - 5 -and $winScore -ne $null) {
                     $winScore = [math]::Max(0, $winScore - 5)
                 }
-                $winConf = 'High'
-            } else {
-                $winConf = 'Low'
             }
         } catch { }
     }
     $cats['Windows'] = $winScore
-    $conf['Windows'] = $winConf
 
     # NETWORK
-    $netScore = if ($NetworkHealth) { $NetworkHealth.Score } else { 90 }
-    $netConf  = 'Medium'
-    if ($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0) {
+    $netScore = if ($NetworkHealth) { $NetworkHealth.Score } else { $null }
+    if ($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0 -and $netScore -ne $null) {
         foreach ($a in $SystemVerification.AdapterCapabilities) {
             if ($a.MaxSpeed -and $a.LinkSpeed -and $a.MaxSpeed -ne $a.LinkSpeed) {
                 if ($a.LinkSpeed -match '100\s*Mbps' -and $a.MaxSpeed -match 'Gb') {
@@ -2845,39 +2825,31 @@ function Get-HealthScore {
                 }
             }
         }
-        $netConf = 'High'
     }
     $cats['Network'] = $netScore
-    $conf['Network'] = $netConf
 
-    # Event log adjustments
+    # SYSTEM - stability / event log issues, all measured
+    $sysScore = 100
     if ($EventLogs) {
-        if ($EventLogs.WheaCount -gt 0) {
-            $cats['Hardware'] = [math]::Max(0, $cats['Hardware'] - 15)
-        }
-        if ($EventLogs.UnexpectedShutdown -ge 3) {
-            $cats['Windows'] = [math]::Max(0, $cats['Windows'] - 15)
-            $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 5)
-        } elseif ($EventLogs.UnexpectedShutdown -ge 1) {
-            $cats['Windows'] = [math]::Max(0, $cats['Windows'] - 8)
-        }
-        if ($EventLogs.DiskErrors -ge 10) {
-            $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 25)
-        } elseif ($EventLogs.DiskErrors -ge 1) {
-            $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 10)
-        }
+        if ($EventLogs.WheaCount -gt 0)          { $sysScore -= [math]::Min(50, $EventLogs.WheaCount * 15) }
+        if ($EventLogs.DiskErrors -ge 10)        { $sysScore -= 30 }
+        elseif ($EventLogs.DiskErrors -ge 1)     { $sysScore -= 15 }
+        if ($EventLogs.UnexpectedShutdown -ge 3) { $sysScore -= 25 }
+        elseif ($EventLogs.UnexpectedShutdown -ge 1) { $sysScore -= 10 }
+        if ($EventLogs.AppCrashes -ge 10)        { $sysScore -= 15 }
+        elseif ($EventLogs.AppCrashes -ge 5)     { $sysScore -= 8 }
+        if ($EventLogs.ThermalEvents -ge 10)     { $sysScore -= 10 }
+        elseif ($EventLogs.ThermalEvents -ge 1)  { $sysScore -= 3 }
     }
-
     if ($Battery -and $Battery.HealthPercent -ne $null -and $System.Power.HasBattery) {
-        if ($Battery.HealthPercent -lt 60) {
-            $cats['Hardware'] = [math]::Max(0, $cats['Hardware'] - 5)
-        }
+        if ($Battery.HealthPercent -lt 60) { $sysScore -= 5 }
     }
+    $cats['System'] = [math]::Max(0, $sysScore)
 
-    # Overall - GPU and Drivers removed; weights redistributed
+    # Weights
     $weights = @{
-        Hardware = 0.30; Storage = 0.22; EngineeringSoftware = 0.30
-        Licensing = 0.08; Windows = 0.05; Network = 0.05
+        Hardware = 0.25; Storage = 0.18; EngineeringSoftware = 0.25
+        Licensing = 0.07; Windows = 0.05; Network = 0.05; System = 0.15
     }
 
     $sumW = 0
@@ -2890,41 +2862,9 @@ function Get-HealthScore {
     }
     $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
 
-    # DataConfidence - measured, not assigned. The value is the weighted
-    # fraction of the score that is backed by real measurement rather than
-    # heuristics or fallback estimates:
-    #   Hardware            - PassMark CPU Mark was actually fetched
-    #   Storage             - SMART wear/hours counters were actually read
-    #   EngineeringSoftware - winget returned a real upgrade list
-    #   Licensing           - installed products exist whose licensing
-    #                         service/port state was actually probed
-    #   Windows             - latest Windows build was cross-referenced online
-    #   Network             - adapter capabilities were actually retrieved
-    $measured = [ordered]@{
-        Hardware            = [bool]($Enrichment -and $Enrichment.CpuScore -ne $null)
-        Storage             = [bool]($SystemVerification -and
-                                     @($SystemVerification.DiskReliability |
-                                       Where-Object { $_.Wear -ne $null -or $_.PowerOnHours -ne $null }).Count -gt 0)
-        EngineeringSoftware = [bool]($Enrichment -and $Enrichment.Upgradeable.Count -gt 0)
-        Licensing           = [bool]($rel.Count -gt 0)
-        Windows             = [bool]($SystemVerification -and $SystemVerification.LatestWindowsBuild -ne $null)
-        Network             = [bool]($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0)
-    }
-    $confWeight = 0
-    $confSum    = 0
-    foreach ($k in $cats.Keys) {
-        if ($cats[$k] -eq $null) { continue }
-        $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
-        $confWeight += $w
-        if ($measured.Contains($k) -and $measured[$k]) { $confSum += $w }
-    }
-    $dataConfidence = if ($confWeight -gt 0) { [int][math]::Round(100 * $confSum / $confWeight) } else { 0 }
-
     [pscustomobject]@{
-        Overall        = $overall
-        Categories     = $cats
-        Confidence     = $conf
-        DataConfidence = $dataConfidence
+        Overall    = $overall
+        Categories = $cats
     }
 }
 
@@ -3079,9 +3019,9 @@ foreach ($d in $byDisc.Keys | Sort-Object) {
                 -f $d, $green, $total, $yell, $red, $bar) -ForegroundColor Cyan
 }
 
-# Console score display - no brackets, no GPU/Drivers
+# Console score display - no brackets, no GPU/Drivers, no data confidence
 Write-Host ""
-Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100  (Data confidence: {1}%)" -f $score.Overall, $score.DataConfidence) -ForegroundColor Green
+Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100" -f $score.Overall) -ForegroundColor Green
 foreach ($k in $score.Categories.Keys) {
     $v = if ($score.Categories[$k] -eq $null) { 'N/A' } else { "{0,3}" -f $score.Categories[$k] }
     Write-Host ("    {0,-22} {1}/100" -f $k, $v)
@@ -3324,7 +3264,6 @@ $style = @'
  .hero-num{font-size:64px;font-weight:800;line-height:1;letter-spacing:-2px}
  .hero-num span{font-size:22px;font-weight:400;opacity:.55}
  .hero-label{font-size:13px;text-transform:uppercase;letter-spacing:3px;opacity:.85;margin-top:6px}
- .hero-conf{font-size:12px;opacity:.75;margin-top:4px}
  .hero-cats{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;margin-top:22px}
  .hero-cats > div{background:rgba(255,255,255,.12);padding:10px 14px;border-radius:8px;min-width:100px}
  .hero-cats b{display:block;font-size:20px;font-weight:700}
@@ -3363,7 +3302,6 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("<div class='hero'>")
 [void]$sb.AppendLine("<div class='hero-num'>$($score.Overall)<span>/100</span></div>")
 [void]$sb.AppendLine("<div class='hero-label'>Sigma Engineering Score</div>")
-[void]$sb.AppendLine("<div class='hero-conf'>Data confidence: $($score.DataConfidence)%</div>")
 [void]$sb.AppendLine("<div class='hero-cats'>")
 foreach ($k in $score.Categories.Keys) {
     $v = if ($score.Categories[$k] -eq $null) { '<span class="na">N/A</span>' } else { $score.Categories[$k] }
