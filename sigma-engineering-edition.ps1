@@ -5,7 +5,6 @@
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
     GPU and Drivers categories removed from scoring.
-    Data confidence counts N/A at 0.5 (honest).
 #>
 [CmdletBinding()]
 param(
@@ -3062,7 +3061,7 @@ foreach ($d in $byDisc.Keys | Sort-Object) {
 
 # Console score display - no brackets, no GPU/Drivers
 Write-Host ""
-Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100  (Data confidence: {1}%)" -f $score.Overall, $score.DataConfidence) -ForegroundColor Green
+Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100 -ForegroundColor Green
 foreach ($k in $score.Categories.Keys) {
     $v = if ($score.Categories[$k] -eq $null) { 'N/A' } else { "{0,3}" -f $score.Categories[$k] }
     Write-Host ("    {0,-22} {1}/100" -f $k, $v)
@@ -3344,7 +3343,6 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("<div class='hero'>")
 [void]$sb.AppendLine("<div class='hero-num'>$($score.Overall)<span>/100</span></div>")
 [void]$sb.AppendLine("<div class='hero-label'>Sigma Engineering Score</div>")
-[void]$sb.AppendLine("<div class='hero-conf'>Data confidence: $($score.DataConfidence)%</div>")
 [void]$sb.AppendLine("<div class='hero-cats'>")
 foreach ($k in $score.Categories.Keys) {
     $v = if ($score.Categories[$k] -eq $null) { '<span class="na">N/A</span>' } else { $score.Categories[$k] }
