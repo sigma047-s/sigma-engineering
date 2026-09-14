@@ -5,7 +5,9 @@
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
     GPU and Drivers categories removed from scoring.
-    Data confidence counts N/A at 0.5 (honest).
+    Data confidence is measured: the weighted fraction of the score
+    that is backed by real measured data (PassMark, SMART, winget,
+    online verification, adapter capabilities) rather than heuristics.
 #>
 [CmdletBinding()]
 param(
@@ -2888,16 +2890,33 @@ function Get-HealthScore {
     }
     $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
 
-    # DataConfidence - N/A counts as 0.5
-    $confMap = @{ 'High' = 1.0; 'Medium' = 0.7; 'Low' = 0.4; 'N/A' = 0.5 }
-    $confSum = 0
+    # DataConfidence - measured, not assigned. The value is the weighted
+    # fraction of the score that is backed by real measurement rather than
+    # heuristics or fallback estimates:
+    #   Hardware            - PassMark CPU Mark was actually fetched
+    #   Storage             - SMART wear/hours counters were actually read
+    #   EngineeringSoftware - winget returned a real upgrade list
+    #   Licensing           - installed products exist whose licensing
+    #                         service/port state was actually probed
+    #   Windows             - latest Windows build was cross-referenced online
+    #   Network             - adapter capabilities were actually retrieved
+    $measured = [ordered]@{
+        Hardware            = [bool]($Enrichment -and $Enrichment.CpuScore -ne $null)
+        Storage             = [bool]($SystemVerification -and
+                                     @($SystemVerification.DiskReliability |
+                                       Where-Object { $_.Wear -ne $null -or $_.PowerOnHours -ne $null }).Count -gt 0)
+        EngineeringSoftware = [bool]($Enrichment -and $Enrichment.Upgradeable.Count -gt 0)
+        Licensing           = [bool]($rel.Count -gt 0)
+        Windows             = [bool]($SystemVerification -and $SystemVerification.LatestWindowsBuild -ne $null)
+        Network             = [bool]($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0)
+    }
     $confWeight = 0
-    foreach ($k in $conf.Keys) {
-        $c = $conf[$k]
-        if ($c -eq $null) { $c = 'N/A' }
+    $confSum    = 0
+    foreach ($k in $cats.Keys) {
+        if ($cats[$k] -eq $null) { continue }
         $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
         $confWeight += $w
-        $confSum += $w * $confMap[$c]
+        if ($measured.Contains($k) -and $measured[$k]) { $confSum += $w }
     }
     $dataConfidence = if ($confWeight -gt 0) { [int][math]::Round(100 * $confSum / $confWeight) } else { 0 }
 
