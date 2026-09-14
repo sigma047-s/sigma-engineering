@@ -2517,6 +2517,7 @@ if ($Disciplines.Count -gt 0) {
 [void]$sb.AppendLine("</div></div>")
 
 # Machine
+$cpuMarkText = if ($enrichment.CpuScore) { [string]$enrichment.CpuScore } else { 'unavailable' }
 [void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
 foreach ($kv in @(
     @('OS', $sys.OS), @('Display version', $sys.OSDisplayVersion),
@@ -2528,7 +2529,7 @@ foreach ($kv in @(
     @('PowerShell', $PSVersionTable.PSVersion.ToString()),
     @('Admin', $sys.IsAdmin),
     @('Power', $sys.Power.StatusText),
-    @('PassMark CPU Mark', if ($enrichment.CpuScore) { $enrichment.CpuScore } else { 'unavailable' })
+    @('PassMark CPU Mark', $cpuMarkText)
 )) {
     [void]$sb.AppendLine("<tr><th style='width:220px'>$($kv[0])</th><td>$($kv[1])</td></tr>")
 }
