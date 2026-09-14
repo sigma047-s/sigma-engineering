@@ -3277,8 +3277,6 @@ $style = @'
  .finding-body{width:100%;border:none;font-size:12px;margin:0}
  .finding-body th{background:transparent;border:none;color:#8b95a5;text-transform:uppercase;font-size:10px;letter-spacing:1.2px;width:150px;padding:3px 12px 3px 0;vertical-align:top;font-weight:700}
  .finding-body td{border:none;padding:3px 0}
- .legend{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 18px 0}
- .legend .chip{font-size:12px;padding:4px 10px}
  .verify{background:#f0fbf1;border-left:5px solid #1c9b4b;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
  .verify b{color:#0f7233}
 </style>
@@ -3425,17 +3423,6 @@ if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
     }
     [void]$sb.AppendLine("</table></div>")
 }
-
-# Legend
-[void]$sb.AppendLine("<h2>Legend</h2>")
-[void]$sb.AppendLine("<div class='legend'>")
-[void]$sb.AppendLine("<span class='chip green'>Healthy</span>")
-[void]$sb.AppendLine("<span class='chip yellow'>Attention</span>")
-[void]$sb.AppendLine("<span class='chip red'>Critical</span>")
-[void]$sb.AppendLine("<span class='chip gray'>Not installed</span>")
-[void]$sb.AppendLine("<span class='chip darkgray'>Not applicable</span>")
-[void]$sb.AppendLine("<span class='chip blue'>Unknown</span>")
-[void]$sb.AppendLine("</div>")
 
 # Findings
 $topFindings = @()
@@ -3603,11 +3590,6 @@ if ($guardian) {
     }
     [void]$sb.AppendLine("</div>")
 }
-
-# Overall
-[void]$sb.AppendLine("<h2>Overall</h2><div class='card'>")
-[void]$sb.AppendLine("<p><span class='chip green'>$gCount healthy</span> &nbsp; <span class='chip yellow'>$yCount attention</span> &nbsp; <span class='chip red'>$rCount critical</span> &nbsp; <span class='chip gray'>$nCount not installed</span> &nbsp; <span class='chip darkgray'>$aCount not applicable</span></p>")
-[void]$sb.AppendLine("</div>")
 
 # Disciplines
 $realInstalled = @($allResults | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') -and -not $_.IsSynthetic })
