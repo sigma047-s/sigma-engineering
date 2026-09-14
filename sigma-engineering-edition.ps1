@@ -3,12 +3,10 @@
 .SYNOPSIS
     Sigma Engineer Toolkit - engineering workstation diagnostic + software installer.
 .DESCRIPTION
-    Read-only diagnostic pass over every engineering discipline.
-    GPU and Drivers categories removed from scoring.
-    Scoring is derived strictly from measured data (PassMark, SMART, winget,
-    event logs, adapter capabilities, licensing probes). No heuristics are
-    used to fill in missing values - if a metric cannot be measured, the
-    category is reported as N/A rather than guessed.
+    Discipline-driven diagnostic that scans the apps you care about, compares the
+    PC against every requirement the vendor lists (hardware + software), verifies
+    against online sources (PassMark, vendor feeds, winget), and reports a verdict
+    per requirement per application.
 #>
 [CmdletBinding()]
 param(
@@ -26,12 +24,10 @@ param(
 
 Write-Host "`n========== SIGMA ENGINEER TOOLKIT ==========" -ForegroundColor Green
 Write-Host ""
-Write-Host "[INFO] Scans every engineering discipline on this workstation." -ForegroundColor Cyan
-Write-Host "[INFO] Detects installed software, checks prerequisites, writes a report." -ForegroundColor Cyan
-Write-Host "[INFO] The tool can install engineering software." -ForegroundColor Cyan
-Write-Host "[INFO] Online: PassMark, vendor driver feeds, winget, Windows/BIOS/SMART." -ForegroundColor Cyan
+Write-Host "[INFO] Discipline-driven requirement scanner." -ForegroundColor Cyan
+Write-Host "[INFO] Picks apps in the selected disciplines, compares each requirement." -ForegroundColor Cyan
+Write-Host "[INFO] Online: PassMark, vendor feeds, winget, Windows/BIOS/SMART." -ForegroundColor Cyan
 Write-Host "[WARNING] A full scan can take 2-5 minutes on a loaded machine." -ForegroundColor Yellow
-Write-Host "[WARNING] Deep cache scan adds 1-3 minutes per large product." -ForegroundColor Yellow
 Write-Host "[WARNING] This scanning tool isn't 100% accurate." -ForegroundColor Yellow
 if ($Offline) { Write-Host "[INFO] Offline mode: online enrichment disabled." -ForegroundColor Cyan }
 if ($Disciplines.Count -gt 0) { Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan }
@@ -96,11 +92,7 @@ function Test-IsAdmin {
 }
 
 function Test-TcpPort {
-    param(
-        [string]$ComputerName = 'localhost',
-        [int]$Port,
-        [int]$TimeoutMs = 1500
-    )
+    param([string]$ComputerName = 'localhost', [int]$Port, [int]$TimeoutMs = 1500)
     $client = New-Object System.Net.Sockets.TcpClient
     try {
         $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
@@ -144,9 +136,7 @@ function Get-GpuVramMap {
                 }
             } catch { }
         }
-    } catch {
-        Add-Diagnostic 'GPU' "VRAM registry read failed: $_"
-    }
+    } catch { Add-Diagnostic 'GPU' "VRAM registry read failed: $_" }
     return $map
 }
 
@@ -201,27 +191,16 @@ function Get-PowerState {
 
 function Get-BatteryHealth {
     $r = [ordered]@{
-        DesignCapacity = $null
-        FullCharge     = $null
-        HealthPercent  = $null
-        CycleCount     = $null
-        Manufacture    = $null
-        Chemistry      = $null
+        DesignCapacity = $null; FullCharge = $null; HealthPercent = $null
+        CycleCount = $null; Manufacture = $null; Chemistry = $null
     }
     try {
-        $static = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStaticData -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-        $full   = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-        $cycle  = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryCycleCount -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-        if ($static) {
-            $r.DesignCapacity = $static.DesignedCapacity
-            $r.Manufacture    = $static.ManufactureName
-            $r.Chemistry      = $static.Chemistry
-        }
-        if ($full) { $r.FullCharge = $full.FullChargedCapacity }
-        if ($cycle) { $r.CycleCount = $cycle.CycleCount }
+        $static = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1
+        $full   = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue | Select-Object -First 1
+        $cycle  = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($static) { $r.DesignCapacity = $static.DesignedCapacity; $r.Manufacture = $static.ManufactureName; $r.Chemistry = $static.Chemistry }
+        if ($full)   { $r.FullCharge = $full.FullChargedCapacity }
+        if ($cycle)  { $r.CycleCount = $cycle.CycleCount }
         if ($r.DesignCapacity -and $r.FullCharge -and $r.DesignCapacity -gt 0) {
             $r.HealthPercent = [math]::Round(($r.FullCharge / $r.DesignCapacity) * 100, 1)
         }
@@ -232,64 +211,38 @@ function Get-BatteryHealth {
 function Get-EventLogIssues {
     $since = (Get-Date).AddDays(-7)
     $r = [ordered]@{
-        WheaCount          = 0
-        DiskErrors         = 0
-        DiskErrorDevices   = @()
-        ThermalEvents      = 0
-        UnexpectedShutdown = 0
-        AppCrashes         = 0
-        Samples            = @()
+        WheaCount = 0; DiskErrors = 0; DiskErrorDevices = @()
+        ThermalEvents = 0; UnexpectedShutdown = 0; AppCrashes = 0; Samples = @()
     }
     try {
-        $whea = @(Get-WinEvent -FilterHashtable @{
-            LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; StartTime=$since
-        } -ErrorAction SilentlyContinue)
+        $whea = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; StartTime=$since } -ErrorAction SilentlyContinue)
         $r.WheaCount = $whea.Count
         foreach ($e in ($whea | Select-Object -First 3)) {
             $r.Samples += [pscustomobject]@{ Type='WHEA'; Id=$e.Id; Time=$e.TimeCreated.ToString('s'); Msg=$e.Message.Split("`n")[0] }
         }
     } catch { }
-
     try {
-        $disk = @(Get-WinEvent -FilterHashtable @{
-            LogName='System'; ProviderName=@('disk','Ntfs','storahci','stornvme','volmgr');
-            StartTime=$since; Level=@(1,2,3)
-        } -ErrorAction SilentlyContinue)
+        $disk = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName=@('disk','Ntfs','storahci','stornvme','volmgr'); StartTime=$since; Level=@(1,2,3) } -ErrorAction SilentlyContinue)
         $r.DiskErrors = $disk.Count
         $devSet = @{}
-        foreach ($e in $disk) {
-            if ($e.Message -match 'Harddisk(\d+)') {
-                $devSet[$matches[1]] = $true
-            }
-        }
+        foreach ($e in $disk) { if ($e.Message -match 'Harddisk(\d+)') { $devSet[$matches[1]] = $true } }
         $r.DiskErrorDevices = @($devSet.Keys)
         foreach ($e in ($disk | Select-Object -First 3)) {
             $r.Samples += [pscustomobject]@{ Type='Disk'; Id=$e.Id; Time=$e.TimeCreated.ToString('s'); Msg=$e.Message.Split("`n")[0] }
         }
     } catch { }
-
     try {
-        $th = @(Get-WinEvent -FilterHashtable @{
-            LogName='System'; ProviderName='Microsoft-Windows-Kernel-Processor-Power';
-            StartTime=$since; Id=@(86,87,88)
-        } -ErrorAction SilentlyContinue)
+        $th = @(Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-Processor-Power'; StartTime=$since; Id=@(86,87,88) } -ErrorAction SilentlyContinue)
         $r.ThermalEvents = $th.Count
     } catch { }
-
     try {
-        $shut = @(Get-WinEvent -FilterHashtable @{
-            LogName='System'; Id=41; ProviderName='Microsoft-Windows-Kernel-Power'; StartTime=$since
-        } -ErrorAction SilentlyContinue)
+        $shut = @(Get-WinEvent -FilterHashtable @{ LogName='System'; Id=41; ProviderName='Microsoft-Windows-Kernel-Power'; StartTime=$since } -ErrorAction SilentlyContinue)
         $r.UnexpectedShutdown = $shut.Count
     } catch { }
-
     try {
-        $app = @(Get-WinEvent -FilterHashtable @{
-            LogName='Application'; Id=1000; StartTime=$since
-        } -ErrorAction SilentlyContinue)
+        $app = @(Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1000; StartTime=$since } -ErrorAction SilentlyContinue)
         $r.AppCrashes = $app.Count
     } catch { }
-
     return [pscustomobject]$r
 }
 
@@ -301,22 +254,15 @@ function Get-DefenderExclusions {
             Extensions = @($pref.ExclusionExtension | Where-Object { $_ -and $_.Trim() })
             Processes  = @($pref.ExclusionProcess   | Where-Object { $_ -and $_.Trim() })
         }
-    } catch {
-        return [pscustomobject]@{ Paths = @(); Extensions = @(); Processes = @() }
-    }
+    } catch { return [pscustomobject]@{ Paths = @(); Extensions = @(); Processes = @() } }
 }
 
 function Get-WifiDetails {
     $r = [ordered]@{ Interfaces = @() }
-
     try {
         $svc = Get-Service wlansvc -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -ne 'Running') {
-            Start-Service wlansvc -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-        }
+        if ($svc -and $svc.Status -ne 'Running') { Start-Service wlansvc -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }
     } catch { }
-
     try {
         $raw = netsh wlan show interfaces 2>$null | Out-String
         $block = @{}
@@ -338,20 +284,10 @@ function Get-WifiDetails {
         }
         if ($block.Count -gt 0) { $r.Interfaces += [pscustomobject]$block }
     } catch { }
-
     if ($r.Interfaces.Count -eq 0) {
         try {
             $cp = Get-NetConnectionProfile -InterfaceAlias 'Wi-Fi' -ErrorAction Stop
-            $r.Interfaces += [pscustomobject]@{
-                Name            = 'Wi-Fi'
-                SSID            = $cp.Name
-                State           = 'Connected'
-                Band            = ''
-                Channel         = ''
-                RadioType       = ''
-                Signal          = ''
-                NetworkCategory = $cp.NetworkCategory
-            }
+            $r.Interfaces += [pscustomobject]@{ Name='Wi-Fi'; SSID=$cp.Name; State='Connected'; Band=''; Channel=''; RadioType=''; Signal=''; NetworkCategory=$cp.NetworkCategory }
         } catch { }
     }
     return [pscustomobject]$r
@@ -365,19 +301,14 @@ function Get-DiskReliability {
         try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
 
         $entry = [ordered]@{
-            FriendlyName  = $d.FriendlyName
-            MediaType     = $d.MediaType
-            BusType       = $d.BusType
-            SizeGB        = [math]::Round($d.Size / 1GB, 1)
-            HealthStatus  = $d.HealthStatus
-            Wear          = if ($rc) { $rc.Wear } else { $null }
-            Temperature   = if ($rc) { $rc.Temperature } else { $null }
-            PowerOnHours  = if ($rc) { $rc.PowerOnHours } else { $null }
-            ReadErrors    = if ($rc) { $rc.ReadErrorsTotal } else { $null }
-            WriteErrors   = if ($rc) { $rc.WriteErrorsTotal } else { $null }
-            Firmware      = $null
-            Serial        = $null
-            Source        = 'Win32'
+            FriendlyName = $d.FriendlyName; MediaType = $d.MediaType; BusType = $d.BusType
+            SizeGB = [math]::Round($d.Size / 1GB, 1); HealthStatus = $d.HealthStatus
+            Wear = if ($rc) { $rc.Wear } else { $null }
+            Temperature = if ($rc) { $rc.Temperature } else { $null }
+            PowerOnHours = if ($rc) { $rc.PowerOnHours } else { $null }
+            ReadErrors = if ($rc) { $rc.ReadErrorsTotal } else { $null }
+            WriteErrors = if ($rc) { $rc.WriteErrorsTotal } else { $null }
+            Firmware = $null; Serial = $null; Source = 'Win32'
         }
 
         if ($smartctl -and -not $entry.PowerOnHours) {
@@ -386,21 +317,20 @@ function Get-DiskReliability {
                 $json = & smartctl -a -j $devPath 2>$null | Out-String
                 if ($json) {
                     $sd = $json | ConvertFrom-Json -ErrorAction Stop
-                    if ($sd.power_on_time -and $sd.power_on_time.hours)    { $entry.PowerOnHours = $sd.power_on_time.hours }
-                    if ($sd.temperature -and $sd.temperature.current)      { $entry.Temperature  = $sd.temperature.current }
+                    if ($sd.power_on_time -and $sd.power_on_time.hours) { $entry.PowerOnHours = $sd.power_on_time.hours }
+                    if ($sd.temperature -and $sd.temperature.current)   { $entry.Temperature  = $sd.temperature.current }
                     if ($sd.nvme_smart_health_information_log) {
                         $log = $sd.nvme_smart_health_information_log
-                        if ($log.percentage_used -ne $null)                { $entry.Wear         = $log.percentage_used }
-                        if ($log.media_errors   -ne $null)                 { $entry.ReadErrors   = $log.media_errors }
-                        if ($log.num_err_log_entries -ne $null)            { $entry.WriteErrors  = $log.num_err_log_entries }
+                        if ($log.percentage_used -ne $null)     { $entry.Wear         = $log.percentage_used }
+                        if ($log.media_errors   -ne $null)      { $entry.ReadErrors   = $log.media_errors }
+                        if ($log.num_err_log_entries -ne $null) { $entry.WriteErrors  = $log.num_err_log_entries }
                     }
-                    if ($sd.serial_number)   { $entry.Serial   = $sd.serial_number }
-                    if ($sd.firmware_version){ $entry.Firmware = $sd.firmware_version }
+                    if ($sd.serial_number)    { $entry.Serial   = $sd.serial_number }
+                    if ($sd.firmware_version) { $entry.Firmware = $sd.firmware_version }
                     $entry.Source = 'smartctl'
                 }
             } catch { }
         }
-
         $out += [pscustomobject]$entry
     }
     return $out
@@ -450,41 +380,27 @@ function Compare-NetVersion {
 }
 
 function Get-VCRedist {
-    Get-InstalledSoftware | Where-Object {
-        $_.DisplayName -match 'Microsoft Visual C\+\+.*Redistributable'
-    } | Select-Object DisplayName, DisplayVersion
+    Get-InstalledSoftware | Where-Object { $_.DisplayName -match 'Microsoft Visual C\+\+.*Redistributable' } |
+        Select-Object DisplayName, DisplayVersion
 }
 
 function New-Finding {
     param(
-        [string]$Id,
-        [string]$Software,
-        [string]$Problem,
-        [string]$Detected,
-        [string]$WhyItMatters,
-        [string]$Recommendation,
-        [string]$Optional = '',
-        [string]$Severity = 'warn',
-        [double]$RecoverableGB = 0
+        [string]$Id, [string]$Software, [string]$Problem, [string]$Detected,
+        [string]$WhyItMatters, [string]$Recommendation, [string]$Optional = '',
+        [string]$Severity = 'warn', [double]$RecoverableGB = 0
     )
     [pscustomobject]@{
-        Id             = $Id
-        Software       = $Software
-        Problem        = $Problem
-        Detected       = $Detected
-        WhyItMatters   = $WhyItMatters
-        Recommendation = $Recommendation
-        Optional       = $Optional
-        Severity       = $Severity
-        RecoverableGB  = $RecoverableGB
+        Id = $Id; Software = $Software; Problem = $Problem; Detected = $Detected
+        WhyItMatters = $WhyItMatters; Recommendation = $Recommendation
+        Optional = $Optional; Severity = $Severity; RecoverableGB = $RecoverableGB
     }
 }
 
 function Get-LiveGpuSample {
     param([int]$DurationSeconds = 2)
     try {
-        $samples = Get-Counter '\GPU Engine(*)\Utilization Percentage' `
-                    -SampleInterval 1 -MaxSamples $DurationSeconds -ErrorAction Stop
+        $samples = Get-Counter '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples $DurationSeconds -ErrorAction Stop
         $perInstance = @{}
         foreach ($s in $samples.CounterSamples) {
             $key = $s.InstanceName
@@ -513,6 +429,411 @@ function Get-LiveGpuSample {
 }
 
 # =============================================================================
+# REQUIREMENT DETECTORS
+# =============================================================================
+function New-RequirementResult {
+    param(
+        [string]$Type, [string]$Component,
+        [string]$Required, [string]$Actual,
+        [string]$Status,   [string]$Note
+    )
+    [pscustomobject]@{
+        Type = $Type; Component = $Component; Required = $Required
+        Actual = $Actual; Status = $Status; Note = $Note
+    }
+}
+
+function Get-CpuInstructionSets {
+    $out = @{}
+    try { if ([System.Runtime.Intrinsics.X86.Sse42]::IsSupported)   { $out['SSE4.2']  = $true } } catch { }
+    try { if ([System.Runtime.Intrinsics.X86.Avx]::IsSupported)     { $out['AVX']     = $true } } catch { }
+    try { if ([System.Runtime.Intrinsics.X86.Avx2]::IsSupported)    { $out['AVX2']    = $true } } catch { }
+    try { if ([System.Runtime.Intrinsics.X86.Avx512F]::IsSupported) { $out['AVX-512'] = $true } } catch { }
+    return $out
+}
+
+function Get-DirectXVersion {
+    try {
+        $v = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\DirectX' -ErrorAction Stop).Version
+        if ($v -match '4\.09\.00\.09(\d\d)') { return [int]$matches[1] }
+    } catch { }
+    return $null
+}
+
+function Test-ReqOS {
+    param([hashtable]$Spec, [pscustomobject]$System)
+    $os = Get-CimInstance Win32_OperatingSystem
+    $actualVersion = "$($os.Version)"
+    $actualArch    = $os.OSArchitecture
+    $edition       = $os.Caption
+    $requiredParts = @(); $fail = $false; $warn = $false
+    if ($Spec.MinVersion) {
+        $requiredParts += "≥ $($Spec.MinVersion)"
+        try { if ([version]$actualVersion -lt [version]$Spec.MinVersion) { $fail = $true } } catch { $fail = $true }
+    }
+    if ($Spec.Arch) {
+        $requiredParts += $Spec.Arch
+        $archMap = @{ 'x64'='64-bit'; 'x86'='32-bit'; 'ARM64'='ARM 64-bit' }
+        $want = $archMap[$Spec.Arch]
+        if ($want -and $actualArch -ne $want) { $fail = $true }
+    }
+    if ($Spec.Edition) {
+        $requiredParts += "edition: $($Spec.Edition -join '/')"
+        $hit = $false
+        foreach ($e in $Spec.Edition) { if ($edition -match $e) { $hit = $true } }
+        if (-not $hit) { $warn = $true }
+    }
+    $status = if ($fail) { 'FAIL' } elseif ($warn) { 'WARN' } else { 'PASS' }
+    $note = if ($fail) { 'OS below minimum' } elseif ($warn) { 'Edition differs from vendor recommendation' } else { 'Meets OS requirement' }
+    New-RequirementResult 'OS' 'Operating System' ($requiredParts -join ', ') "$edition ($actualVersion, $actualArch)" $status $note
+}
+
+function Test-ReqCPU {
+    param([hashtable]$Spec, [pscustomobject]$System, [pscustomobject]$Enrichment)
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $parts = @(); $fail = $false; $warn = $false; $unknown = $false
+    if ($Spec.MinCores) {
+        $parts += "$($Spec.MinCores)+ cores"
+        if ($cpu.NumberOfCores -lt $Spec.MinCores) { $fail = $true }
+    }
+    if ($Spec.MinClockMHz) {
+        $parts += "$($Spec.MinClockMHz)+ MHz"
+        if ($cpu.MaxClockSpeed -lt $Spec.MinClockMHz) { $warn = $true }
+    }
+    if ($Spec.MinPassMark) {
+        $parts += "$($Spec.MinPassMark)+ PassMark"
+        if ($Enrichment -and $Enrichment.CpuScore) {
+            if ($Enrichment.CpuScore -lt $Spec.MinPassMark) { $fail = $true }
+        } else { $unknown = $true }
+    }
+    if ($Spec.InstructionSets) {
+        $have = Get-CpuInstructionSets
+        $missing = @()
+        foreach ($set in $Spec.InstructionSets) { if (-not $have.ContainsKey($set)) { $missing += $set } }
+        $parts += "ISA: $($Spec.InstructionSets -join ',')"
+        if ($missing.Count -gt 0) {
+            if ($have.Count -eq 0) { $unknown = $true } else { $fail = $true }
+        }
+    }
+    $actualParts = @("$($cpu.NumberOfCores)C/$($cpu.NumberOfLogicalProcessors)T")
+    if ($Enrichment -and $Enrichment.CpuScore) { $actualParts += "PassMark $($Enrichment.CpuScore)" }
+    $actualParts += "$($cpu.MaxClockSpeed) MHz"
+    $status = if ($fail) { 'FAIL' } elseif ($unknown) { 'UNKNOWN' } elseif ($warn) { 'WARN' } else { 'PASS' }
+    $note = if ($fail) { 'CPU below minimum' }
+            elseif ($unknown) { 'Cannot verify (PassMark or ISA unavailable)' }
+            elseif ($warn) { 'Meets minimum clock only' }
+            else { 'Meets CPU requirement' }
+    New-RequirementResult 'CPU' 'Processor' ($parts -join ', ') ($actualParts -join ', ') $status $note
+}
+
+function Test-ReqRAM {
+    param([hashtable]$Spec, [pscustomobject]$System, [pscustomobject]$Enrichment)
+    $have = $System.RAM_GB
+    $min = [int]$Spec.Min
+    $rec = if ($Spec.Rec) { [int]$Spec.Rec } else { $min }
+    $status = if ($have -ge $rec) { 'PASS' } elseif ($have -ge $min) { 'WARN' } else { 'FAIL' }
+    $note = switch ($status) { 'PASS' { 'Meets recommended' } 'WARN' { 'Meets minimum only' } 'FAIL' { 'Below minimum' } }
+    $reqText = if ($rec -ne $min) { "$min GB min / $rec GB rec" } else { "$min GB" }
+    New-RequirementResult 'RAM' 'Memory' $reqText "$have GB" $status $note
+}
+
+function Test-ReqDisk {
+    param([hashtable]$Spec, [pscustomobject]$System, [pscustomobject]$Enrichment)
+    $sysd = $System.Disks | Where-Object Drive -eq "$($env:SystemDrive)" | Select-Object -First 1
+    if (-not $sysd) { return New-RequirementResult 'Disk' 'System drive' "$($Spec.Min) GB" 'unknown' 'UNKNOWN' 'Cannot read system drive' }
+    $have = $sysd.FreeGB
+    $min = [int]$Spec.Min
+    $rec = if ($Spec.Rec) { [int]$Spec.Rec } else { $min }
+    $status = if ($have -ge $rec) { 'PASS' } elseif ($have -ge $min) { 'WARN' } else { 'FAIL' }
+    $note = switch ($status) { 'PASS' { 'Meets recommended' } 'WARN' { 'Meets minimum only' } 'FAIL' { 'Insufficient free space' } }
+    if ($Spec.SSD -and $Enrichment -and $Enrichment.DiskMediaTypes) {
+        $hasSSD = @($Enrichment.DiskMediaTypes | Where-Object { $_.MediaType -in @('SSD','NVMe') -or $_.BusType -eq 'NVMe' }).Count -gt 0
+        if (-not $hasSSD) {
+            if ($status -eq 'PASS') { $status = 'WARN' }
+            $note += ' · SSD required but not detected'
+        }
+    }
+    $reqText = if ($rec -ne $min) { "$min GB min / $rec GB rec" } else { "$min GB" }
+    if ($Spec.SSD) { $reqText += ' (SSD)' }
+    New-RequirementResult 'Disk' 'Free disk space' $reqText "$have GB" $status $note
+}
+
+function Test-ReqGPU {
+    param([hashtable]$Spec, [pscustomobject]$System, [pscustomobject]$Enrichment)
+    $bestVRAM = 0; $bestGPU = $null
+    foreach ($g in $System.GPUs) {
+        if ($g.VRAM_GB -and $g.VRAM_GB -gt $bestVRAM) { $bestVRAM = $g.VRAM_GB; $bestGPU = $g }
+    }
+    $parts = @(); $fail = $false; $warn = $false; $unknown = $false
+    if ($Spec.MinVRAM) {
+        $parts += "$($Spec.MinVRAM) GB VRAM min"
+        $rec = if ($Spec.RecVRAM) { [int]$Spec.RecVRAM } else { [int]$Spec.MinVRAM }
+        if ($bestVRAM -ge $rec) { }
+        elseif ($bestVRAM -ge $Spec.MinVRAM) { $warn = $true }
+        else { $fail = $true }
+    }
+    if ($Spec.Vendor) {
+        $parts += "vendor: $($Spec.Vendor)"
+        $hit = $false
+        foreach ($g in $System.GPUs) { if ($g.Name -match $Spec.Vendor) { $hit = $true } }
+        if (-not $hit) { $fail = $true }
+    }
+    if ($Spec.MinDirectX) {
+        $parts += "DirectX $($Spec.MinDirectX)+"
+        $dx = Get-DirectXVersion
+        if ($dx) { if ([int]$dx -lt [int]$Spec.MinDirectX) { $fail = $true } } else { $unknown = $true }
+    }
+    if ($Spec.MinPassMark) {
+        $parts += "G3D $($Spec.MinPassMark)+"
+        if ($Enrichment -and $Enrichment.GpuScores) {
+            $top = ($Enrichment.GpuScores | Where-Object Score | Sort-Object Score -Descending | Select-Object -First 1)
+            if ($top) { if ($top.Score -lt $Spec.MinPassMark) { $fail = $true } } else { $unknown = $true }
+        } else { $unknown = $true }
+    }
+    if ($Spec.RequiresCUDA) {
+        $parts += 'CUDA'
+        if (-not (Test-Path "$env:SystemRoot\System32\nvcuda.dll")) { $fail = $true }
+    }
+    if ($Spec.MinOpenGL) {
+        $parts += "OpenGL $($Spec.MinOpenGL)+"
+        $unknown = $true
+    }
+    if ($Spec.RequiresVulkan) {
+        $parts += 'Vulkan'
+        if (-not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) { $fail = $true }
+    }
+    $status = if ($fail) { 'FAIL' } elseif ($unknown) { 'UNKNOWN' } elseif ($warn) { 'WARN' } else { 'PASS' }
+    $actual = if ($bestGPU) { "$($bestGPU.Name) · $bestVRAM GB" } else { 'no GPU detected' }
+    $note = switch ($status) {
+        'PASS' { 'Meets GPU requirement' }
+        'WARN' { 'Meets minimum VRAM only' }
+        'FAIL' { 'GPU below requirement' }
+        'UNKNOWN' { 'Cannot verify API version locally' }
+    }
+    New-RequirementResult 'GPU' 'Graphics' ($parts -join ', ') $actual $status $note
+}
+
+function Test-ReqDisplay {
+    param([hashtable]$Spec, [pscustomobject]$System)
+    $g = $System.GPUs | Where-Object { $_.Resolution } | Select-Object -First 1
+    if (-not $g -or $g.Resolution -notmatch '(\d+)x(\d+)') {
+        return New-RequirementResult 'Display' 'Display resolution' "$($Spec.MinWidth)x$($Spec.MinHeight)" 'unknown' 'UNKNOWN' 'No display detected'
+    }
+    $w = [int]$matches[1]; $h = [int]$matches[2]
+    $ok = ($w -ge $Spec.MinWidth) -and ($h -ge $Spec.MinHeight)
+    New-RequirementResult 'Display' 'Display resolution' "$($Spec.MinWidth)x$($Spec.MinHeight)" "$w x $h" $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Meets minimum' } else { 'Resolution too low' })
+}
+
+function Test-ReqNetFx {
+    param([hashtable]$Spec)
+    $have = Get-DotNetFrameworkVersion
+    $ok = Compare-NetVersion -Have $have -Need $Spec.Min
+    New-RequirementResult 'NetFx' '.NET Framework' ".NET $($Spec.Min)+" $have $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Installed' } else { 'Must be installed' })
+}
+
+function Test-ReqNetDesktop {
+    param([hashtable]$Spec)
+    $have = $null
+    try {
+        $out = & dotnet --list-runtimes 2>$null
+        $desktop = $out | Where-Object { $_ -match 'Microsoft\.WindowsDesktop\.App' } |
+                   ForEach-Object { if ($_ -match '(\d+\.\d+\.\d+)') { [version]$matches[1] } } |
+                   Sort-Object -Descending | Select-Object -First 1
+        if ($desktop) { $have = $desktop.ToString() }
+    } catch { }
+    if (-not $have) {
+        $hit = Get-InstalledSoftware | Where-Object { $_.DisplayName -match 'Microsoft Windows Desktop Runtime' } | Select-Object -First 1
+        if ($hit) { $have = $hit.DisplayVersion }
+    }
+    $ok = $false
+    if ($have) { try { $ok = ([version]($have -replace '[^0-9\.]','') -ge [version]$Spec.Min) } catch { } }
+    New-RequirementResult 'NetDesktop' '.NET Desktop Runtime' ".NET $($Spec.Min)+ Desktop" $(if ($have) { $have } else { 'not found' }) $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Installed' } else { 'Must be installed' })
+}
+
+function Test-ReqVCRedist {
+    param([hashtable]$Spec)
+    $vc = @(Get-VCRedist)
+    if ($vc.Count -eq 0) {
+        return New-RequirementResult 'VCRedist' 'VC++ Redistributable' "$($Spec.Min)+" 'not found' 'FAIL' 'Must be installed'
+    }
+    $best = $vc | ForEach-Object { if ($_.DisplayVersion -match '(\d+\.\d+\.\d+)') { [version]$matches[1] } } | Sort-Object -Descending | Select-Object -First 1
+    $ok = if ($best) { $best -ge [version]$Spec.Min } else { $false }
+    New-RequirementResult 'VCRedist' 'VC++ Redistributable' "$($Spec.Min)+" $(if ($best) { $best.ToString() } else { $vc[0].DisplayVersion }) $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Installed' } else { 'Version too old' })
+}
+
+function Test-ReqJava {
+    param([hashtable]$Spec)
+    $have = $null
+    try {
+        $out = & java -version 2>&1 | Out-String
+        if ($out -match 'version "(\d+)(?:\.(\d+))?') {
+            $have = if ($matches[2]) { "$($matches[1]).$($matches[2])" } else { $matches[1] }
+        }
+    } catch { }
+    if (-not $have) {
+        $pat = if ($Spec.Kind -eq 'JDK') { 'Java.*Development Kit|JDK' } else { 'Java.*Runtime|JRE|Java \d' }
+        $hit = Get-InstalledSoftware | Where-Object { $_.DisplayName -match $pat } | Select-Object -First 1
+        if ($hit) { $have = $hit.DisplayVersion }
+    }
+    $ok = $false
+    if ($have) { try { $ok = [double]($have -replace '[^0-9\.]','') -ge [double]$Spec.Min } catch { } }
+    $label = if ($Spec.Kind) { "Java $($Spec.Kind)" } else { 'Java' }
+    New-RequirementResult 'Java' $label "$($Spec.Min)+" $(if ($have) { $have } else { 'not found' }) $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Installed' } else { 'Must be installed' })
+}
+
+function Test-ReqPython {
+    param([hashtable]$Spec)
+    $have = $null
+    try {
+        $out = & python --version 2>&1 | Out-String
+        if ($out -match 'Python (\d+\.\d+\.\d+)') { $have = $matches[1] }
+    } catch { }
+    if (-not $have) {
+        $hit = Get-InstalledSoftware | Where-Object { $_.DisplayName -match '^Python 3' } | Select-Object -First 1
+        if ($hit) { $have = $hit.DisplayVersion }
+    }
+    $ok = $false
+    if ($have) { try { $ok = [version]$have -ge [version]$Spec.Min } catch { } }
+    New-RequirementResult 'Python' 'Python' "$($Spec.Min)+" $(if ($have) { $have } else { 'not found' }) $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Installed' } else { 'Must be installed' })
+}
+
+function Test-ReqDirectX {
+    param([hashtable]$Spec)
+    $have = Get-DirectXVersion
+    if (-not $have) { return New-RequirementResult 'DirectX' 'DirectX' "$($Spec.Min)+" 'unknown' 'UNKNOWN' 'Cannot read DirectX version' }
+    $ok = [int]$have -ge [int]$Spec.Min
+    New-RequirementResult 'DirectX' 'DirectX' "$($Spec.Min)+" "$have" $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Installed' } else { 'Version too old' })
+}
+
+function Test-ReqWebView2 {
+    $hit = Get-InstalledSoftware | Where-Object { $_.DisplayName -match 'WebView2 Runtime' } | Select-Object -First 1
+    New-RequirementResult 'WebView2' 'WebView2 Runtime' 'Evergreen' $(if ($hit) { $hit.DisplayVersion } else { 'not found' }) $(if ($hit) { 'PASS' } else { 'FAIL' }) $(if ($hit) { 'Installed' } else { 'Must be installed' })
+}
+
+function Test-ReqBrowser {
+    param([hashtable]$Spec)
+    $name = if ($Spec.Name) { $Spec.Name } else { 'Edge' }
+    $hit = Get-InstalledSoftware | Where-Object { $_.DisplayName -match 'Microsoft Edge|Google Chrome|Mozilla Firefox' } | Select-Object -First 1
+    New-RequirementResult 'Browser' "$name / browser" 'Edge or Chrome' $(if ($hit) { $hit.DisplayName } else { 'not found' }) $(if ($hit) { 'PASS' } else { 'FAIL' }) $(if ($hit) { 'Installed' } else { 'Must be installed' })
+}
+
+function Test-ReqWinFeature {
+    param([hashtable]$Spec)
+    try {
+        $f = Get-WindowsOptionalFeature -Online -FeatureName $Spec.Name -ErrorAction Stop
+        $ok = $f.State -eq 'Enabled'
+        New-RequirementResult 'WinFeature' "Windows feature: $($Spec.Name)" 'Enabled' $f.State $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Enabled' } else { 'Feature not enabled' })
+    } catch {
+        New-RequirementResult 'WinFeature' "Windows feature: $($Spec.Name)" 'Enabled' 'unknown' 'UNKNOWN' 'Cannot query feature'
+    }
+}
+
+function Test-ReqKB {
+    param([hashtable]$Spec)
+    $hit = Get-HotFix -Id $Spec.Id -ErrorAction SilentlyContinue
+    New-RequirementResult 'KB' "Update $($Spec.Id)" 'Installed' $(if ($hit) { 'present' } else { 'missing' }) $(if ($hit) { 'PASS' } else { 'FAIL' }) $(if ($hit) { 'Installed' } else { 'Update missing' })
+}
+
+function Test-ReqTPM {
+    param([hashtable]$Spec)
+    try {
+        $tpm = Get-CimInstance -Namespace 'root/cimv2/security/microsofttpm' -ClassName Win32_Tpm -ErrorAction Stop
+        if (-not $tpm) { return New-RequirementResult 'TPM' 'TPM' "v$($Spec.MinVersion)+" 'not present' 'FAIL' 'TPM not present' }
+        $have = "$($tpm.SpecVersion -split ',' | Select-Object -First 1)".Trim()
+        $ok = $false
+        try { $ok = [double]$have -ge [double]$Spec.MinVersion } catch { }
+        New-RequirementResult 'TPM' 'TPM' "v$($Spec.MinVersion)+" "v$have" $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Meets TPM requirement' } else { 'TPM too old' })
+    } catch {
+        New-RequirementResult 'TPM' 'TPM' "v$($Spec.MinVersion)+" 'unknown' 'UNKNOWN' 'Cannot query TPM'
+    }
+}
+
+function Test-ReqSecureBoot {
+    try {
+        $sb = Confirm-SecureBootUEFI -ErrorAction Stop
+        New-RequirementResult 'SecureBoot' 'Secure Boot' 'Enabled' $(if ($sb) { 'Enabled' } else { 'Disabled' }) $(if ($sb) { 'PASS' } else { 'FAIL' }) $(if ($sb) { 'Enabled' } else { 'Must be enabled in BIOS' })
+    } catch {
+        New-RequirementResult 'SecureBoot' 'Secure Boot' 'Enabled' 'unknown' 'UNKNOWN' 'Cannot query Secure Boot'
+    }
+}
+
+function Test-ReqLicenseSvc {
+    param([hashtable]$Spec)
+    $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { ($_.Name + ' ' + $_.DisplayName) -like $Spec.Pattern })
+    $running = @($svc | Where-Object Status -eq 'Running').Count
+    $portOpen = $false
+    foreach ($p in @($Spec.Ports)) { if (Test-TcpPort -Port $p -TimeoutMs 800) { $portOpen = $true; break } }
+    $ok = ($running -gt 0) -or $portOpen
+    $actual = "$($svc.Count) service(s), $running running"
+    if ($Spec.Ports -and $Spec.Ports.Count -gt 0) { $actual += " · ports $($Spec.Ports -join ',') $(if($portOpen){'open'}else{'closed'})" }
+    New-RequirementResult 'LicenseSvc' "License service ($($Spec.Pattern))" 'Service running OR port reachable' $actual $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'License path available' } else { 'Cannot acquire license' })
+}
+
+function Test-ReqAdmin {
+    param([hashtable]$Spec)
+    $isAdmin = Test-IsAdmin
+    $ok = (-not $Spec.Required) -or $isAdmin
+    New-RequirementResult 'Admin' 'Admin rights' $(if ($Spec.Required) { 'Required' } else { 'Optional' }) $(if ($isAdmin) { 'Yes' } else { 'No' }) $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Admin present' } else { 'Run elevated' })
+}
+
+function Test-ReqInternet {
+    param([hashtable]$Spec)
+    $ok = $true; $actual = 'Unknown'
+    try { $null = Resolve-DnsName 'microsoft.com' -QuickTimeout -ErrorAction Stop; $actual = 'Online' }
+    catch { $actual = 'Offline'; $ok = -not $Spec.Required }
+    New-RequirementResult 'Internet' 'Internet connection' $(if ($Spec.Required) { 'Required' } else { 'Optional' }) $actual $(if ($ok) { 'PASS' } else { 'FAIL' }) $(if ($ok) { 'Connectivity OK' } else { 'Internet required' })
+}
+
+function Test-ReqLocale {
+    param([hashtable]$Spec)
+    $have = (Get-WinSystemLocale).Name
+    $ok = $have -in @($Spec.Allowed)
+    New-RequirementResult 'Locale' 'System locale' ($Spec.Allowed -join ', ') $have $(if ($ok) { 'PASS' } else { 'WARN' }) $(if ($ok) { 'Compatible locale' } else { 'Locale may need changing' })
+}
+
+function Test-ReqFont {
+    param([hashtable]$Spec)
+    $hit = Test-Path "$env:SystemRoot\Fonts\$($Spec.File)"
+    New-RequirementResult 'Font' "Font: $($Spec.File)" 'Installed' $(if ($hit) { 'present' } else { 'missing' }) $(if ($hit) { 'PASS' } else { 'WARN' }) $(if ($hit) { 'Font present' } else { 'Install font before use' })
+}
+
+function Test-ReqDirectStorage {
+    $hit = (Test-Path "$env:SystemRoot\System32\dstorage.dll") -and (Test-Path "$env:SystemRoot\System32\dstoragecore.dll")
+    New-RequirementResult 'DirectStorage' 'DirectStorage' 'Present' $(if ($hit) { 'present' } else { 'missing' }) $(if ($hit) { 'PASS' } else { 'FAIL' }) $(if ($hit) { 'Available' } else { 'Requires Windows 11 21H2+' })
+}
+
+function Test-Requirement {
+    param([hashtable]$Spec, [pscustomobject]$System, [pscustomobject]$Enrichment)
+    switch ($Spec.Type) {
+        'OS'           { Test-ReqOS          -Spec $Spec -System $System }
+        'CPU'          { Test-ReqCPU         -Spec $Spec -System $System -Enrichment $Enrichment }
+        'RAM'          { Test-ReqRAM         -Spec $Spec -System $System -Enrichment $Enrichment }
+        'Disk'         { Test-ReqDisk        -Spec $Spec -System $System -Enrichment $Enrichment }
+        'GPU'          { Test-ReqGPU         -Spec $Spec -System $System -Enrichment $Enrichment }
+        'Display'      { Test-ReqDisplay     -Spec $Spec -System $System }
+        'NetFx'        { Test-ReqNetFx       -Spec $Spec }
+        'NetDesktop'   { Test-ReqNetDesktop  -Spec $Spec }
+        'VCRedist'     { Test-ReqVCRedist    -Spec $Spec }
+        'Java'         { Test-ReqJava        -Spec $Spec }
+        'Python'       { Test-ReqPython      -Spec $Spec }
+        'DirectX'      { Test-ReqDirectX     -Spec $Spec }
+        'WebView2'     { Test-ReqWebView2 }
+        'Browser'      { Test-ReqBrowser     -Spec $Spec }
+        'WinFeature'   { Test-ReqWinFeature  -Spec $Spec }
+        'KB'           { Test-ReqKB          -Spec $Spec }
+        'TPM'          { Test-ReqTPM         -Spec $Spec }
+        'SecureBoot'   { Test-ReqSecureBoot }
+        'LicenseSvc'   { Test-ReqLicenseSvc  -Spec $Spec }
+        'Admin'        { Test-ReqAdmin       -Spec $Spec }
+        'Internet'     { Test-ReqInternet    -Spec $Spec }
+        'Locale'       { Test-ReqLocale      -Spec $Spec }
+        'Font'         { Test-ReqFont        -Spec $Spec }
+        'DirectStorage'{ Test-ReqDirectStorage }
+        default        { New-RequirementResult $Spec.Type $Spec.Type 'unknown' 'unknown' 'UNKNOWN' 'No detector for this requirement type' }
+    }
+}
+
+# =============================================================================
 # BASELINE
 # =============================================================================
 $baseline = [pscustomobject]@{
@@ -526,7 +847,7 @@ $baseline = [pscustomobject]@{
 Write-Host "[INFO] Baseline: $($baseline.When) on $($baseline.Computer) as $($baseline.User)" -ForegroundColor DarkGray
 
 # =============================================================================
-# 1. MASTER CATALOG
+# MASTER CATALOG
 # =============================================================================
 Write-Stage "Loading master catalog..."
 $Script:RawCatalog = @(
@@ -767,13 +1088,12 @@ $Script:RawCatalog = @(
     @{N='Capella';              D=@('Systems');                          P=@('Capella*');                                           K='MBSE';       RAM=8;  Disk=15;  Lic='None'}
     @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
-
 $Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
 $Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
 
 # =============================================================================
-# 2. DISCIPLINE PROFILES
+# DISCIPLINE PROFILES
 # =============================================================================
 Write-Stage "Loading discipline profiles..."
 $Script:Profiles = @{
@@ -816,7 +1136,6 @@ $Script:Profiles = @{
     'Manufacturing'   = @('Mastercam','SolidCAM','PowerMill','VERICUT','ESPRIT','PC-DMIS','PolyWorks','Fusion 360','Siemens NX','Autodesk Inventor')
     'Metrology'       = @('PC-DMIS','PolyWorks','ImageJ')
     'Systems'         = @('IBM Engineering DOORS','Cameo Systems Modeler','Capella','Enterprise Architect','MATLAB','Simulink','Siemens Teamcenter')
-    'Surveying'       = @('Trimble Business Center','Leica Infinity','Carlson Survey','Civil 3D','Autodesk ReCap')
     'PLM'             = @('Siemens Teamcenter','SOLIDWORKS','CATIA','Siemens NX','PTC Creo')
     'CFD'             = @('ANSYS Fluent','Simcenter STAR-CCM+','OpenFOAM','COMSOL Multiphysics','ANSYS')
     'FEA'             = @('ANSYS','Abaqus','MSC Nastran','LS-DYNA','Altair HyperWorks','COMSOL Multiphysics')
@@ -825,51 +1144,470 @@ $Script:Profiles = @{
 Write-Ok
 
 # =============================================================================
-# 3. INSTALLED SOFTWARE
+# SOFTWARE REQUIREMENTS TABLE
+# =============================================================================
+Write-Stage "Loading requirement grids..."
+
+$Script:SoftwareRequirements = @{
+    'AutoCAD' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=4000;  InstructionSets=@('SSE4.2') }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=10; Rec=20 }
+        @{ Type='GPU';     MinVRAM=1; RecVRAM=2; MinDirectX='11' }
+        @{ Type='Display'; MinWidth=1920; MinHeight=1080 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'Revit' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000; InstructionSets=@('SSE4.2') }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=40; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinDirectX='11' }
+        @{ Type='Display'; MinWidth=1920; MinHeight=1080 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'Civil 3D' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=5000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=40; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinDirectX='11' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'SOLIDWORKS' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000; InstructionSets=@('SSE4.2') }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=60; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='4.5'; MinDirectX='11' }
+        @{ Type='Display'; MinWidth=1920; MinHeight=1080 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*SolidWorks*'; Ports=@(25734) }
+    )
+    'Autodesk Inventor' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=40; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinDirectX='11' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'CATIA' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=60 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='4.5' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*DS*'; Ports=@(4085) }
+    )
+    'Siemens NX' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=60 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='4.5' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='Java';    Min='8'; Kind='JRE' }
+        @{ Type='LicenseSvc'; Pattern='*Siemens*'; Ports=@(28000) }
+    )
+    'PTC Creo' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=40 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='4.5' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*Creo*'; Ports=@(7788) }
+    )
+    'ANSYS' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=12000; InstructionSets=@('AVX2') }
+        @{ Type='RAM';     Min=16; Rec=64 }
+        @{ Type='Disk';    Min=60; Rec=200; SSD=$true }
+        @{ Type='GPU';     MinVRAM=4; RecVRAM=12; MinDirectX='11'; MinPassMark=3000 }
+        @{ Type='Display'; MinWidth=1920; MinHeight=1080 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*ansys*'; Ports=@(1055,2325) }
+    )
+    'Abaqus' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=12000; InstructionSets=@('AVX2') }
+        @{ Type='RAM';     Min=16; Rec=64 }
+        @{ Type='Disk';    Min=50; Rec=150; SSD=$true }
+        @{ Type='GPU';     MinVRAM=4; RecVRAM=11 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*SIMULIA*'; Ports=@(27000) }
+    )
+    'COMSOL Multiphysics' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=10000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=30; Rec=80 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=8 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*COMSOL*'; Ports=@(1718,1719) }
+    )
+    'Simcenter STAR-CCM+' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=32; Rec=64 }
+        @{ Type='Disk';    Min=60; Rec=200; SSD=$true }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='Java';    Min='11'; Kind='JRE' }
+        @{ Type='LicenseSvc'; Pattern='*CDLMD*'; Ports=@() }
+    )
+    'MATLAB' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=4000 }
+        @{ Type='RAM';     Min=4;  Rec=16 }
+        @{ Type='Disk';    Min=5;  Rec=20; SSD=$true }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='Java';    Min='8'; Kind='JRE' }
+        @{ Type='LicenseSvc'; Pattern='*MATLAB*'; Ports=@(27000) }
+    )
+    'SAP2000' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=3000 }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=10; Rec=30 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='Sentinel*'; Ports=@(1947) }
+    )
+    'ETABS' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=3000 }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=10; Rec=30 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='Sentinel*'; Ports=@(1947) }
+    )
+    'STAAD.Pro' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=10; Rec=30 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*Bentley*'; Ports=@() }
+    )
+    'Tekla Structures' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=50 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinDirectX='11' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*Tekla*'; Ports=@(27000) }
+    )
+    'ArcGIS Pro' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='CPU';     MinCores=4;  MinPassMark=6000 }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=40; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinDirectX='11' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='WebView2' }
+        @{ Type='LicenseSvc'; Pattern='*ArcGIS*'; Ports=@(27000) }
+    )
+    'QGIS' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='Python';  Min='3.9' }
+    )
+    'Altium Designer' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=15; Rec=30 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinDirectX='11' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*Altium*'; Ports=@(27000) }
+    )
+    'KiCad' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'Xilinx Vivado' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=60; Rec=150 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='Java';    Min='8';  Kind='JRE' }
+        @{ Type='Python';  Min='3.8' }
+        @{ Type='LicenseSvc'; Pattern='*Xilinx*'; Ports=@() }
+    )
+    'Intel Quartus Prime' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=50; Rec=120 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*Quartus*'; Ports=@() }
+    )
+    'Siemens TIA Portal' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=40; Rec=80 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*Automation License*'; Ports=@(27000) }
+    )
+    'Rockwell Studio 5000' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=30; Rec=60 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*Rockwell*'; Ports=@() }
+    )
+    'NI LabVIEW' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=20; Rec=40 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*National Instruments*'; Ports=@() }
+    )
+    'Aspen Plus' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=20; Rec=40 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*Aspen*'; Ports=@(27000) }
+    )
+    'Petrel' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=30; Rec=80; SSD=$true }
+        @{ Type='GPU';     MinVRAM=4; RecVRAM=8; MinDirectX='11' }
+        @{ Type='LicenseSvc'; Pattern='*Schlumberger*'; Ports=@() }
+    )
+    'Keysight ADS' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=40; Rec=80 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*Keysight*'; Ports=@(27000) }
+    )
+    'ANSYS HFSS' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=32; Rec=64 }
+        @{ Type='Disk';    Min=50; Rec=120 }
+        @{ Type='VCRedist';Min='14.30' }
+        @{ Type='LicenseSvc'; Pattern='*ansys*'; Ports=@(1055) }
+    )
+    'Mastercam' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=50; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='3.3' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*Mastercam*'; Ports=@() }
+    )
+    'Primavera P6' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=15; Rec=30 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='Java';    Min='8'; Kind='JRE' }
+        @{ Type='LicenseSvc'; Pattern='*Primavera*'; Ports=@() }
+    )
+    'Microsoft Project' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='NetFx';   Min='4.8' }
+    )
+    'Fusion 360' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=10; Rec=20 }
+        @{ Type='GPU';     MinVRAM=1; RecVRAM=2; MinDirectX='11' }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'Visual Studio' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=30; Rec=60; SSD=$true }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'Visual Studio Code' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='NetFx';   Min='4.8' }
+    )
+    'Docker Desktop' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=20; Rec=40; SSD=$true }
+        @{ Type='WinFeature'; Name='Microsoft-Hyper-V-All' }
+        @{ Type='WinFeature'; Name='Containers' }
+        @{ Type='WinFeature'; Name='VirtualMachinePlatform' }
+    )
+    'Git' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=2;  Rec=4 }
+        @{ Type='Disk';    Min=2;  Rec=5 }
+    )
+    'Wireshark' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+    )
+    'Python' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=2;  Rec=4 }
+        @{ Type='Disk';    Min=1;  Rec=2 }
+    )
+    'Anaconda' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=4;  Rec=10 }
+    )
+    'Wolfram Mathematica' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=16 }
+        @{ Type='Disk';    Min=8;  Rec=20 }
+        @{ Type='VCRedist';Min='14.30' }
+    )
+    'SolidCAM' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=20; Rec=40 }
+        @{ Type='NetFx';   Min='4.8' }
+        @{ Type='LicenseSvc'; Pattern='*SolidCAM*'; Ports=@() }
+    )
+    'OpenFOAM' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=64 }
+        @{ Type='Disk';    Min=40; Rec=150; SSD=$true }
+    )
+    'HEC-RAS' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=10; Rec=20 }
+        @{ Type='NetFx';   Min='4.8' }
+    )
+    'EPA SWMM' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=2;  Rec=5 }
+    )
+    'LTspice' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=2;  Rec=4 }
+        @{ Type='Disk';    Min=1;  Rec=2 }
+        @{ Type='NetFx';   Min='4.8' }
+    )
+    'Arduino IDE' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=2;  Rec=4 }
+        @{ Type='Disk';    Min=1;  Rec=5 }
+        @{ Type='Java';    Min='8'; Kind='JRE' }
+    )
+    'STM32CubeIDE' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=15; Rec=30 }
+        @{ Type='Java';    Min='11'; Kind='JRE' }
+    )
+    'ImageJ' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=2;  Rec=4 }
+        @{ Type='Disk';    Min=2;  Rec=5 }
+        @{ Type='Java';    Min='8'; Kind='JRE' }
+    )
+    'Blender' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='4.3' }
+    )
+    'FreeCAD' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=2;  Rec=5 }
+    )
+    'CloudCompare' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=8;  Rec=16 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='3.3' }
+    )
+    'Pix4Dmapper' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=50; SSD=$true }
+        @{ Type='GPU';     MinVRAM=4; RecVRAM=6; MinOpenGL='3.3' }
+        @{ Type='LicenseSvc'; Pattern='*Pix4D*'; Ports=@() }
+    )
+    'Agisoft Metashape' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=20; Rec=50; SSD=$true }
+        @{ Type='GPU';     MinVRAM=4; RecVRAM=6; MinOpenCL='1.2' }
+    )
+    'PyroSim' = @(
+        @{ Type='OS';      MinVersion='10.0.19041'; Arch='x64' }
+        @{ Type='RAM';     Min=16; Rec=32 }
+        @{ Type='Disk';    Min=10; Rec=30; SSD=$true }
+        @{ Type='GPU';     MinVRAM=2; RecVRAM=4; MinOpenGL='3.3' }
+    )
+    'EnergyPlus' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=16 }
+        @{ Type='Disk';    Min=5;  Rec=15 }
+    )
+    'PVsyst' = @(
+        @{ Type='OS';      MinVersion='10.0.17763'; Arch='x64' }
+        @{ Type='RAM';     Min=4;  Rec=8 }
+        @{ Type='Disk';    Min=5;  Rec=10 }
+        @{ Type='NetFx';   Min='4.8' }
+    )
+}
+Write-Ok
+
+# =============================================================================
+# INSTALLED SOFTWARE + SYSTEM INVENTORY
 # =============================================================================
 Write-Stage "Scanning installed software..."
 $installed = Get-InstalledSoftware
 Write-Host " $($installed.Count) entries." -ForegroundColor Green
 
-# =============================================================================
-# 4. SYSTEM INVENTORY
-# =============================================================================
 Write-Stage "Capturing system inventory..."
 $sys = & {
     $os   = Get-CimInstance Win32_OperatingSystem
     $cs   = Get-CimInstance Win32_ComputerSystem
     $cpu  = Get-CimInstance Win32_Processor | Select-Object -First 1
     $gpus = @(Get-CimInstance Win32_VideoController)
-
     $vramMap = Get-GpuVramMap
 
     $gpuInfo = foreach ($g in $gpus) {
         $regVram = Resolve-GpuVram -GpuName $g.Name -Map $vramMap
-        $wmiVram = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) {
-            [math]::Round($g.AdapterRAM / 1GB, 2)
-        } else { $null }
+        $wmiVram = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) { [math]::Round($g.AdapterRAM / 1GB, 2) } else { $null }
         $finalVram = if ($regVram) { $regVram } else { $wmiVram }
-
         $res = if ($g.CurrentHorizontalResolution -and $g.CurrentVerticalResolution -and
                    $g.CurrentHorizontalResolution -gt 0 -and $g.CurrentVerticalResolution -gt 0) {
             "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
         } else { '' }
-
         $refresh = $null
-        try {
-            if ($g.CurrentRefreshRate -and $g.CurrentRefreshRate -gt 0) { $refresh = [int]$g.CurrentRefreshRate }
-        } catch { }
-
+        try { if ($g.CurrentRefreshRate -and $g.CurrentRefreshRate -gt 0) { $refresh = [int]$g.CurrentRefreshRate } } catch { }
         [pscustomobject]@{
-            Name          = $g.Name
-            Kind          = Get-GpuKind -Name $g.Name
+            Name = $g.Name; Kind = Get-GpuKind -Name $g.Name
             DriverVersion = $g.DriverVersion
-            DriverDate    = if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') } else { '' }
-            VRAM_GB       = $finalVram
-            VRAM_Source   = if ($regVram) { 'registry' } else { 'wmi' }
-            Resolution    = $res
-            RefreshHz     = $refresh
-            VideoProcessor= $g.VideoProcessor
+            DriverDate = if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') } else { '' }
+            VRAM_GB = $finalVram
+            VRAM_Source = if ($regVram) { 'registry' } else { 'wmi' }
+            Resolution = $res; RefreshHz = $refresh; VideoProcessor = $g.VideoProcessor
         }
     }
 
@@ -878,11 +1616,8 @@ $sys = & {
         $vols = Get-Volume -ErrorAction Stop | Where-Object DriveLetter
         foreach ($v in $vols) {
             $disks += [pscustomobject]@{
-                Drive   = "$($v.DriveLetter):"
-                Label   = $v.FileSystemLabel
-                FS      = $v.FileSystem
-                SizeGB  = [math]::Round($v.Size / 1GB, 1)
-                FreeGB  = [math]::Round($v.SizeRemaining / 1GB, 1)
+                Drive = "$($v.DriveLetter):"; Label = $v.FileSystemLabel; FS = $v.FileSystem
+                SizeGB = [math]::Round($v.Size / 1GB, 1); FreeGB = [math]::Round($v.SizeRemaining / 1GB, 1)
                 FreePct = if ($v.Size -gt 0) { [math]::Round(($v.SizeRemaining / $v.Size) * 100, 1) } else { 0 }
             }
         }
@@ -891,11 +1626,8 @@ $sys = & {
             if ($d.Used -ne $null) {
                 $size = $d.Used + $d.Free
                 $disks += [pscustomobject]@{
-                    Drive   = "$($d.Name):"
-                    Label   = ''
-                    FS      = ''
-                    SizeGB  = [math]::Round($size / 1GB, 1)
-                    FreeGB  = [math]::Round($d.Free / 1GB, 1)
+                    Drive = "$($d.Name):"; Label = ''; FS = ''
+                    SizeGB = [math]::Round($size / 1GB, 1); FreeGB = [math]::Round($d.Free / 1GB, 1)
                     FreePct = if ($size -gt 0) { [math]::Round(($d.Free / $size) * 100, 1) } else { 0 }
                 }
             }
@@ -903,42 +1635,40 @@ $sys = & {
     }
 
     $pf = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue
-
     $hasDedicated  = @($gpuInfo | Where-Object Kind -eq 'Discrete').Count -gt 0
     $hasIntegrated = @($gpuInfo | Where-Object Kind -eq 'Integrated').Count -gt 0
 
     [pscustomobject]@{
-        ComputerName   = $env:COMPUTERNAME
-        User           = "$env:USERDOMAIN\$env:USERNAME"
-        OS             = "$($os.Caption) ($($os.Version), Build $($os.BuildNumber))"
-        OSBuild        = "$($os.Version).$($os.BuildNumber)"
-        OSVersion      = $os.Version
-        OSBuildNumber  = $os.BuildNumber
+        ComputerName = $env:COMPUTERNAME
+        User = "$env:USERDOMAIN\$env:USERNAME"
+        OS = "$($os.Caption) ($($os.Version), Build $($os.BuildNumber))"
+        OSBuild = "$($os.Version).$($os.BuildNumber)"
+        OSVersion = $os.Version
+        OSBuildNumber = $os.BuildNumber
         OSDisplayVersion = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).DisplayVersion
-        Arch           = $os.OSArchitecture
-        LastBoot       = $os.LastBootUpTime
-        InstallDate    = $os.InstallDate
-        CPU            = $cpu.Name
-        Cores          = $cpu.NumberOfCores
-        LogicalCPUs    = $cpu.NumberOfLogicalProcessors
-        ClockMHz       = $cpu.MaxClockSpeed
-        RAM_GB         = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
-        FreeRAM_GB     = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-        GPUs           = $gpuInfo
+        Arch = $os.OSArchitecture
+        LastBoot = $os.LastBootUpTime
+        InstallDate = $os.InstallDate
+        CPU = $cpu.Name
+        Cores = $cpu.NumberOfCores
+        LogicalCPUs = $cpu.NumberOfLogicalProcessors
+        ClockMHz = $cpu.MaxClockSpeed
+        RAM_GB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+        FreeRAM_GB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+        GPUs = $gpuInfo
         HasDiscreteGPU = $hasDedicated
-        HasIntegrated  = $hasIntegrated
-        Disks          = $disks
-        PageFile       = $pf
-        ThermalZones   = @()
-        Power          = Get-PowerState
-        Battery        = Get-BatteryHealth
-        IsAdmin        = (Test-IsAdmin)
+        HasIntegrated = $hasIntegrated
+        Disks = $disks
+        PageFile = $pf
+        Power = Get-PowerState
+        Battery = Get-BatteryHealth
+        IsAdmin = (Test-IsAdmin)
     }
 }
 Write-Ok
 
 # =============================================================================
-# 5. PREREQUISITES
+# PREREQUISITES
 # =============================================================================
 Write-Stage "Checking prerequisites..."
 $netFx = Get-DotNetFrameworkVersion
@@ -946,248 +1676,148 @@ $vc    = @(Get-VCRedist)
 Write-Ok
 
 # =============================================================================
-# 5b. WINDOWS HEALTH
+# WINDOWS HEALTH / NETWORK HEALTH
 # =============================================================================
 function Get-WindowsHealth {
     param([pscustomobject]$System)
-
     $r = [ordered]@{
-        PendingReboot = $false
-        RebootReason  = ''
-        UpdateService = 'Unknown'
-        UpdateStartMode = ''
-        Defender      = 'Unknown'
-        DefenderSig   = 'Unknown'
-        DefenderSigDate = ''
-        Firewall      = 'Unknown'
-        Activation    = 'Unknown'
-        BuildAgeDays  = 0
-        Score         = 100
+        PendingReboot = $false; RebootReason = ''
+        UpdateService = 'Unknown'; UpdateStartMode = ''
+        Defender = 'Unknown'; DefenderSig = 'Unknown'; DefenderSigDate = ''
+        Firewall = 'Unknown'; Activation = 'Unknown'
+        BuildAgeDays = 0; Score = 100
     }
-
     $rebootKeys = @(
         @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'; Reason='CBS RebootPending'},
         @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'; Reason='Windows Update RebootRequired'},
         @{Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'; Reason='CBS PackagesPending'}
     )
     foreach ($k in $rebootKeys) {
-        if (Test-Path $k.Path) {
-            $r.PendingReboot = $true
-            $r.RebootReason  = $k.Reason
-            break
-        }
+        if (Test-Path $k.Path) { $r.PendingReboot = $true; $r.RebootReason = $k.Reason; break }
     }
     try {
         $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop).PendingFileRenameOperations
-        if ($pfro) {
-            $r.PendingReboot = $true
-            if (-not $r.RebootReason) { $r.RebootReason = 'PendingFileRenameOperations' }
-        }
+        if ($pfro) { $r.PendingReboot = $true; if (-not $r.RebootReason) { $r.RebootReason = 'PendingFileRenameOperations' } }
     } catch { }
-
     try {
         $wu = Get-Service wuauserv -ErrorAction Stop
         $wuStart = (Get-CimInstance Win32_Service -Filter "Name='wuauserv'" -ErrorAction SilentlyContinue).StartMode
         $r.UpdateStartMode = $wuStart
-        if ($wuStart -eq 'Disabled') {
-            $r.UpdateService = 'Disabled'
-        } elseif ($wu.Status -eq 'Running') {
-            $r.UpdateService = 'Running'
-        } else {
-            $r.UpdateService = "Stopped ($wuStart)"
-        }
+        if ($wuStart -eq 'Disabled') { $r.UpdateService = 'Disabled' }
+        elseif ($wu.Status -eq 'Running') { $r.UpdateService = 'Running' }
+        else { $r.UpdateService = "Stopped ($wuStart)" }
     } catch { }
-
     try {
         $def = Get-MpComputerStatus -ErrorAction Stop
         $r.Defender = if ($def.AntivirusEnabled) { 'Active' } else { 'Off' }
-        if ($def.AntivirusSignatureVersion) {
-            $r.DefenderSig = $def.AntivirusSignatureVersion
-        }
-        if ($def.AntivirusSignatureLastUpdated) {
-            $r.DefenderSigDate = ([datetime]$def.AntivirusSignatureLastUpdated).ToString('yyyy-MM-dd')
-        }
+        if ($def.AntivirusSignatureVersion) { $r.DefenderSig = $def.AntivirusSignatureVersion }
+        if ($def.AntivirusSignatureLastUpdated) { $r.DefenderSigDate = ([datetime]$def.AntivirusSignatureLastUpdated).ToString('yyyy-MM-dd') }
     } catch {
         try {
             $sc = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop
             $r.Defender = if ($sc) { 'Active' } else { 'Unknown' }
         } catch { }
     }
-
     try {
         $fw = Get-NetFirewallProfile -ErrorAction Stop
         $enabled = @($fw | Where-Object Enabled -eq $true).Count
         $r.Firewall = if ($enabled -eq $fw.Count) { 'On' } elseif ($enabled -eq 0) { 'Off' } else { "Partial ($enabled/$($fw.Count))" }
     } catch { }
-
     try {
         $lic = Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue |
                Where-Object { $_.PartialProductKey -and $_.ApplicationID -eq '55c92734-d682-4d71-983e-d6ec3f16059f' } |
                Select-Object -First 1
         if ($lic) {
             $r.Activation = switch ([int]$lic.LicenseStatus) {
-                0 { 'Unlicensed' }
-                1 { 'Licensed' }
-                2 { 'OOB Grace' }
-                3 { 'OOT Grace' }
-                4 { 'Non-Genuine Grace' }
-                5 { 'Notification' }
-                6 { 'Extended Grace' }
+                0 { 'Unlicensed' } 1 { 'Licensed' } 2 { 'OOB Grace' } 3 { 'OOT Grace' }
+                4 { 'Non-Genuine Grace' } 5 { 'Notification' } 6 { 'Extended Grace' }
                 default { "Unknown ($($lic.LicenseStatus))" }
             }
         }
     } catch { }
-
     if ($System.InstallDate) {
         try { $r.BuildAgeDays = (New-TimeSpan -Start $System.InstallDate -End (Get-Date)).Days } catch { }
     }
-
     $s = 100
-    if ($r.PendingReboot)                                   { $s -= 20 }
-    if ($r.UpdateService -eq 'Disabled')                    { $s -= 15 }
-    if ($r.Defender -eq 'Off')                              { $s -= 15 }
-    if ($r.Firewall -eq 'Off')                              { $s -= 10 }
+    if ($r.PendingReboot) { $s -= 20 }
+    if ($r.UpdateService -eq 'Disabled') { $s -= 15 }
+    if ($r.Defender -eq 'Off') { $s -= 15 }
+    if ($r.Firewall -eq 'Off') { $s -= 10 }
     if ($r.Activation -in @('Unlicensed','Notification','Non-Genuine Grace')) { $s -= 25 }
-    if ($r.BuildAgeDays -gt 3 * 365)                        { $s -= 10 }
-    elseif ($r.BuildAgeDays -gt 2 * 365)                    { $s -= 5 }
+    if ($r.BuildAgeDays -gt 3 * 365) { $s -= 10 } elseif ($r.BuildAgeDays -gt 2 * 365) { $s -= 5 }
     $r.Score = [math]::Max(0, $s)
-
     [pscustomobject]$r
 }
 
-# =============================================================================
-# 5c. NETWORK HEALTH
-# =============================================================================
 function Get-NetworkHealth {
     param([pscustomobject]$System, [array]$Catalog, [array]$Installed)
-
     $r = [ordered]@{
-        Adapters      = @()
-        WifiDetails   = @()
-        LinkSpeedMbps = 0
-        LinkSpeedText = ''
-        DNS           = 'Unknown'
-        DNSms         = $null
-        DefaultGW     = ''
-        License       = @()
-        Score         = 100
-        Confidence    = 'High'
+        Adapters = @(); WifiDetails = @()
+        LinkSpeedMbps = 0; LinkSpeedText = ''
+        DNS = 'Unknown'; DNSms = $null
+        DefaultGW = ''; License = @(); Score = 100; Confidence = 'High'
     }
-
     try {
         $nics = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object Status -eq 'Up')
         $maxMbps = 0
         foreach ($n in $nics) {
             $mbps = 0
-            if ($n.LinkSpeed -match '([\d\.]+)\s*Gbps')      { $mbps = [double]$Matches[1] * 1000 }
-            elseif ($n.LinkSpeed -match '([\d\.]+)\s*Mbps')  { $mbps = [double]$Matches[1] }
+            if ($n.LinkSpeed -match '([\d\.]+)\s*Gbps') { $mbps = [double]$Matches[1] * 1000 }
+            elseif ($n.LinkSpeed -match '([\d\.]+)\s*Mbps') { $mbps = [double]$Matches[1] }
             if ($mbps -gt $maxMbps) { $maxMbps = $mbps }
-
-            $maxCap = $null
-            try {
-                $adv = Get-NetAdapterAdvancedProperty -Name $n.Name -ErrorAction Stop |
-                       Where-Object { $_.DisplayName -match 'Speed|Duplex|Rate' }
-                foreach ($a in $adv) {
-                    if ($a.RegistryValue -match '(\d+)\s*(Gb|GbE|Gbps)' -or $a.DisplayValue -match '(\d+)\s*(Gb|Gbps)') {
-                        $maxCap = "$($matches[1]) Gb"
-                        break
-                    }
-                }
-            } catch { }
-
             $r.Adapters += [pscustomobject]@{
-                Name       = $n.Name
-                LinkSpeed  = $n.LinkSpeed
-                MaxSpeed   = $maxCap
-                Mac        = $n.MacAddress
-                MediaType  = $n.MediaType
-                Description= $n.InterfaceDescription
+                Name = $n.Name; LinkSpeed = $n.LinkSpeed; Mac = $n.MacAddress
+                MediaType = $n.MediaType; Description = $n.InterfaceDescription
             }
         }
         $r.LinkSpeedMbps = [int]$maxMbps
         $r.LinkSpeedText = if ($maxMbps -ge 1000) { "$([math]::Round($maxMbps/1000,1)) Gbps" }
                            elseif ($maxMbps -gt 0) { "$maxMbps Mbps" } else { '' }
     } catch { }
-
-    try {
-        $wifi = Get-WifiDetails
-        if ($wifi.Interfaces.Count -gt 0) { $r.WifiDetails = @($wifi.Interfaces) }
-    } catch { }
-
+    try { $wifi = Get-WifiDetails; if ($wifi.Interfaces.Count -gt 0) { $r.WifiDetails = @($wifi.Interfaces) } } catch { }
     try {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $null = Resolve-DnsName 'microsoft.com' -ErrorAction Stop -QuickTimeout
         $sw.Stop()
         $r.DNSms = [int]$sw.ElapsedMilliseconds
         $r.DNS = 'OK'
-    } catch {
-        $r.DNS = 'Failed'
-    }
-
+    } catch { $r.DNS = 'Failed' }
     try {
         $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -First 1
         if ($route) { $r.DefaultGW = $route.NextHop }
     } catch { }
-
     foreach ($entry in $Catalog) {
         if (-not $entry.Lport) { continue }
         $hit = $false
-        foreach ($pat in @($entry.P)) {
-            if ($Installed | Where-Object { $_.DisplayName -like $pat }) { $hit = $true; break }
-        }
+        foreach ($pat in @($entry.P)) { if ($Installed | Where-Object { $_.DisplayName -like $pat }) { $hit = $true; break } }
         if (-not $hit) { continue }
-
         $anyOpen = $false
-        foreach ($p in $entry.Lport) {
-            if (Test-TcpPort -Port $p -TimeoutMs 800) { $anyOpen = $true; break }
-        }
-        $r.License += [pscustomobject]@{
-            Product = $entry.N
-            Ports   = ($entry.Lport -join ', ')
-            Local   = $anyOpen
-        }
+        foreach ($p in $entry.Lport) { if (Test-TcpPort -Port $p -TimeoutMs 800) { $anyOpen = $true; break } }
+        $r.License += [pscustomobject]@{ Product = $entry.N; Ports = ($entry.Lport -join ', '); Local = $anyOpen }
     }
-
     $s = 100
-    if ($r.Adapters.Count -eq 0)                                            { $s -= 20 }
-    elseif ($r.LinkSpeedMbps -gt 0 -and $r.LinkSpeedMbps -lt 100)           { $s -= 15 }
-    elseif ($r.LinkSpeedMbps -gt 0 -and $r.LinkSpeedMbps -lt 1000)          { $s -= 5 }
-    if ($r.DNS -ne 'OK')                                                    { $s -= 10 }
-    if (-not $r.DefaultGW)                                                  { $s -= 10 }
+    if ($r.Adapters.Count -eq 0) { $s -= 20 }
+    elseif ($r.LinkSpeedMbps -gt 0 -and $r.LinkSpeedMbps -lt 100) { $s -= 15 }
+    elseif ($r.LinkSpeedMbps -gt 0 -and $r.LinkSpeedMbps -lt 1000) { $s -= 5 }
+    if ($r.DNS -ne 'OK') { $s -= 10 }
+    if (-not $r.DefaultGW) { $s -= 10 }
     $r.Score = [math]::Max(0, $s)
-
     [pscustomobject]$r
 }
 
 # =============================================================================
-# 5d. PREFLIGHT
+# PREFLIGHT / WHY-SLOW / DISPATCH
 # =============================================================================
 function Invoke-Preflight {
-    param(
-        [string]$ProductName,
-        [array]$Catalog,
-        [pscustomobject]$System,
-        [string]$NetFx,
-        [array]$VC,
-        [array]$Installed
-    )
-
-    Write-Host ""
-    Write-Host ("=" * 78) -ForegroundColor DarkCyan
-    Write-Host "  PREFLIGHT: $ProductName" -ForegroundColor Cyan
-    Write-Host ("=" * 78) -ForegroundColor DarkCyan
-    Write-Host ""
-
+    param([string]$ProductName, [array]$Catalog, [pscustomobject]$System,
+          [string]$NetFx, [array]$VC, [array]$Installed)
+    Write-Head "PREFLIGHT: $ProductName"
     $entry = $Catalog | Where-Object { $_.N -eq $ProductName } | Select-Object -First 1
+    if (-not $entry) { $entry = $Catalog | Where-Object { $_.N -like "*$ProductName*" } | Select-Object -First 1 }
     if (-not $entry) {
-        $entry = $Catalog | Where-Object { $_.N -like "*$ProductName*" } | Select-Object -First 1
-    }
-    if (-not $entry) {
-        Write-Host "[ERROR] Product not found in catalog: $ProductName" -ForegroundColor Red
-        Write-Host "[INFO]  Try one of the catalog names, e.g. ANSYS, SOLIDWORKS, Revit, MATLAB" -ForegroundColor Yellow
+        Write-Host "[ERROR] Product not found: $ProductName" -ForegroundColor Red
         return
     }
-
     $script:pass = 0; $script:warn = 0; $script:fail = 0
     function Report {
         param([string]$State, [string]$Label, [string]$Detail = '')
@@ -1199,116 +1829,23 @@ function Invoke-Preflight {
         Write-Host $Label -NoNewline
         if ($Detail) { Write-Host "  ($Detail)" -ForegroundColor DarkGray } else { Write-Host "" }
     }
-
     if ($entry.RAM) {
-        if ($System.RAM_GB -ge $entry.RAM) {
-            Report 'OK' "RAM installed" "$($System.RAM_GB) GB >= $($entry.RAM) GB recommended"
-        } else {
-            Report 'WARN' "RAM below recommendation" "$($System.RAM_GB) GB installed, $($entry.RAM) GB recommended"
-        }
+        if ($System.RAM_GB -ge $entry.RAM) { Report 'OK' "RAM" "$($System.RAM_GB) GB >= $($entry.RAM) GB" }
+        else { Report 'WARN' "RAM below" "$($System.RAM_GB) GB / $($entry.RAM) GB" }
     }
-    Report 'OK' "Free RAM now" "$($System.FreeRAM_GB) GB of $($System.RAM_GB) GB"
-
-    if ($System.PageFile -and $System.PageFile.Count -gt 0) {
-        $pf = $System.PageFile | Select-Object -First 1
-        Report 'OK' "Pagefile enabled" "$($pf.AllocatedBaseSize) MB allocated"
-    } else {
-        Report 'FAIL' "Pagefile not detected" "large solvers may fail"
-    }
-
     if ($entry.Disk) {
         $sysd = $System.Disks | Where-Object Drive -eq "$($env:SystemDrive)"
-        if ($sysd -and $sysd.FreeGB -ge $entry.Disk) {
-            Report 'OK' "Scratch disk free" "$($sysd.FreeGB) GB on $($sysd.Drive)"
-        } elseif ($sysd) {
-            Report 'WARN' "Scratch disk tight" "$($sysd.FreeGB) GB free, $($entry.Disk) GB recommended"
-        }
+        if ($sysd -and $sysd.FreeGB -ge $entry.Disk) { Report 'OK' "Disk" "$($sysd.FreeGB) GB free" }
+        elseif ($sysd) { Report 'WARN' "Disk tight" "$($sysd.FreeGB) GB / $($entry.Disk) GB" }
     }
-
     if ($entry.Net) {
-        if (Compare-NetVersion -Have $NetFx -Need $entry.Net) {
-            Report 'OK' ".NET Framework" "$NetFx >= $($entry.Net)"
-        } else {
-            Report 'FAIL' ".NET Framework" "have $NetFx, need $($entry.Net)"
-        }
+        if (Compare-NetVersion -Have $NetFx -Need $entry.Net) { Report 'OK' ".NET" "$NetFx >= $($entry.Net)" }
+        else { Report 'FAIL' ".NET" "have $NetFx, need $($entry.Net)" }
     }
-
     if ($entry.VCPP) {
-        if ($VC -and $VC.Count -gt 0) {
-            Report 'OK' "VC++ Runtime" "$($VC.Count) redistributable(s) present"
-        } else {
-            Report 'FAIL' "VC++ Runtime" "not detected"
-        }
+        if ($VC -and $VC.Count -gt 0) { Report 'OK' "VC++ Runtime" "$($VC.Count) redistributable(s)" }
+        else { Report 'FAIL' "VC++ Runtime" "not detected" }
     }
-
-    if ($entry.GPU) {
-        $discrete = @($System.GPUs | Where-Object Kind -eq 'Discrete')
-        if ($discrete.Count -gt 0) {
-            Report 'OK' "Discrete GPU present" (($discrete | ForEach-Object { "$($_.Name) [$($_.VRAM_GB) GB]" }) -join ', ')
-        } else {
-            Report 'WARN' "No discrete GPU" "using integrated graphics"
-        }
-    }
-
-    if ($entry.Lsvc) {
-        $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
-            $n = $_.Name + ' ' + $_.DisplayName
-            foreach ($pat in $entry.Lsvc) { if ($n -like $pat) { return $true } }
-            return $false
-        })
-        if ($svc.Count -gt 0 -and (@($svc | Where-Object Status -eq 'Running').Count -gt 0)) {
-            Report 'OK' "License service running" (($svc | Where-Object Status -eq 'Running' | Select-Object -First 1).DisplayName)
-        } elseif ($svc.Count -gt 0) {
-            Report 'FAIL' "License service stopped" (($svc | Select-Object -First 1).DisplayName)
-        } else {
-            Report 'WARN' "License service not found" "may be remote"
-        }
-    }
-
-    if ($entry.Lport) {
-        $open = @()
-        foreach ($p in $entry.Lport) { if (Test-TcpPort -Port $p -TimeoutMs 800) { $open += $p } }
-        if ($open.Count -gt 0) {
-            Report 'OK' "License port(s) open" ($open -join ', ')
-        } else {
-            Report 'WARN' "License ports closed locally" "normal for node-locked or remote servers"
-        }
-    }
-
-    if ($System.Power.HasBattery) {
-        if ($System.Power.OnAC) {
-            Report 'OK' "AC power" "battery at $($System.Power.Percent)% ($($System.Power.StatusText))"
-        } else {
-            Report 'WARN' "Running on battery" "$($System.Power.Percent)% - heavy solve will drain fast"
-        }
-    }
-
-    $heavyNames = @('chrome','msedge','firefox','teams','slack','discord','zoom',
-                    'photoshop','illustrator','premiere','aftereffects',
-                    'code','devenv','rider','webstorm','pycharm','idea',
-                    'excel','powerpnt','winword','outlook','spotify','obs','blender')
-    $heavy = @()
-    $recoverGB = 0
-    try {
-        $procs = Get-Process -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            if ($heavyNames -contains $p.ProcessName.ToLower()) {
-                $gb = [math]::Round($p.WorkingSet64 / 1GB, 2)
-                $heavy += [pscustomobject]@{ Name = $p.ProcessName; GB = $gb }
-                $recoverGB += $gb
-            }
-        }
-    } catch { }
-    if ($heavy.Count -eq 0) {
-        Report 'OK' "No heavy background apps detected"
-    } else {
-        $recoverGB = [math]::Round($recoverGB, 1)
-        Report 'WARN' "$($heavy.Count) heavy application(s) open" "closing them recovers ~$recoverGB GB"
-        foreach ($h in ($heavy | Sort-Object GB -Descending | Select-Object -First 5)) {
-            Write-Host ("           - {0,-14} {1,5} GB" -f $h.Name, $h.GB) -ForegroundColor DarkGray
-        }
-    }
-
     Write-Host ""
     $verdict = if ($fail -gt 0) { 'NOT READY' } elseif ($warn -gt 2) { 'CAUTION' } else { 'READY' }
     $col = if ($fail -gt 0) { 'Red' } elseif ($warn -gt 2) { 'Yellow' } else { 'Green' }
@@ -1316,34 +1853,18 @@ function Invoke-Preflight {
     Write-Host ""
 }
 
-# =============================================================================
-# 5e. WHY-SLOW
-# =============================================================================
 function Invoke-WhySlow {
     param([pscustomobject]$System)
-
-    Write-Host ""
-    Write-Host ("=" * 78) -ForegroundColor DarkCyan
-    Write-Host "  WHY IS MY PC SLOW?" -ForegroundColor Cyan
-    Write-Host ("=" * 78) -ForegroundColor DarkCyan
-    Write-Host ""
-
+    Write-Head "WHY IS MY PC SLOW?"
     $ramPctFree = [math]::Round(($System.FreeRAM_GB / $System.RAM_GB) * 100, 1)
     $critDisk = $System.Disks | Sort-Object FreePct | Select-Object -First 1
-
     $topMem = @()
     try {
-        $topMem = Get-Process -ErrorAction SilentlyContinue |
-                  Sort-Object WorkingSet64 -Descending |
-                  Select-Object -First 8 |
-                  ForEach-Object {
-                      [pscustomobject]@{
-                          Name = $_.ProcessName
-                          GB   = [math]::Round($_.WorkingSet64 / 1GB, 2)
-                      }
+        $topMem = Get-Process -ErrorAction SilentlyContinue | Sort-Object WorkingSet64 -Descending |
+                  Select-Object -First 8 | ForEach-Object {
+                      [pscustomobject]@{ Name = $_.ProcessName; GB = [math]::Round($_.WorkingSet64 / 1GB, 2) }
                   }
     } catch { }
-
     $topCpu = @()
     try {
         $s1 = @{}
@@ -1357,779 +1878,50 @@ function Invoke-WhySlow {
             [pscustomobject]@{ Name = $_.ProcessName; CPU = $pct }
         } | Sort-Object CPU -Descending | Select-Object -First 8
     } catch { }
-
     $verdicts = [ordered]@{
-        RAM    = if ($ramPctFree -lt 15) { 'CRITICAL' } elseif ($ramPctFree -lt 30) { 'ELEVATED' } else { 'OK' }
-        Disk   = if ($critDisk -and $critDisk.FreePct -lt 5) { 'CRITICAL' } elseif ($critDisk -and $critDisk.FreePct -lt 15) { 'ELEVATED' } else { 'OK' }
-        CPU    = if (($topCpu | Select-Object -First 1).CPU -gt 60) { 'ELEVATED' } else { 'OK' }
-        GPU    = if ($System.HasDiscreteGPU) { 'OK' } else { 'ELEVATED' }
-        Power  = if ($System.Power.HasBattery -and -not $System.Power.OnAC) { 'ELEVATED' } else { 'OK' }
+        RAM   = if ($ramPctFree -lt 15) { 'CRITICAL' } elseif ($ramPctFree -lt 30) { 'ELEVATED' } else { 'OK' }
+        Disk  = if ($critDisk -and $critDisk.FreePct -lt 5) { 'CRITICAL' } elseif ($critDisk -and $critDisk.FreePct -lt 15) { 'ELEVATED' } else { 'OK' }
+        CPU   = if (($topCpu | Select-Object -First 1).CPU -gt 60) { 'ELEVATED' } else { 'OK' }
+        GPU   = if ($System.HasDiscreteGPU) { 'OK' } else { 'ELEVATED' }
+        Power = if ($System.Power.HasBattery -and -not $System.Power.OnAC) { 'ELEVATED' } else { 'OK' }
     }
-
     $primary = 'None detected'
-    foreach ($k in @('RAM','Disk','Power','CPU','GPU')) {
-        if ($verdicts[$k] -eq 'CRITICAL') { $primary = $k; break }
-    }
+    foreach ($k in @('RAM','Disk','Power','CPU','GPU')) { if ($verdicts[$k] -eq 'CRITICAL') { $primary = $k; break } }
     if ($primary -eq 'None detected') {
-        foreach ($k in @('RAM','Disk','Power','CPU','GPU')) {
-            if ($verdicts[$k] -eq 'ELEVATED') { $primary = $k; break }
-        }
+        foreach ($k in @('RAM','Disk','Power','CPU','GPU')) { if ($verdicts[$k] -eq 'ELEVATED') { $primary = $k; break } }
     }
-
     Write-Host "  Current snapshot" -ForegroundColor Cyan
     Write-Host ("    RAM free            {0} GB / {1} GB ({2}%)" -f $System.FreeRAM_GB, $System.RAM_GB, $ramPctFree)
-    Write-Host ("    CPU cores           {0} logical" -f $System.LogicalCPUs)
     Write-Host ("    Worst disk free     {0} GB ({1}% on {2})" -f $critDisk.FreeGB, $critDisk.FreePct, $critDisk.Drive)
     Write-Host ("    Power               {0}" -f $System.Power.StatusText)
     Write-Host ""
-
     Write-Host "  Verdicts" -ForegroundColor Cyan
     foreach ($k in $verdicts.Keys) {
         $col = switch ($verdicts[$k]) { 'CRITICAL' { 'Red' } 'ELEVATED' { 'Yellow' } default { 'Green' } }
         Write-Host ("    {0,-8} {1}" -f $k, $verdicts[$k]) -ForegroundColor $col
     }
     Write-Host ""
-
     Write-Host ("  PRIMARY BOTTLENECK: {0}" -f $primary) -ForegroundColor Yellow
     Write-Host ""
-
     if ($topMem.Count -gt 0) {
         Write-Host "  Top memory consumers" -ForegroundColor Cyan
-        foreach ($p in $topMem) {
-            Write-Host ("    {0,-22} {1,6} GB" -f $p.Name, $p.GB)
-        }
+        foreach ($p in $topMem) { Write-Host ("    {0,-22} {1,6} GB" -f $p.Name, $p.GB) }
         Write-Host ""
     }
-    if ($topCpu.Count -gt 0) {
-        Write-Host "  Top CPU consumers (last 0.8s)" -ForegroundColor Cyan
-        foreach ($p in $topCpu) {
-            if ($p.CPU -lt 0.5) { continue }
-            Write-Host ("    {0,-22} {1,6}%" -f $p.Name, $p.CPU)
-        }
-        Write-Host ""
-    }
-
-    $rec = switch ($primary) {
-        'RAM'    { "Close unused applications or upgrade RAM. Currently $ramPctFree% free." }
-        'Disk'   { "Free space on $($critDisk.Drive). Engineering tools need scratch headroom." }
-        'Power'  { "Plug in AC power. Laptop battery mode throttles CPU and GPU." }
-        'CPU'    { "A background process is consuming CPU. See the list above." }
-        'GPU'    { "No discrete GPU detected. Some 3D and solver workloads will be slow." }
-        default  { "No obvious local bottleneck. Check license server reachability and project file size." }
-    }
-    Write-Host "  RECOMMENDATION" -ForegroundColor Cyan
-    Write-Host "    $rec"
     Write-Host ""
 }
 
-# =============================================================================
-# 5f. DISPATCH
-# =============================================================================
 if ($Preflight) {
-    Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog `
-                     -System $sys -NetFx $netFx -VC $vc -Installed $installed
+    Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog -System $sys -NetFx $netFx -VC $vc -Installed $installed
     exit 0
 }
-
 if ($WhySlow) {
     Invoke-WhySlow -System $sys
     exit 0
 }
 
 # =============================================================================
-# 5g. SOFTWARE INSTALLER
-# =============================================================================
-$Script:WingetMap = @{
-    'Python'             = 'Python.Python.3.12'
-    'Anaconda'           = 'Anaconda.Anaconda3'
-    'Git'                = 'Git.Git'
-    'Visual Studio Code' = 'Microsoft.VisualStudioCode'
-    'Visual Studio'      = 'Microsoft.VisualStudio.2022.Community'
-    'Docker Desktop'     = 'Docker.DockerDesktop'
-    'Wireshark'          = 'WiresharkFoundation.Wireshark'
-    'KiCad'              = 'KiCad.KiCad'
-    'QGIS'               = 'QGIS.QGIS'
-    'CloudCompare'       = 'CloudCompare.CloudCompare'
-    'Arduino IDE'        = 'ArduinoSA.IDE.stable'
-    'R'                  = 'RProject.R'
-    'LTspice'            = 'AnalogDevices.LTspice'
-    'ImageJ'             = 'ImageJ.ImageJ'
-    'DWSIM'              = 'DWSIM.DWSIM'
-    '3D Slicer'          = 'Slicer.Slicer'
-    'PlatformIO'         = 'PlatformIO.PlatformIO'
-    'FreeCAD'            = 'FreeCAD.FreeCAD'
-    'OpenSCAD'           = 'OpenSCAD.OpenSCAD'
-    'Blender'            = 'BlenderFoundation.Blender'
-    'ParaView'           = 'Kitware.ParaView'
-    'GNU Octave'         = 'GNU.Octave'
-    'CMake'              = 'Kitware.CMake'
-    'Notepad++'          = 'Notepad++.Notepad++'
-    'GIMP'               = 'GIMP.GIMP'
-    'Inkscape'           = 'Inkscape.Inkscape'
-    '7-Zip'              = '7zip.7zip'
-}
-
-$Script:ManualUrls = @{
-    'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
-    'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
-    'Civil 3D'            = 'https://www.autodesk.com/products/civil-3d/free-trial'
-    'Autodesk Inventor'   = 'https://www.autodesk.com/products/inventor/free-trial'
-    'Fusion 360'          = 'https://www.autodesk.com/products/fusion-360/free-trial'
-    'Navisworks'          = 'https://www.autodesk.com/products/navisworks/free-trial'
-    'Advance Steel'       = 'https://www.autodesk.com/products/advance-steel/free-trial'
-    'AutoCAD Electrical'  = 'https://www.autodesk.com/products/autocad-electrical/free-trial'
-    'AutoCAD MEP'         = 'https://www.autodesk.com/products/autocad-mep/free-trial'
-    'Revit MEP'           = 'https://www.autodesk.com/products/revit/free-trial'
-    'Robot Structural'    = 'https://www.autodesk.com/products/robot-structural-analysis/free-trial'
-    'Autodesk ReCap'      = 'https://www.autodesk.com/products/recap/free-trial'
-    'PowerMill'           = 'https://www.autodesk.com/products/powermill/overview'
-    'InfoWorks ICM'       = 'https://www.autodesk.com/products/infoworks-icm'
-    'Autodesk Construction Cloud' = 'https://construction.autodesk.com/'
-    'Dynamo'              = 'https://dynamobim.org/download/'
-    'BricsCAD'            = 'https://www.bricsys.com/en-intl/bricscad/'
-    'Archicad'            = 'https://www.graphisoft.com/archicad/'
-    'Bluebeam Revu'       = 'https://www.bluebeam.com/'
-    'Rhino'               = 'https://www.rhino3d.com/download/'
-    'Grasshopper'         = 'https://www.grasshopper3d.com/'
-    'SOLIDWORKS'          = 'https://www.solidworks.com/sw/support/downloads.htm'
-    'SOLIDWORKS Electrical' = 'https://www.solidworks.com/sw/support/downloads.htm'
-    'CATIA'               = 'https://www.3ds.com/products/catia'
-    'Abaqus'              = 'https://www.3ds.com/products/simulia/abaqus'
-    'CST Studio Suite'    = 'https://www.3ds.com/products/simulia/cst-studio-suite'
-    'Materials Studio'    = 'https://www.3ds.com/products/biovia/materials-studio'
-    'Cameo Systems Modeler' = 'https://www.3ds.com/products/catia/no-magic/cameo-systems-modeler'
-    'Siemens NX'          = 'https://plm.sw.siemens.com/en-US/nx/'
-    'Siemens Teamcenter'  = 'https://plm.sw.siemens.com/en-US/teamcenter/'
-    'Simcenter STAR-CCM+' = 'https://plm.sw.siemens.com/en-US/simcenter/fluids-thermal-simulation/star-ccm/'
-    'Solid Edge'          = 'https://solidedge.siemens.com/'
-    'Siemens Xpedition'   = 'https://eda.sw.siemens.com/en-US/pcb/xpedition/'
-    'PADS Professional'   = 'https://eda.sw.siemens.com/en-US/pcb/pads/'
-    'ANSYS'               = 'https://www.ansys.com/products'
-    'ANSYS HFSS'          = 'https://www.ansys.com/products/electronics/ansys-hfss'
-    'ANSYS Fluent'        = 'https://www.ansys.com/products/fluids/ansys-fluent'
-    'ANSYS AQWA'          = 'https://www.ansys.com/products/structures/ansys-aqwa'
-    'LS-DYNA'             = 'https://www.ansys.com/products/structures/ansys-ls-dyna'
-    'COMSOL Multiphysics' = 'https://www.comsol.com/'
-    'MATLAB'              = 'https://www.mathworks.com/products/matlab.html'
-    'Simulink'            = 'https://www.mathworks.com/products/simulink.html'
-    'MSC Nastran'         = 'https://www.mscsoftware.com/product/msc-nastran'
-    'MSC Adams'           = 'https://www.mscsoftware.com/product/adams'
-    'Altair HyperWorks'   = 'https://altair.com/hyperworks'
-    'Altair HyperMesh'    = 'https://altair.com/hypermesh'
-    'HyperMesh'           = 'https://altair.com/hypermesh'
-    'OpenFOAM'            = 'https://openfoam.org/download/'
-    'FactSage'            = 'https://www.factsage.com/'
-    'Thermo-Calc'         = 'https://thermocalc.com/'
-    'JMatPro'             = 'https://www.sentesoftware.co.uk/jmatpro'
-    'Altium Designer'     = 'https://www.altium.com/'
-    'ETAP'                = 'https://etap.com/'
-    'EPLAN Electric P8'   = 'https://www.eplan-software.com/'
-    'Cadence Allegro'     = 'https://www.cadence.com/en_US/home/tools/pcb-design-and-analysis/allegro.html'
-    'OrCAD'               = 'https://www.orcad.com/'
-    'PSpice'              = 'https://www.orcad.com/products/orcad-pspice-designer/overview'
-    'Proteus'             = 'https://www.labcenter.com/'
-    'EasyEDA'             = 'https://easyeda.com/'
-    'DipTrace'            = 'https://diptrace.com/'
-    'DesignSpark PCB'     = 'https://www.rs-online.com/designspark/pcb-software'
-    'SKM PowerTools'      = 'https://www.skm.com/'
-    'EasyPower'           = 'https://www.easypower.com/'
-    'PSS/E'               = 'https://www.siemens.com/global/en/products/energy/services/transmission-distribution-smart-grid/consulting-and-planning/pss-software/pss-e.html'
-    'PSCAD'               = 'https://www.pscad.com/'
-    'DIgSILENT PowerFactory' = 'https://www.digsilent.de/en/downloads.html'
-    'Keysight ADS'        = 'https://www.keysight.com/us/en/products/software/pathwave-design-software/pathwave-advanced-design-system.html'
-    'NI LabVIEW'          = 'https://www.ni.com/en-us/support/downloads/software-products/download.labview.html'
-    'NI Multisim'         = 'https://www.ni.com/en-us/support/downloads/software-products/download.multisim.html'
-    'Siemens TIA Portal'  = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
-    'STEP 7'              = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
-    'WinCC'               = 'https://support.industry.siemens.com/cs/products?dtp=Download&mfn=ps&lc=en-WW'
-    'Rockwell Studio 5000'= 'https://www.rockwellautomation.com/en-us/products/software/factorytalk/designsuite/studio-5000.html'
-    'FactoryTalk View'    = 'https://www.rockwellautomation.com/en-us/products/software/factorytalk/operationsuite/view.html'
-    'Beckhoff TwinCAT 3'  = 'https://www.beckhoff.com/en-en/products/automation/twincat/'
-    'Schneider EcoStruxure' = 'https://www.se.com/ww/en/product-range/65878856-ecostruxure-control-expert/'
-    'Mitsubishi GX Works' = 'https://www.mitsubishielectric.com/fa/products/cnt/plceng/smerit/gx_works3/index.html'
-    'Omron Sysmac Studio' = 'https://automation.omron.com/en/us/products/family/sysmac-studio'
-    'AVEVA System Platform' = 'https://www.aveva.com/en/products/system-platform/'
-    'AVEVA Marine'        = 'https://www.aveva.com/en/products/'
-    'CODESYS'             = 'https://www.codesys.com/download.html'
-    'Ignition'            = 'https://inductiveautomation.com/downloads/'
-    'Factory I/O'         = 'https://factoryio.com/downloads/'
-    'Xilinx Vivado'       = 'https://www.xilinx.com/support/download.html'
-    'Intel Quartus Prime' = 'https://www.intel.com/content/www/us/en/software-kit/'
-    'ModelSim'            = 'https://www.intel.com/content/www/us/en/software/programmable/quartus-prime/model-sim.html'
-    'MPLAB X'             = 'https://www.microchip.com/en-us/development-tools-tools-and-software/mplab-x-ide'
-    'STM32CubeIDE'        = 'https://www.st.com/en/development-tools/stm32cubeide.html'
-    'IAR Embedded Workbench' = 'https://www.iar.com/products/architectures/arm/iar-embedded-workbench-for-arm/'
-    'Keil uVision'        = 'https://www.keil.com/demo/eval/arm.htm'
-    'STAAD.Pro'           = 'https://www.bentley.com/software/staad-pro/'
-    'Tekla Structures'    = 'https://www.tekla.com/products/tekla-structures'
-    'Tekla Tedds'         = 'https://www.tekla.com/products/tekla-tedds'
-    'SAP2000'             = 'https://www.csiamerica.com/products/sap2000'
-    'ETABS'               = 'https://www.csiamerica.com/products/etabs'
-    'SAFE'                = 'https://www.csiamerica.com/products/safe'
-    'CSiBridge'           = 'https://www.csiamerica.com/products/csibridge'
-    'MIDAS Civil'         = 'https://www.midasuser.com/'
-    'MIDAS Gen'           = 'https://www.midasuser.com/'
-    'SCIA Engineer'       = 'https://www.scia.net/en'
-    'RISA-3D'             = 'https://risa.com/products/risa-3d'
-    'IDEA StatiCa'        = 'https://www.ideastatica.com/'
-    'RFEM'                = 'https://www.dlubal.com/en'
-    'PLAXIS 2D'           = 'https://www.bentley.com/software/plaxis-2d/'
-    'PLAXIS 3D'           = 'https://www.bentley.com/software/plaxis-3d/'
-    'GeoStudio'           = 'https://www.geoslope.com/'
-    'Slide2'              = 'https://www.rocscience.com/software/slide2'
-    'Rocscience RS2'      = 'https://www.rocscience.com/software/rs2'
-    'Rocscience RS3'      = 'https://www.rocscience.com/software/rs3'
-    'FLAC3D'              = 'https://www.itascacg.com/software/flac3d'
-    'GEO5'                = 'https://www.finesoftware.eu/geotechnical-software/'
-    'gINT'                = 'https://www.bentley.com/software/gint/'
-    'Deswik'              = 'https://www.deswik.com/'
-    'Maptek Vulcan'       = 'https://www.maptek.com/products/vulcan/'
-    'Datamine Studio'     = 'https://www.dataminesoftware.com/'
-    'Micromine'           = 'https://www.micromine.com/'
-    'Leapfrog Geo'        = 'https://www.seequent.com/products-solutions/leapfrog-geo/'
-    'Bentley OpenRail'    = 'https://www.bentley.com/software/openrail-designer/'
-    'RailSys'             = 'https://www.rmcon.de/en/'
-    'HEC-RAS'             = 'https://www.hec.usace.army.mil/software/hec-ras/downloads.aspx'
-    'HEC-HMS'             = 'https://www.hec.usace.army.mil/software/hec-hms/downloads.aspx'
-    'EPA SWMM'            = 'https://www.epa.gov/water-research/storm-water-management-model-swmm'
-    'EPANET'              = 'https://www.epa.gov/water-research/epanet'
-    'WaterGEMS'           = 'https://www.bentley.com/software/watergems/'
-    'SewerGEMS'           = 'https://www.bentley.com/software/sewergems/'
-    'MIKE+'               = 'https://www.dhigroup.com/technologies/mikepoweredbydhi'
-    'MODFLOW'             = 'https://www.usgs.gov/software/modflow-6-usgs-modular-hydrologic-model'
-    'AERMOD'              = 'https://www.epa.gov/scram/air-quality-dispersion-modeling-preferred-and-recommended-models#aermod'
-    'CALPUFF'             = 'https://www.epa.gov/scram/air-quality-dispersion-modeling-preferred-and-recommended-models#calpuff'
-    'ArcGIS Pro'          = 'https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview'
-    'ArcGIS Desktop'      = 'https://www.esri.com/en-us/arcgis/products/arcgis-desktop/overview'
-    'Global Mapper'       = 'https://www.bluemarblegeo.com/global-mapper/'
-    'ENVI'                = 'https://www.nv5geospatialsoftware.com/Products/ENVI'
-    'ERDAS Imagine'       = 'https://www.hexagongeospatial.com/products/power-portfolio/erdas-imagine'
-    'Agisoft Metashape'   = 'https://www.agisoft.com/downloads/installer/'
-    'Pix4Dmapper'         = 'https://www.pix4d.com/product/pix4dmapper-photogrammetry-software'
-    'Trimble Business Center' = 'https://geospatial.trimble.com/products-and-solutions/trimble-business-center'
-    'Leica Infinity'      = 'https://leica-geosystems.com/products/software/leica-infinity'
-    'Leica Cyclone'       = 'https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
-    'Carlson Survey'      = 'https://www.carlsonsw.com/'
-    'Aspen Plus'          = 'https://www.aspentech.com/en/products/engineering/aspen-plus'
-    'Aspen HYSYS'         = 'https://www.aspentech.com/en/products/engineering/aspen-hysys'
-    'Petrel'              = 'https://www.software.slb.com/products/petrel'
-    'ShipConstructor'     = 'https://www.ssi-corporate.com/'
-    'Maxsurf'             = 'https://www.bentley.com/software/maxsurf/'
-    'NAPA'                = 'https://www.napa.fi/'
-    'MOSES'               = 'https://www.bentley.com/software/moses/'
-    'AutoSPRINK'          = 'https://www.autosprink.com/'
-    'HydraCALC'           = 'https://www.hydratec.com/'
-    'PyroSim'             = 'https://www.thunderheadeng.com/pyrosim/'
-    'Pathfinder'          = 'https://www.thunderheadeng.com/pathfinder/'
-    'FDS'                 = 'https://pages.nist.gov/fds-smv/downloads.html'
-    'CONTAM'              = 'https://www.nist.gov/services-resources/software/contam'
-    'Carrier HAP'         = 'https://www.carrier.com/commercial/en/us/software/hvac-system-design/'
-    'TRACE 3D Plus'       = 'https://www.trane.com/commercial/north-america/us/en/products-systems/design-and-analysis-tools/trace-3d-plus.html'
-    'EnergyPlus'          = 'https://energyplus.net/downloads'
-    'OpenStudio'          = 'https://openstudio.net/downloads'
-    'IES VE'              = 'https://www.iesve.com/'
-    'DesignBuilder'       = 'https://designbuilder.co.uk/'
-    'DIALux evo'          = 'https://www.dialux.com/en-GB/download'
-    'AGi32'               = 'https://lightinganalysts.com/software-products/agi32/'
-    'MCNP'                = 'https://mcnp.lanl.gov/'
-    'SCALE'               = 'https://www.ornl.gov/scale'
-    'RELAP5'              = 'https://www.nrc.gov/about-nrc/regulatory/research/safetycodes.html'
-    'OpenMC'              = 'https://docs.openmc.org/'
-    'Mimics Innovation Suite' = 'https://www.materialise.com/en/medical/mimics-innovation-suite'
-    'Simpleware'          = 'https://www.synopsys.com/simpleware.html'
-    'PVsyst'              = 'https://www.pvsyst.com/'
-    'HOMER Pro'           = 'https://www.homerenergy.com/products/pro/'
-    'SAM'                 = 'https://sam.nrel.gov/download'
-    'RETScreen Expert'    = 'https://www.nrcan.gc.ca/maps-tools-and-publications/tools/modelling-tools/retscreen/7465'
-    'WindPRO'             = 'https://www.emdt.co.uk/product/windpro'
-    'WAsP'                = 'https://www.wasp.dk/'
-    'Wolfram Mathematica' = 'https://www.wolfram.com/mathematica/'
-    'Maple'               = 'https://www.maplesoft.com/products/Maple/'
-    'Mathcad Prime'       = 'https://www.ptc.com/en/products/mathcad'
-    'OriginPro'           = 'https://www.originlab.com/'
-    'GNU Radio'           = 'https://wiki.gnuradio.org/index.php/InstallingGR'
-    'Mastercam'           = 'https://www.mastercam.com/'
-    'SolidCAM'            = 'https://www.solidcam.com/'
-    'VERICUT'             = 'https://www.cgtech.com/'
-    'ESPRIT'              = 'https://www.espritcam.com/'
-    'PC-DMIS'             = 'https://www.hexagonmi.com/products/software/pc-dmis'
-    'PolyWorks'           = 'https://www.innovmetric.com/'
-    'Microsoft Project'   = 'https://www.microsoft.com/en-us/microsoft-365/project/project-management-software'
-    'Primavera P6'        = 'https://www.oracle.com/industries/construction-engineering/primavera-p6/'
-    'Procore'             = 'https://www.procore.com/'
-    'Oracle Aconex'       = 'https://www.oracle.com/construction-engineering/aconex/'
-    'CostX'               = 'https://www.exactal.com/'
-    'PlanSwift'           = 'https://www.planswift.com/'
-    'IBM Engineering DOORS' = 'https://www.ibm.com/products/requirements-management-doors'
-    'Capella'             = 'https://www.eclipse.org/capella/'
-    'Enterprise Architect'= 'https://sparxsystems.com/products/ea/'
-}
-
-function Test-WingetAvailable { [bool](Get-Command winget -ErrorAction SilentlyContinue) }
-
-function Get-InstallTag {
-    param([string]$Name)
-    if ($Script:WingetMap.ContainsKey($Name))  { return 'winget' }
-    if ($Script:ManualUrls.ContainsKey($Name)) { return 'manual' }
-    return 'skip'
-}
-
-function Install-OneProduct {
-    param(
-        [string]$Name,
-        [bool]$HasWinget,
-        [switch]$NonInteractive
-    )
-
-    $tag = Get-InstallTag -Name $Name
-
-    if ($tag -eq 'winget' -and $HasWinget) {
-        $id = $Script:WingetMap[$Name]
-        Write-Host "  [INSTALL] $Name  via  winget  ($id)" -ForegroundColor Cyan
-        try {
-            & winget install --id $id --exact `
-                --accept-package-agreements --accept-source-agreements `
-                --silent --disable-interactivity
-            $code = $LASTEXITCODE
-            if ($null -eq $code -or $code -eq 0) {
-                Write-Host "  [ OK ]  $Name installed." -ForegroundColor Green
-                return 'installed'
-            } else {
-                Write-Host "  [FAIL]  $Name - winget exit code $code" -ForegroundColor Red
-                Add-Diagnostic 'Install' "$Name winget failed with exit code $code"
-                return 'failed'
-            }
-        } catch {
-            Write-Host "  [FAIL]  $Name - $_" -ForegroundColor Red
-            Add-Diagnostic 'Install' "$Name threw: $_"
-            return 'failed'
-        }
-    }
-
-    if ($tag -eq 'winget' -and -not $HasWinget) {
-        Write-Host "  [SKIP]  $Name - winget not available on this machine." -ForegroundColor Yellow
-        return 'skipped'
-    }
-
-    if ($tag -eq 'manual') {
-        $url = $Script:ManualUrls[$Name]
-        Write-Host "  [MANUAL] $Name - no winget entry, opening vendor page." -ForegroundColor Yellow
-        Write-Host "           $url" -ForegroundColor DarkGray
-        if (-not $NonInteractive) {
-            $open = Read-Host "  Open the download page now? (Y/N)"
-            if ($open -match '^[Yy]') {
-                try { Start-Process $url } catch {
-                    Write-Host "  [FAIL] Could not open browser: $_" -ForegroundColor Red
-                }
-            }
-        }
-        return 'manual'
-    }
-
-    Write-Host "  [SKIP]  $Name - not installable automatically (no winget ID, no download URL)." -ForegroundColor DarkGray
-    return 'skipped'
-}
-
-function Show-DisciplineInstaller {
-    param([bool]$HasWinget)
-
-    $byDisc = @{}
-    foreach ($e in $Script:RawCatalog) {
-        foreach ($d in $e.D) {
-            if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
-            $byDisc[$d] += $e
-        }
-    }
-
-    $disc = @($byDisc.Keys | Sort-Object)
-    if ($disc.Count -eq 0) {
-        Write-Host "  No disciplines available." -ForegroundColor Yellow
-        return
-    }
-
-    Write-Host ""
-    Write-Host "  Choose a discipline:" -ForegroundColor Cyan
-    for ($i = 0; $i -lt $disc.Count; $i++) {
-        $d = $disc[$i]
-        $products = @($byDisc[$d] | Sort-Object N -Unique)
-        $auto = @($products | Where-Object { (Get-InstallTag -Name $_.N) -eq 'winget' }).Count
-        $man  = @($products | Where-Object { (Get-InstallTag -Name $_.N) -eq 'manual' }).Count
-        Write-Host ("    {0,2}. {1,-22}  {2} product(s)  ({3} winget, {4} manual)" -f `
-                    ($i+1), $d, $products.Count, $auto, $man)
-    }
-    Write-Host "     0. Cancel"
-
-    $sel = Read-Host "`n  Number"
-    if (-not $sel -or $sel -eq '0') { return }
-    $idx = 0
-    if (-not [int]::TryParse($sel, [ref]$idx) -or $idx -lt 1 -or $idx -gt $disc.Count) {
-        Write-Host "  Invalid selection." -ForegroundColor Red
-        return
-    }
-
-    $pickedDisc = $disc[$idx-1]
-    $products   = @($byDisc[$pickedDisc] | Sort-Object N -Unique)
-
-    Write-Host ""
-    Write-Host "  Products in $pickedDisc  ($($products.Count) total):" -ForegroundColor Cyan
-    Write-Host "    Tags: [winget] = auto-install  [manual] = opens download page  [skip] = not installable" -ForegroundColor DarkGray
-    Write-Host ""
-    for ($i = 0; $i -lt $products.Count; $i++) {
-        $p   = $products[$i]
-        $tag = Get-InstallTag -Name $p.N
-        $tagStr = "[$tag]".PadRight(9)
-        $col = switch ($tag) {
-            'winget' { 'Green' }
-            'manual' { 'Yellow' }
-            default  { 'DarkGray' }
-        }
-        Write-Host ("    {0,2}. " -f ($i+1)) -NoNewline
-        Write-Host $tagStr -ForegroundColor $col -NoNewline
-        Write-Host $p.N
-    }
-
-    Write-Host ""
-    Write-Host "  Enter numbers separated by commas (e.g. 1,3,5) or 'all':"
-    $pick = Read-Host "  Selection"
-
-    $indices = @()
-    if ($pick -match '^all$') {
-        $indices = 1..$products.Count
-    } else {
-        foreach ($tok in ($pick -split ',')) {
-            $n = 0
-            if ([int]::TryParse($tok.Trim(), [ref]$n) -and $n -ge 1 -and $n -le $products.Count) {
-                $indices += $n
-            }
-        }
-    }
-    if ($indices.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; return }
-
-    Write-Host ""
-    Write-Host "  Install plan:" -ForegroundColor Cyan
-    foreach ($i in $indices) {
-        $p = $products[$i-1]
-        $tag = Get-InstallTag -Name $p.N
-        Write-Host ("    - {0,-32} [{1}]" -f $p.N, $tag)
-    }
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
-
-    $ok = 0; $fail = 0; $manual = 0; $skipped = 0
-    foreach ($i in $indices) {
-        $p = $products[$i-1]
-        $res = Install-OneProduct -Name $p.N -HasWinget $HasWinget
-        switch ($res) {
-            'installed' { $ok++ }
-            'failed'    { $fail++ }
-            'manual'    { $manual++ }
-            'skipped'   { $skipped++ }
-        }
-    }
-
-    Write-Host ""
-    Write-Host ("  Summary: {0} installed, {1} failed, {2} manual download, {3} skipped." -f `
-                $ok, $fail, $manual, $skipped) -ForegroundColor Cyan
-}
-
-function Invoke-Installer {
-    param(
-        [string[]]$Disciplines = @(),
-        [string[]]$InstallList = @()
-    )
-
-    Write-Host ""
-    Write-Host ("=" * 78) -ForegroundColor DarkCyan
-    Write-Host "  SIGMA SOFTWARE INSTALLER" -ForegroundColor Cyan
-    Write-Host ("=" * 78) -ForegroundColor DarkCyan
-    Write-Host ""
-    Write-Host ("  Catalog products: {0}" -f $Script:CatalogCount) -ForegroundColor DarkGray
-
-    $hasWinget = Test-WingetAvailable
-    Write-Host ("  winget          : {0}" -f $(if ($hasWinget) { 'available' } else { 'not found' })) `
-        -ForegroundColor $(if ($hasWinget) { 'Green' } else { 'Yellow' })
-
-    if (-not $hasWinget) {
-        Write-Host ""
-        Write-Host "  [WARN] winget is not available." -ForegroundColor Yellow
-        Write-Host "  [INFO] Install 'App Installer' from the Microsoft Store to enable silent installs." -ForegroundColor Yellow
-        Write-Host "  [INFO] Manual download pages will still be offered." -ForegroundColor Yellow
-    }
-
-    if ($InstallList.Count -gt 0) {
-        Write-Host ""
-        Write-Host "  Batch mode: $($InstallList -join ', ')" -ForegroundColor Cyan
-        $ok = 0; $fail = 0; $manual = 0; $skipped = 0
-        foreach ($name in $InstallList) {
-            $entry = $Script:RawCatalog | Where-Object {
-                $_.N -eq $name -or $_.N -like "*$name*"
-            } | Select-Object -First 1
-
-            if (-not $entry) {
-                Write-Host "  [SKIP] Unknown product: $name" -ForegroundColor Yellow
-                $skipped++
-                continue
-            }
-            $res = Install-OneProduct -Name $entry.N -HasWinget $hasWinget -NonInteractive
-            switch ($res) {
-                'installed' { $ok++ }
-                'failed'    { $fail++ }
-                'manual'    { $manual++ }
-                'skipped'   { $skipped++ }
-            }
-        }
-        Write-Host ""
-        Write-Host ("  Batch summary: {0} installed, {1} failed, {2} manual, {3} skipped." -f `
-                    $ok, $fail, $manual, $skipped) -ForegroundColor Cyan
-        return
-    }
-
-    while ($true) {
-        Show-DisciplineInstaller -HasWinget $hasWinget
-        Write-Host ""
-        $again = Read-Host "  Install something else? (Y/N)"
-        if ($again -notmatch '^[Yy]') { break }
-    }
-}
-
-if ($Install) {
-    Invoke-Installer -Disciplines $Disciplines -InstallList $InstallList
-    exit 0
-}
-
-# =============================================================================
-# 6. PER-PRODUCT CHECKS
-# =============================================================================
-function Get-ProductStatus {
-    param(
-        [object]$Entry,
-        [array]$Installed,
-        [pscustomobject]$System,
-        [string]$NetFx,
-        [array]$VC,
-        [string[]]$ActiveDisciplines,
-        [switch]$DeepScan
-    )
-
-    $status = [ordered]@{
-        Name        = $Entry.N
-        Disciplines = ($Entry.D -join ', ')
-        Kind        = $Entry.K
-        Installed   = $false
-        IsSynthetic = $false
-        Version     = ''
-        Match       = ''
-        State       = 'NotInstalled'
-        Severity    = 'info'
-        Findings    = (New-Object System.Collections.Generic.List[object])
-        Notes       = @()
-        CacheGB     = 0
-    }
-
-    if ($ActiveDisciplines.Count -gt 0) {
-        $overlap = $false
-        foreach ($d in $Entry.D) {
-            if ($ActiveDisciplines -contains $d) { $overlap = $true; break }
-        }
-        if (-not $overlap) {
-            $status.State = 'NotApplicable'
-            return [pscustomobject]$status
-        }
-    }
-
-    $hits = @()
-    foreach ($pat in @($Entry.P)) {
-        $hits += $Installed | Where-Object { $_.DisplayName -like $pat }
-    }
-    $hits = @($hits | Sort-Object DisplayName -Unique)
-
-    if ($hits.Count -eq 0) {
-        $status.State = 'NotInstalled'
-        return [pscustomobject]$status
-    }
-
-    $status.Installed = $true
-    $status.Version   = (($hits | ForEach-Object { $_.DisplayVersion } |
-                          Where-Object { $_ } | Sort-Object -Unique) -join ', ')
-    $status.Match     = ($hits.DisplayName -join ' | ')
-
-    $minRam = 0
-    if ($Entry.MinRAM) { $minRam = [int]$Entry.MinRAM }
-    elseif ($Entry.RAM) { $minRam = [int][math]::Ceiling($Entry.RAM * 0.5) }
-
-    if ($Entry.RAM -and $System.RAM_GB -lt $Entry.RAM) {
-        $sev = if ($minRam -gt 0 -and $System.RAM_GB -lt $minRam) { 'critical' } else { 'warn' }
-        $why = if ($sev -eq 'critical') {
-            "Large models may fail to open or the solver may crash mid-run."
-        } else {
-            "Large models may spill to the pagefile, causing noticeably slower performance."
-        }
-        $rec = if ($sev -eq 'critical') {
-            "Upgrade RAM before attempting large models. Close memory-heavy applications now."
-        } else {
-            "Close memory-heavy applications before running large models."
-        }
-        $status.Findings.Add((New-Finding `
-            -Id "$($Entry.N).RAM_LOW" `
-            -Software $Entry.N `
-            -Problem "$($Entry.N) may experience slow performance or instability." `
-            -Detected "$($System.RAM_GB) GB installed; $($Entry.RAM) GB recommended (min $minRam GB)." `
-            -WhyItMatters $why `
-            -Recommendation $rec `
-            -Optional "Consider upgrading to $($Entry.RAM) GB or more for large workloads." `
-            -Severity $sev))
-    }
-
-    if ($Entry.Disk) {
-        $sysd = $System.Disks | Where-Object Drive -eq "$($env:SystemDrive)"
-        if ($sysd -and $sysd.FreeGB -lt $Entry.Disk) {
-            $sev = if ($sysd.FreeGB -lt 5) { 'critical' } else { 'warn' }
-            $status.Findings.Add((New-Finding `
-                -Id "$($Entry.N).DISK_LOW" `
-                -Software $Entry.N `
-                -Problem "$($Entry.N) scratch disk is running low." `
-                -Detected "$($sysd.FreeGB) GB free on $($sysd.Drive); $($Entry.Disk) GB recommended." `
-                -WhyItMatters "Solvers, caches, and autosaves write to this disk. Running out can abort jobs." `
-                -Recommendation "Free space on $($sysd.Drive) or redirect scratch to another volume." `
-                -Severity $sev))
-        }
-    }
-
-    if ($Entry.GPU) {
-        $hasDedicated = $false
-        foreach ($g in $System.GPUs) {
-            if ($g.VRAM_GB -and $g.VRAM_GB -ge 2) { $hasDedicated = $true }
-        }
-        if (-not $hasDedicated) {
-            $status.Findings.Add((New-Finding `
-                -Id "$($Entry.N).GPU_LOW" `
-                -Software $Entry.N `
-                -Problem "$($Entry.N) prefers a dedicated GPU." `
-                -Detected "No dedicated GPU with 2 GB or more VRAM detected." `
-                -WhyItMatters "3D views, rendering, and GPU-accelerated solvers will be slow." `
-                -Recommendation "Install a dedicated GPU (NVIDIA RTX / AMD Radeon Pro class)." `
-                -Severity 'warn'))
-        }
-    }
-
-    if ($Entry.Net) {
-        if (-not (Compare-NetVersion -Have $NetFx -Need $Entry.Net)) {
-            $status.Findings.Add((New-Finding `
-                -Id "$($Entry.N).DOTNET" `
-                -Software $Entry.N `
-                -Problem "$($Entry.N) may not start." `
-                -Detected ".NET Framework $NetFx installed; $($Entry.Net) required." `
-                -WhyItMatters "Missing framework versions cause startup errors and missing features." `
-                -Recommendation "Install .NET Framework $($Entry.Net) or newer from Microsoft." `
-                -Severity 'critical'))
-        }
-    }
-
-    if ($Entry.VCPP -and (-not $VC -or $VC.Count -eq 0)) {
-        $status.Findings.Add((New-Finding `
-            -Id "$($Entry.N).VCPP" `
-            -Software $Entry.N `
-            -Problem "$($Entry.N) may fail to launch." `
-            -Detected "No Microsoft Visual C++ Redistributable detected." `
-            -WhyItMatters "Most engineering applications depend on the VC++ runtime." `
-            -Recommendation "Install the Microsoft Visual C++ Redistributable (2015-2022, x64)." `
-            -Severity 'critical'))
-    }
-
-    if ($Entry.Lsvc) {
-        $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object {
-            $n = $_.Name + ' ' + $_.DisplayName
-            foreach ($pat in $Entry.Lsvc) { if ($n -like $pat) { return $true } }
-            return $false
-        })
-        if ($svc.Count -gt 0) {
-            $running = @($svc | Where-Object Status -eq 'Running').Count
-            if ($running -eq 0) {
-                $status.Findings.Add((New-Finding `
-                    -Id "$($Entry.N).LICSVC" `
-                    -Software $Entry.N `
-                    -Problem "$($Entry.N) license service is not running." `
-                    -Detected "$($svc.Count) vendor service(s) installed; 0 running." `
-                    -WhyItMatters "The application will fail to acquire a license and may not launch." `
-                    -Recommendation "Start the vendor license service or repair the install." `
-                    -Severity 'critical'))
-            }
-        }
-    }
-
-    if ($Entry.Lport) {
-        $openAny = $false
-        foreach ($p in $Entry.Lport) {
-            if (Test-TcpPort -Port $p -TimeoutMs 800) { $openAny = $true; break }
-        }
-        if (-not $openAny) {
-            $status.Notes += "License ports not open locally ($($Entry.Lport -join ', ')) - normal for node-locked or remote license servers."
-        }
-    }
-
-    if ($System.Power.HasBattery -and -not $System.Power.OnAC) {
-        if ($Entry.RAM -ge 16 -or $Entry.K -match 'FEA|CFD|BIM|Explicit|FEA/CFD') {
-            $status.Findings.Add((New-Finding `
-                -Id "$($Entry.N).POWER" `
-                -Software $Entry.N `
-                -Problem "$($Entry.N) will run slower on battery." `
-                -Detected "Currently on battery at $($System.Power.Percent)% ($($System.Power.StatusText))." `
-                -WhyItMatters "Windows throttles CPU and GPU under battery power, which lengthens solve times significantly." `
-                -Recommendation "Plug in AC power before heavy workloads." `
-                -Severity 'warn'))
-        }
-    }
-
-    if ($DeepScan -and $Entry.Cache) {
-        $total = 0
-        foreach ($c in $Entry.Cache) { $total += (Get-FolderSizeGB -Path (Expand-Env $c)) }
-        $status.CacheGB = [math]::Round($total, 2)
-        if ($total -gt 20) {
-            $recoverable = [math]::Round($total * 0.7, 1)
-            $status.Notes += "Cache is large ($($status.CacheGB) GB)."
-            $status.Findings.Add((New-Finding `
-                -Id "$($Entry.N).CACHE" `
-                -Software $Entry.N `
-                -Problem "$($Entry.N) cache is unusually large." `
-                -Detected "Cache total: $($status.CacheGB) GB across $($Entry.Cache.Count) folder(s)." `
-                -WhyItMatters "Oversized caches slow launches and often indicate leftover project data." `
-                -Recommendation "Review the cache folders while the app is closed." `
-                -Optional "Estimated recoverable space: $recoverable GB." `
-                -Severity 'warn' `
-                -RecoverableGB $recoverable))
-        }
-    }
-
-    $crit = @($status.Findings | Where-Object Severity -eq 'critical').Count
-    $warn = @($status.Findings | Where-Object Severity -eq 'warn').Count
-    if ($crit -gt 0) {
-        $status.State = 'Critical'; $status.Severity = 'critical'
-    } elseif ($warn -gt 0) {
-        $status.State = 'Attention'; $status.Severity = 'warn'
-    } else {
-        $status.State = 'Healthy'; $status.Severity = 'info'
-    }
-
-    return [pscustomobject]$status
-}
-
-Write-Stage "Checking every product in the catalog..."
-$allResults = New-Object System.Collections.Generic.List[object]
-foreach ($entry in $Script:RawCatalog) {
-    $allResults.Add((Get-ProductStatus -Entry $entry -Installed $installed -System $sys `
-                                        -NetFx $netFx -VC $vc -ActiveDisciplines $Disciplines `
-                                        -DeepScan:$DeepScan))
-}
-
-$gCount = @($allResults | Where-Object State -eq 'Healthy').Count
-$yCount = @($allResults | Where-Object State -eq 'Attention').Count
-$rCount = @($allResults | Where-Object State -eq 'Critical').Count
-$nCount = @($allResults | Where-Object State -eq 'NotInstalled').Count
-$aCount = @($allResults | Where-Object State -eq 'NotApplicable').Count
-Write-Host " $gCount healthy / $yCount attention / $rCount critical / $nCount not installed / $aCount not applicable." -ForegroundColor Green
-
-# =============================================================================
-# 6b. ONLINE ENRICHMENT
+# ONLINE CACHE / FETCH
 # =============================================================================
 $Script:OnlineCache     = @{}
 $Script:OnlineCachePath = Join-Path $env:TEMP 'sigma_online_cache.json'
@@ -2138,27 +1930,17 @@ $Script:OnlineEnabled   = -not $Offline
 try {
     if (Test-Path $Script:OnlineCachePath) {
         $cached = Get-Content $Script:OnlineCachePath -Raw | ConvertFrom-Json
-        foreach ($p in $cached.PSObject.Properties) {
-            $Script:OnlineCache[$p.Name] = $p.Value
-        }
+        foreach ($p in $cached.PSObject.Properties) { $Script:OnlineCache[$p.Name] = $p.Value }
     }
 } catch { }
 
 function Save-OnlineCache {
-    try {
-        $Script:OnlineCache | ConvertTo-Json -Depth 6 |
-            Set-Content $Script:OnlineCachePath -Encoding UTF8
-    } catch { }
+    try { $Script:OnlineCache | ConvertTo-Json -Depth 6 | Set-Content $Script:OnlineCachePath -Encoding UTF8 } catch { }
 }
 
 function Get-Cached {
-    param(
-        [string]$Key,
-        [scriptblock]$Fetch,
-        [int]$TtlHours = 24
-    )
+    param([string]$Key, [scriptblock]$Fetch, [int]$TtlHours = 24)
     if (-not $Script:OnlineEnabled) { return $null }
-
     if ($Script:OnlineCache.ContainsKey($Key)) {
         $e = $Script:OnlineCache[$Key]
         try {
@@ -2166,10 +1948,8 @@ function Get-Cached {
             if ($age -lt $TtlHours) { return $e.Value }
         } catch { }
     }
-
     $val = $null
     try { $val = & $Fetch } catch { Add-Diagnostic 'Online' "Fetch failed for ${Key}: $_" }
-
     $Script:OnlineCache[$Key] = @{ Value = $val; Fetched = (Get-Date).ToString('s') }
     Save-OnlineCache
     return $val
@@ -2178,43 +1958,27 @@ function Get-Cached {
 function Invoke-SafeWebRequest {
     param([string]$Url, [int]$TimeoutSec = 8, [hashtable]$Headers = @{})
     if (-not $Headers.ContainsKey('User-Agent')) {
-        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.6'
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.7'
     }
-    try {
-        return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing `
-                                 -Headers $Headers -ErrorAction Stop
-    } catch {
-        Add-Diagnostic 'Online' "GET $Url failed: $_"
-        return $null
-    }
+    try { return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -Headers $Headers -ErrorAction Stop }
+    catch { Add-Diagnostic 'Online' "GET $Url failed: $_"; return $null }
 }
 
 function Get-CpuPassMarkScore {
     param([string]$CpuName)
     if (-not $CpuName) { return $null }
-
-    $clean = $CpuName -replace '\(R\)','' -replace '\(TM\)','' `
-                      -replace '\s+CPU\s+@.*$','' `
-                      -replace '\s+Processor.*$','' `
-                      -replace '\s+\d+-Core.*$','' `
-                      -replace '\s+@.*$','' `
-                      -replace '\s+',' '
+    $clean = $CpuName -replace '\(R\)','' -replace '\(TM\)','' -replace '\s+CPU\s+@.*$','' `
+                      -replace '\s+Processor.*$','' -replace '\s+\d+-Core.*$','' -replace '\s+@.*$','' -replace '\s+',' '
     $clean = $clean.Trim()
-    $key   = "cpu_passmark_v2_$clean"
-
+    $key = "cpu_passmark_v2_$clean"
     Get-Cached -Key $key -TtlHours 168 -Fetch {
         $q = [uri]::EscapeDataString($clean)
         $r = Invoke-SafeWebRequest -Url "https://www.cpubenchmark.net/cpu.php?cpu=$q"
         if ($r) {
             $html = $r.Content
-            if ($html -match 'id="mark-neww"[^>]*>\s*([\d,]+)')             { return [int]($matches[1] -replace ',','') }
-            if ($html -match 'class="[^"]*mark-neww[^"]*"[^>]*>\s*([\d,]+)'){ return [int]($matches[1] -replace ',','') }
-            if ($html -match 'CPU Mark[^<]*<[^>]*>\s*([\d,]+)')              { return [int]($matches[1] -replace ',','') }
-            if ($html -match 'class="[^"]*mark[^"]*"[^>]*>\s*([\d,]+)')      { return [int]($matches[1] -replace ',','') }
-        }
-        $r2 = Invoke-SafeWebRequest -Url "https://www.cpubenchmark.net/cpu_lookup.php?cpu=$q"
-        if ($r2 -and $r2.Content -match '(\d{4,6})\s*<[^>]*>\s*CPU Mark') {
-            return [int]$matches[1]
+            if ($html -match 'id="mark-neww"[^>]*>\s*([\d,]+)')              { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'class="[^"]*mark-neww[^"]*"[^>]*>\s*([\d,]+)') { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'CPU Mark[^<]*<[^>]*>\s*([\d,]+)')               { return [int]($matches[1] -replace ',','') }
         }
         return $null
     }
@@ -2223,103 +1987,83 @@ function Get-CpuPassMarkScore {
 function Get-GpuPassMarkScore {
     param([string]$GpuName)
     if (-not $GpuName) { return $null }
-
-    $clean = $GpuName -replace '^NVIDIA\s+','' -replace '^AMD\s+','' -replace '^Intel\s+',''
-    $clean = $clean.Trim()
-    $key   = "gpu_passmark_v2_$clean"
-
+    $clean = ($GpuName -replace '^NVIDIA\s+','' -replace '^AMD\s+','' -replace '^Intel\s+','').Trim()
+    $key = "gpu_passmark_v2_$clean"
     Get-Cached -Key $key -TtlHours 168 -Fetch {
         $q = [uri]::EscapeDataString($clean)
         $r = Invoke-SafeWebRequest -Url "https://www.videocardbenchmark.net/gpu.php?gpu=$q"
         if ($r) {
             $html = $r.Content
-            if ($html -match 'id="mark-neww"[^>]*>\s*([\d,]+)')             { return [int]($matches[1] -replace ',','') }
-            if ($html -match 'class="[^"]*mark-neww[^"]*"[^>]*>\s*([\d,]+)'){ return [int]($matches[1] -replace ',','') }
-            if ($html -match 'G3D Mark[^<]*<[^>]*>\s*([\d,]+)')              { return [int]($matches[1] -replace ',','') }
-            if ($html -match 'class="[^"]*mark[^"]*"[^>]*>\s*([\d,]+)')      { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'id="mark-neww"[^>]*>\s*([\d,]+)')              { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'G3D Mark[^<]*<[^>]*>\s*([\d,]+)')               { return [int]($matches[1] -replace ',','') }
         }
         return $null
     }
 }
 
-function Get-NvidiaLatestDriver {
-    param([string]$GpuName)
-    $key = 'nvidia_latest_v3'
-    Get-Cached -Key $key -TtlHours 24 -Fetch {
-        $patterns = @(
-            '\b(5[0-9]{2}\.\d{2})\b',
-            '\b(3[0-9]\.0\.\d{2}\.\d{4})\b'
-        )
-        $sources = @(
-            'https://www.nvidia.com/en-us/geforce/drivers/',
-            'https://www.techpowerup.com/download/nvidia-geforce-graphics-drivers/'
-        )
-        foreach ($url in $sources) {
-            try {
-                $r = Invoke-SafeWebRequest -Url $url -TimeoutSec 10
-                if (-not $r) { continue }
-                foreach ($p in $patterns) {
-                    if ($r.Content -match $p) { return $matches[1] }
+function Get-LatestComponentVersion {
+    param([string]$Component)
+    $key = "latest_comp_v1_$Component"
+    Get-Cached -Key $key -TtlHours 168 -Fetch {
+        switch ($Component) {
+            '.NET Framework' {
+                $r = Invoke-SafeWebRequest -Url 'https://dotnet.microsoft.com/en-us/download/dotnet-framework'
+                if ($r -and $r.Content -match '\.NET Framework (\d+\.\d+(?:\.\d+)?)') { return $matches[1] }
+            }
+            '.NET Desktop Runtime' {
+                $r = Invoke-SafeWebRequest -Url 'https://dotnet.microsoft.com/en-us/download/dotnet'
+                if ($r -and $r.Content -match '\.NET (\d+\.\d+)') { return $matches[1] }
+            }
+            'VC++ Redistributable' {
+                $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist'
+                if ($r) {
+                    $all = [regex]::Matches($r.Content, 'v14\.(\d+)\.(\d+)\.(\d+)') |
+                           ForEach-Object { "14.$($_.Groups[1].Value).$($_.Groups[2].Value).$($_.Groups[3].Value)" }
+                    if ($all) { return ($all | Sort-Object { [version]$_ } | Select-Object -Last 1) }
                 }
-            } catch { }
+            }
+            'Java JRE' {
+                $r = Invoke-SafeWebRequest -Url 'https://www.oracle.com/java/technologies/downloads/'
+                if ($r -and $r.Content -match 'Java (\d+)') { return $matches[1] }
+            }
+            'Java JDK' {
+                $r = Invoke-SafeWebRequest -Url 'https://www.oracle.com/java/technologies/downloads/'
+                if ($r -and $r.Content -match 'Java (\d+)') { return $matches[1] }
+            }
+            'Python' {
+                $r = Invoke-SafeWebRequest -Url 'https://www.python.org/downloads/'
+                if ($r -and $r.Content -match 'Python (\d+\.\d+\.\d+)') { return $matches[1] }
+            }
+            'NVIDIA Driver' {
+                try {
+                    $r = Invoke-SafeWebRequest -Url 'https://www.nvidia.com/en-us/geforce/drivers/' -TimeoutSec 10
+                    if ($r -and $r.Content -match '\b(5[0-9]{2}\.\d{2})\b') { return $matches[1] }
+                } catch { }
+            }
+            'AMD Driver' {
+                try {
+                    $r = Invoke-SafeWebRequest -Url 'https://www.amd.com/en/support/rss' -TimeoutSec 8
+                    if ($r -and $r.Content -match 'Adrenalin[^\d]*(\d+\.\d+\.\d+)') { return $matches[1] }
+                } catch { }
+            }
         }
-        return $null
-    }
-}
-
-function Get-AmdLatestDriver {
-    param([string]$GpuName)
-    if ($GpuName -notmatch 'Radeon|AMD') { return $null }
-
-    $key = 'amd_latest_driver'
-    Get-Cached -Key $key -TtlHours 24 -Fetch {
-        try {
-            $r = Invoke-SafeWebRequest -Url 'https://www.amd.com/en/support/rss' -TimeoutSec 8
-            if ($r -and $r.Content -match 'Adrenalin[^\d]*(\d+\.\d+\.\d+)') {
-                return $matches[1]
-            }
-        } catch { }
-        return $null
-    }
-}
-
-function Get-IntelLatestGraphicsDriver {
-    param([string]$GpuName)
-    if ($GpuName -notmatch 'Intel') { return $null }
-
-    $key = 'intel_latest_graphics'
-    Get-Cached -Key $key -TtlHours 24 -Fetch {
-        try {
-            $r = Invoke-SafeWebRequest -Url 'https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html' -TimeoutSec 10
-            if ($r -and $r.Content -match '(\d+\.\d+\.\d+\.\d+)') {
-                return $matches[1]
-            }
-        } catch { }
         return $null
     }
 }
 
 function Get-WingetUpgradeable {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return @() }
-
     $key = 'winget_upgradeable_v2'
     Get-Cached -Key $key -TtlHours 6 -Fetch {
         try {
-            $raw = & winget upgrade --include-unknown `
-                    --accept-source-agreements --disable-interactivity 2>$null | Out-String
-
+            $raw = & winget upgrade --include-unknown --accept-source-agreements --disable-interactivity 2>$null | Out-String
             $list = @()
             $lines = $raw -split "`r?`n"
-
             $headerIdx = -1
             for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($lines[$i] -match '^\s*Name\s+Id\s+Version\s+Available\s+Source\s*$') {
-                    $headerIdx = $i
-                    break
-                }
+                if ($lines[$i] -match '^\s*Name\s+Id\s+Version\s+Available\s+Source\s*$') { $headerIdx = $i; break }
             }
             if ($headerIdx -lt 0) { return @() }
-
             $dataLines = @()
             for ($i = $headerIdx + 1; $i -lt $lines.Count; $i++) {
                 $line = $lines[$i]
@@ -2328,39 +2072,23 @@ function Get-WingetUpgradeable {
                 if (-not $line.Trim()) { continue }
                 $dataLines += $line
             }
-
             $headerLine = $lines[$headerIdx]
             $colStarts = @()
-            foreach ($m in [regex]::Matches($headerLine, '\S+')) {
-                $colStarts += $m.Index
-            }
+            foreach ($m in [regex]::Matches($headerLine, '\S+')) { $colStarts += $m.Index }
             if ($colStarts.Count -lt 5) { return @() }
-
             foreach ($dl in $dataLines) {
-                if ($dl.Length -lt $colStarts[-1] + 1) {
-                    $dl = $dl.PadRight($colStarts[-1] + 40)
-                }
+                if ($dl.Length -lt $colStarts[-1] + 1) { $dl = $dl.PadRight($colStarts[-1] + 40) }
                 $name      = $dl.Substring($colStarts[0], $colStarts[1] - $colStarts[0]).Trim()
                 $id        = $dl.Substring($colStarts[1], $colStarts[2] - $colStarts[1]).Trim()
                 $installed = $dl.Substring($colStarts[2], $colStarts[3] - $colStarts[2]).Trim()
                 $available = $dl.Substring($colStarts[3], $colStarts[4] - $colStarts[3]).Trim()
                 $source    = $dl.Substring($colStarts[4]).Trim()
-
                 if ($name -and $id) {
-                    $list += [pscustomobject]@{
-                        Name      = $name
-                        Id        = $id
-                        Installed = $installed
-                        Available = $available
-                        Source    = $source
-                    }
+                    $list += [pscustomobject]@{ Name = $name; Id = $id; Installed = $installed; Available = $available; Source = $source }
                 }
             }
             return $list
-        } catch {
-            Add-Diagnostic 'winget' "upgrade query failed: $_"
-            return @()
-        }
+        } catch { return @() }
     }
 }
 
@@ -2369,10 +2097,8 @@ function Get-DiskMediaTypes {
         $out = @()
         Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
             $out += [pscustomobject]@{
-                FriendlyName = $_.FriendlyName
-                MediaType    = $_.MediaType
-                BusType      = $_.BusType
-                SizeGB       = [math]::Round($_.Size / 1GB, 1)
+                FriendlyName = $_.FriendlyName; MediaType = $_.MediaType
+                BusType = $_.BusType; SizeGB = [math]::Round($_.Size / 1GB, 1)
             }
         }
         return $out
@@ -2385,171 +2111,12 @@ function Get-RamDetail {
         if ($mods.Count -eq 0) { return $null }
         $speedMhz = ($mods | Measure-Object -Property Speed -Average).Average
         $typeCode = ($mods | Select-Object -First 1).SMBIOSMemoryType
-        $type = switch ($typeCode) {
-            26 { 'DDR4' }
-            34 { 'DDR5' }
-            24 { 'DDR3' }
-            21 { 'DDR2' }
-            default { "Unknown ($typeCode)" }
-        }
+        $type = switch ($typeCode) { 26 { 'DDR4' } 34 { 'DDR5' } 24 { 'DDR3' } 21 { 'DDR2' } default { "Unknown ($typeCode)" } }
         return [pscustomobject]@{
-            Modules  = $mods.Count
-            SpeedMHz = [int]$speedMhz
-            Type     = $type
-            TotalGB  = [math]::Round((($mods | Measure-Object -Property Capacity -Sum).Sum) / 1GB, 1)
+            Modules = $mods.Count; SpeedMHz = [int]$speedMhz; Type = $type
+            TotalGB = [math]::Round((($mods | Measure-Object -Property Capacity -Sum).Sum) / 1GB, 1)
         }
     } catch { return $null }
-}
-
-function Invoke-OnlineEnrichment {
-    param([pscustomobject]$System)
-
-    $enrich = [ordered]@{
-        CpuScore        = $null
-        GpuScores       = @()
-        LatestNvidia    = $null
-        LatestAmd       = $null
-        LatestIntelGpu  = $null
-        Upgradeable     = @()
-        DiskMediaTypes  = @()
-        Ram             = $null
-        EnrichedAt      = (Get-Date).ToString('s')
-        OnlineAvailable = $true
-    }
-
-    if (-not $Script:OnlineEnabled) {
-        $enrich.OnlineAvailable = $false
-        $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
-        $enrich.Ram            = Get-RamDetail
-        return [pscustomobject]$enrich
-    }
-
-    Write-Stage "Fetching live online data (PassMark, winget, vendor feeds)..."
-
-    $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
-    $enrich.Ram            = Get-RamDetail
-
-    $enrich.CpuScore = Get-CpuPassMarkScore -CpuName $System.CPU
-
-    foreach ($g in $System.GPUs) {
-        if ($g.Kind -eq 'Integrated') { continue }
-        $score = Get-GpuPassMarkScore -GpuName $g.Name
-        $enrich.GpuScores += [pscustomobject]@{
-            Name  = $g.Name
-            Score = $score
-        }
-    }
-
-    $hasNvidia = @($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' }).Count -gt 0
-    $hasAmd    = @($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' }).Count -gt 0
-    $hasIntel  = @($System.GPUs | Where-Object { $_.Name -match 'Intel' }).Count -gt 0
-    if ($hasNvidia) {
-        $nvName = ($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1).Name
-        $enrich.LatestNvidia = Get-NvidiaLatestDriver -GpuName $nvName
-    }
-    if ($hasAmd) {
-        $amdName = ($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' } | Select-Object -First 1).Name
-        $enrich.LatestAmd = Get-AmdLatestDriver -GpuName $amdName
-    }
-    if ($hasIntel) {
-        $intelName = ($System.GPUs | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1).Name
-        $enrich.LatestIntelGpu = Get-IntelLatestGraphicsDriver -GpuName $intelName
-    }
-
-    $enrich.Upgradeable = @(Get-WingetUpgradeable)
-
-    if (-not $enrich.CpuScore -and $enrich.GpuScores.Count -eq 0 -and $enrich.Upgradeable.Count -eq 0) {
-        $enrich.OnlineAvailable = $false
-    }
-
-    Write-Ok
-    return [pscustomobject]$enrich
-}
-
-# =============================================================================
-# 6c. SYSTEM ONLINE VERIFICATION
-# =============================================================================
-function Get-LatestWindowsBuild {
-    param([string]$CurrentBuild)
-    $key = 'ms_latest_windows_v2'
-    Get-Cached -Key $key -TtlHours 168 -Fetch {
-        try {
-            $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information' -TimeoutSec 10
-            if (-not $r) { return $null }
-            $m = [regex]::Matches($r.Content, '\b(2[0-9]{4})\.(\d{3,5})\b')
-            if ($m.Count -eq 0) { return $null }
-            $versions = @()
-            foreach ($x in $m) {
-                $v = "$($x.Groups[1].Value).$($x.Groups[2].Value)"
-                try { $null = [version]$v; $versions += $v } catch { }
-            }
-            if ($versions.Count -eq 0) { return $null }
-            $parsed = $versions | ForEach-Object {
-                $parts = $_ -split '\.'
-                [pscustomobject]@{ Base = [int]$parts[0]; Rev = [int]$parts[1]; Full = $_ }
-            }
-            if ($CurrentBuild) {
-                $cb = $CurrentBuild -replace '^.*?(\d{5})\.(\d+)$','$1.$2'
-                try {
-                    $cbBase = [int]($cb -split '\.')[0]
-                    $near = $parsed | Where-Object { [math]::Abs($_.Base - $cbBase) -lt 500 }
-                    if ($near) {
-                        return ($near | Sort-Object Base, Rev | Select-Object -Last 1).Full
-                    }
-                } catch { }
-            }
-            return ($parsed | Sort-Object Base, Rev | Select-Object -Last 1).Full
-        } catch { return $null }
-    }
-}
-
-function Get-LatestDotNetFrameworkVersion {
-    $key = 'ms_latest_dotnet_fx'
-    Get-Cached -Key $key -TtlHours 168 -Fetch {
-        try {
-            $r = Invoke-SafeWebRequest -Url 'https://dotnet.microsoft.com/en-us/download/dotnet-framework' -TimeoutSec 10
-            if ($r -and $r.Content -match '\.NET Framework (\d+\.\d+(?:\.\d+)?)') {
-                return $matches[1]
-            }
-        } catch { }
-        return $null
-    }
-}
-
-function Get-LatestVCRedistVersion {
-    $key = 'ms_latest_vcredist_v3'
-    Get-Cached -Key $key -TtlHours 168 -Fetch {
-        try {
-            $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist' -TimeoutSec 10
-            if ($r) {
-                $matches14 = [regex]::Matches($r.Content, 'v14\.(\d+)\.(\d+)\.(\d+)')
-                $cands = @()
-                foreach ($m in $matches14) {
-                    $minor = [int]$m.Groups[1].Value
-                    if ($minor -ge 30) {
-                        $cands += "14.$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value)"
-                    }
-                }
-                if ($cands.Count -gt 0) {
-                    return ($cands | Sort-Object { [version]($_ -replace '[^0-9\.]','') } | Select-Object -Last 1)
-                }
-            }
-        } catch { }
-        return $null
-    }
-}
-
-function Get-LatestDefenderSignature {
-    $key = 'ms_latest_defender'
-    Get-Cached -Key $key -TtlHours 12 -Fetch {
-        try {
-            $r = Invoke-SafeWebRequest -Url 'https://www.microsoft.com/en-us/wdsi/defenderupdates' -TimeoutSec 10
-            if ($r -and $r.Content -match '(\d+\.\d+\.\d+\.\d+)') {
-                return $matches[1]
-            }
-        } catch { }
-        return $null
-    }
 }
 
 function Get-MotherboardInfo {
@@ -2557,38 +2124,12 @@ function Get-MotherboardInfo {
         $bb   = Get-CimInstance Win32_BaseBoard -ErrorAction Stop
         $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
         return [pscustomobject]@{
-            Manufacturer    = $bb.Manufacturer
-            Product         = $bb.Product
-            Version         = $bb.Version
-            SerialNumber    = $bb.SerialNumber
-            BiosVendor      = $bios.Manufacturer
-            BiosVersion     = $bios.SMBIOSBIOSVersion
+            Manufacturer = $bb.Manufacturer; Product = $bb.Product; Version = $bb.Version
+            SerialNumber = $bb.SerialNumber; BiosVendor = $bios.Manufacturer
+            BiosVersion = $bios.SMBIOSBIOSVersion
             BiosReleaseDate = if ($bios.ReleaseDate) { ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } else { '' }
         }
     } catch { return $null }
-}
-
-function Get-LatestBiosVersion {
-    param([pscustomobject]$Board)
-    if (-not $Board -or -not $Board.Manufacturer) { return $null }
-
-    $mfg = $Board.Manufacturer.ToLower()
-    $key = "bios_v2_$($Board.Manufacturer)_$($Board.Product)_$($Board.BiosVersion)"
-
-    Get-Cached -Key $key -TtlHours 168 -Fetch {
-        try {
-            if ($mfg -match 'dell') {
-                $svcTag = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
-                if ($svcTag) {
-                    $r = Invoke-SafeWebRequest -Url "https://www.dell.com/support/home/en-us/product-support/servicetag/$svcTag/drivers" -TimeoutSec 12
-                    if ($r -and $r.Content -match 'BIOS[^<]{0,200}?(\d+\.\d+\.\d+)') {
-                        return $matches[1]
-                    }
-                }
-            }
-            return $null
-        } catch { return $null }
-    }
 }
 
 function Get-RamPartNumbers {
@@ -2597,13 +2138,10 @@ function Get-RamPartNumbers {
         $out = @()
         foreach ($m in $mods) {
             $out += [pscustomobject]@{
-                Manufacturer  = $m.Manufacturer
-                PartNumber    = $m.PartNumber
-                CapacityGB    = [math]::Round($m.Capacity / 1GB, 0)
-                SpeedMHz      = $m.Speed
-                ConfiguredMHz = $m.ConfiguredClockSpeed
-                TypeCode      = $m.SMBIOSMemoryType
-                FormFactor    = $m.FormFactor
+                Manufacturer = $m.Manufacturer; PartNumber = $m.PartNumber
+                CapacityGB = [math]::Round($m.Capacity / 1GB, 0)
+                SpeedMHz = $m.Speed; ConfiguredMHz = $m.ConfiguredClockSpeed
+                TypeCode = $m.SMBIOSMemoryType; FormFactor = $m.FormFactor
             }
         }
         return $out
@@ -2615,19 +2153,14 @@ function Get-AdapterCapabilities {
         $out = @()
         foreach ($n in Get-NetAdapter -Physical -ErrorAction SilentlyContinue) {
             $maxSpeed = $null
-            if ($n.InterfaceDescription -match '2\.5G')       { $maxSpeed = '2.5 Gb' }
-            elseif ($n.InterfaceDescription -match '10G')      { $maxSpeed = '10 Gb' }
+            if ($n.InterfaceDescription -match '2\.5G') { $maxSpeed = '2.5 Gb' }
+            elseif ($n.InterfaceDescription -match '10G') { $maxSpeed = '10 Gb' }
             elseif ($n.InterfaceDescription -match '(\d+)\s*Gb') { $maxSpeed = "$($matches[1]) Gb" }
             elseif ($n.InterfaceDescription -match '(\d+)\s*Mb') { $maxSpeed = "$($matches[1]) Mb" }
-
             $drv = try { (Get-NetAdapter -Name $n.Name -ErrorAction Stop).DriverVersion } catch { '' }
-
             $out += [pscustomobject]@{
-                Name          = $n.Name
-                Description   = $n.InterfaceDescription
-                LinkSpeed     = $n.LinkSpeed
-                MaxSpeed      = $maxSpeed
-                Status        = $n.Status
+                Name = $n.Name; Description = $n.InterfaceDescription
+                LinkSpeed = $n.LinkSpeed; MaxSpeed = $maxSpeed; Status = $n.Status
                 DriverVersion = $drv
             }
         }
@@ -2635,407 +2168,166 @@ function Get-AdapterCapabilities {
     } catch { return @() }
 }
 
-function Invoke-SystemOnlineVerification {
-    param([pscustomobject]$System, [pscustomobject]$Motherboard)
-
-    $v = [ordered]@{
-        LatestWindowsBuild   = $null
-        LatestDotNetFx       = $null
-        LatestVCRedist       = $null
-        LatestDefenderSig    = $null
-        LatestBios           = $null
-        DiskReliability      = @()
-        RamModules           = @()
-        AdapterCapabilities  = @()
-        VerifiedAt           = (Get-Date).ToString('s')
-        Available            = $true
+function Invoke-OnlineEnrichment {
+    param([pscustomobject]$System)
+    $enrich = [ordered]@{
+        CpuScore = $null; GpuScores = @()
+        LatestNvidia = $null; LatestAmd = $null; LatestIntelGpu = $null
+        Upgradeable = @(); DiskMediaTypes = @(); Ram = $null
+        EnrichedAt = (Get-Date).ToString('s'); OnlineAvailable = $true
     }
-
-    if (-not $Script:OnlineEnabled) {
-        $v.DiskReliability     = @(Get-DiskReliability)
-        $v.RamModules          = @(Get-RamPartNumbers)
-        $v.AdapterCapabilities = @(Get-AdapterCapabilities)
-        $v.Available           = $false
-        return [pscustomobject]$v
+    $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
+    $enrich.Ram = Get-RamDetail
+    if (-not $Script:OnlineEnabled) { $enrich.OnlineAvailable = $false; return [pscustomobject]$enrich }
+    Write-Stage "Fetching live online data (PassMark, winget, vendor feeds)..."
+    $enrich.CpuScore = Get-CpuPassMarkScore -CpuName $System.CPU
+    foreach ($g in $System.GPUs) {
+        if ($g.Kind -eq 'Integrated') { continue }
+        $score = Get-GpuPassMarkScore -GpuName $g.Name
+        $enrich.GpuScores += [pscustomobject]@{ Name = $g.Name; Score = $score }
     }
-
-    Write-Stage "Verifying hardware & OS against online sources..."
-
-    $v.LatestWindowsBuild = Get-LatestWindowsBuild -CurrentBuild $System.OSBuild
-    $v.LatestDotNetFx     = Get-LatestDotNetFrameworkVersion
-    $v.LatestVCRedist     = Get-LatestVCRedistVersion
-    $v.LatestDefenderSig  = Get-LatestDefenderSignature
-    if ($Motherboard) {
-        $v.LatestBios = Get-LatestBiosVersion -Board $Motherboard
+    $hasNvidia = @($System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' }).Count -gt 0
+    $hasAmd    = @($System.GPUs | Where-Object { $_.Name -match 'Radeon|AMD' }).Count -gt 0
+    $hasIntel  = @($System.GPUs | Where-Object { $_.Name -match 'Intel' }).Count -gt 0
+    if ($hasNvidia) { $enrich.LatestNvidia = Get-LatestComponentVersion -Component 'NVIDIA Driver' }
+    if ($hasAmd)    { $enrich.LatestAmd = Get-LatestComponentVersion -Component 'AMD Driver' }
+    $enrich.Upgradeable = @(Get-WingetUpgradeable)
+    if (-not $enrich.CpuScore -and $enrich.GpuScores.Count -eq 0 -and $enrich.Upgradeable.Count -eq 0) {
+        $enrich.OnlineAvailable = $false
     }
-
-    $v.DiskReliability     = @(Get-DiskReliability)
-    $v.RamModules          = @(Get-RamPartNumbers)
-    $v.AdapterCapabilities = @(Get-AdapterCapabilities)
-
-    if (-not $v.LatestWindowsBuild -and -not $v.LatestDotNetFx -and -not $v.LatestVCRedist -and -not $v.LatestDefenderSig) {
-        $v.Available = $false
-    }
-
     Write-Ok
-    return [pscustomobject]$v
+    return [pscustomobject]$enrich
 }
 
-# =============================================================================
-# 7. HEALTH SCORE - GPU and Drivers categories removed
-# =============================================================================
-function Get-HealthScore {
-    param(
-        [array]$Results,
-        [pscustomobject]$System,
-        [string]$NetFx,
-        [array]$VC,
-        [pscustomobject]$WindowsHealth,
-        [pscustomobject]$NetworkHealth,
-        [pscustomobject]$Enrichment,
-        [pscustomobject]$SystemVerification,
-        [pscustomobject]$Motherboard,
-        [pscustomobject]$EventLogs,
-        [pscustomobject]$Battery,
-        [pscustomobject]$DefenderExclusions
-    )
-
-    $cats = [ordered]@{}
-
-    # HARDWARE - only measured data. No fallback heuristics.
-    $ramScore = 100
-    if ($System.RAM_GB -lt 16)                        { $ramScore -= 30 }
-    elseif ($System.RAM_GB -lt 32)                    { $ramScore -= 10 }
-    if ($Enrichment -and $Enrichment.Ram) {
-        if ($Enrichment.Ram.Type -eq 'DDR3')          { $ramScore -= 15 }
-        elseif ($Enrichment.Ram.SpeedMHz -lt 2400)    { $ramScore -= 10 }
-        elseif ($Enrichment.Ram.SpeedMHz -lt 3200 -and $Enrichment.Ram.Type -eq 'DDR4') { $ramScore -= 5 }
-    }
-
-    $cpuScore = $null
-    if ($Enrichment -and $Enrichment.CpuScore) {
-        $mark = $Enrichment.CpuScore
-        $cpuScore = if     ($mark -ge 35000) { 100 }
-                    elseif ($mark -ge 20000) { 95 }
-                    elseif ($mark -ge 12000) { 85 }
-                    elseif ($mark -ge 7000)  { 70 }
-                    elseif ($mark -ge 3500)  { 55 }
-                    else                     { 30 }
-    }
-
-    $hwParts = @()
-    $hwParts += [pscustomobject]@{ Score = $ramScore; Weight = 0.4 }
-    if ($cpuScore -ne $null) {
-        $hwParts += [pscustomobject]@{ Score = $cpuScore; Weight = 0.6 }
-    }
-    $hwTotalW = ($hwParts | Measure-Object Weight -Sum).Sum
-    $hw = if ($hwTotalW -gt 0) {
-        [int]((($hwParts | ForEach-Object { $_.Score * $_.Weight }) | Measure-Object -Sum).Sum / $hwTotalW)
-    } else { $null }
-    $cats['Hardware'] = if ($hw -ne $null) { [math]::Max(0, $hw) } else { $null }
-
-    # STORAGE - only measured data
-    $st = 100
-    if ($System.Disks.Count -gt 0) {
-        $worst = ($System.Disks | Sort-Object FreePct | Select-Object -First 1).FreePct
-        if ($worst -lt 5)      { $st = 30 }
-        elseif ($worst -lt 10) { $st = 55 }
-        elseif ($worst -lt 20) { $st = 80 }
-    }
-    if ($Enrichment -and $Enrichment.DiskMediaTypes.Count -gt 0) {
-        $hasNvme = @($Enrichment.DiskMediaTypes | Where-Object BusType -eq 'NVMe').Count -gt 0
-        $hasSsd  = @($Enrichment.DiskMediaTypes | Where-Object MediaType -eq 'SSD').Count -gt 0
-        if (-not $hasNvme -and -not $hasSsd) { $st = [math]::Max(0, $st - 25) }
-        elseif (-not $hasNvme -and $hasSsd)  { $st = [math]::Max(0, $st - 10) }
-    }
-
-    if ($SystemVerification -and $SystemVerification.DiskReliability.Count -gt 0) {
-        foreach ($disk in $SystemVerification.DiskReliability) {
-            if ($disk.HealthStatus -and $disk.HealthStatus -ne 'Healthy') {
-                $st = [math]::Max(0, $st - 25)
-            }
-            if ($disk.Wear -and $disk.Wear -ge 80) { $st = [math]::Max(0, $st - 20) }
-            elseif ($disk.Wear -and $disk.Wear -ge 50) { $st = [math]::Max(0, $st - 8) }
-            if ($disk.Temperature -and $disk.Temperature -ge 65) { $st = [math]::Max(0, $st - 5) }
-            if ($disk.ReadErrors -and $disk.ReadErrors -gt 100)  { $st = [math]::Max(0, $st - 5) }
-            if ($disk.WriteErrors -and $disk.WriteErrors -gt 100) { $st = [math]::Max(0, $st - 5) }
-        }
-    }
-    $cats['Storage'] = $st
-
-    # ENGINEERING SOFTWARE
-    $rel = @($Results | Where-Object {
-        $_.State -notin @('NotInstalled','NotApplicable') -and -not $_.IsSynthetic
-    })
-    if ($rel.Count -eq 0) {
-        $cats['EngineeringSoftware'] = $null
-    } else {
-        $healthy = @($rel | Where-Object State -eq 'Healthy').Count
-        $baseScore = [int](100 * $healthy / $rel.Count)
-
-        if ($Enrichment -and $Enrichment.Upgradeable.Count -gt 0) {
-            $outdatedEng = 0
-            foreach ($up in $Enrichment.Upgradeable) {
-                foreach ($r in $rel) {
-                    if ($r.Name -and $up.Name -and ($up.Name -like "*$($r.Name)*" -or $r.Name -like "*$($up.Name)*")) {
-                        $outdatedEng++
-                        break
-                    }
-                }
-            }
-            if ($outdatedEng -gt 0) {
-                $penalty = [math]::Min(30, $outdatedEng * 3)
-                $baseScore = [math]::Max(0, $baseScore - $penalty)
-            }
-        }
-        $cats['EngineeringSoftware'] = $baseScore
-    }
-
-    # LICENSING
-    if ($rel.Count -eq 0) {
-        $cats['Licensing'] = $null
-    } else {
-        $licIssues = @($rel | Where-Object { @($_.Findings | Where-Object Id -match 'LICSVC').Count -gt 0 }).Count
-        $cats['Licensing'] = [int](100 - (100 * $licIssues / $rel.Count))
-    }
-
-    # WINDOWS
-    $winScore = if ($WindowsHealth) { $WindowsHealth.Score } else { $null }
-    if ($SystemVerification -and $SystemVerification.LatestWindowsBuild -and $System.OSBuildNumber) {
-        try {
-            $haveBuildNum = [int]$System.OSBuildNumber
-            $wantParts = $SystemVerification.LatestWindowsBuild -split '\.'
-            $wantBuildNum = [int]$wantParts[0]
-            if ([math]::Abs($wantBuildNum - $haveBuildNum) -lt 1000) {
-                if ($haveBuildNum -lt $wantBuildNum - 5 -and $winScore -ne $null) {
-                    $winScore = [math]::Max(0, $winScore - 5)
-                }
-            }
-        } catch { }
-    }
-    $cats['Windows'] = $winScore
-
-    # NETWORK
-    $netScore = if ($NetworkHealth) { $NetworkHealth.Score } else { $null }
-    if ($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0 -and $netScore -ne $null) {
-        foreach ($a in $SystemVerification.AdapterCapabilities) {
-            if ($a.MaxSpeed -and $a.LinkSpeed -and $a.MaxSpeed -ne $a.LinkSpeed) {
-                if ($a.LinkSpeed -match '100\s*Mbps' -and $a.MaxSpeed -match 'Gb') {
-                    $netScore = [math]::Max(0, $netScore - 10)
-                }
-            }
-        }
-    }
-    $cats['Network'] = $netScore
-
-    # SYSTEM - stability / event log issues, all measured
-    $sysScore = 100
-    if ($EventLogs) {
-        if ($EventLogs.WheaCount -gt 0)          { $sysScore -= [math]::Min(50, $EventLogs.WheaCount * 15) }
-        if ($EventLogs.DiskErrors -ge 10)        { $sysScore -= 30 }
-        elseif ($EventLogs.DiskErrors -ge 1)     { $sysScore -= 15 }
-        if ($EventLogs.UnexpectedShutdown -ge 3) { $sysScore -= 25 }
-        elseif ($EventLogs.UnexpectedShutdown -ge 1) { $sysScore -= 10 }
-        if ($EventLogs.AppCrashes -ge 10)        { $sysScore -= 15 }
-        elseif ($EventLogs.AppCrashes -ge 5)     { $sysScore -= 8 }
-        if ($EventLogs.ThermalEvents -ge 10)     { $sysScore -= 10 }
-        elseif ($EventLogs.ThermalEvents -ge 1)  { $sysScore -= 3 }
-    }
-    if ($Battery -and $Battery.HealthPercent -ne $null -and $System.Power.HasBattery) {
-        if ($Battery.HealthPercent -lt 60) { $sysScore -= 5 }
-    }
-    $cats['System'] = [math]::Max(0, $sysScore)
-
-    # Weights
-    $weights = @{
-        Hardware = 0.25; Storage = 0.18; EngineeringSoftware = 0.25
-        Licensing = 0.07; Windows = 0.05; Network = 0.05; System = 0.15
-    }
-
-    $sumW = 0
-    $sumWS = 0
-    foreach ($k in $cats.Keys) {
-        if ($cats[$k] -eq $null) { continue }
-        $w = if ($weights.ContainsKey($k)) { $weights[$k] } else { 0 }
-        $sumW += $w
-        $sumWS += $cats[$k] * $w
-    }
-    $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
-
-    [pscustomobject]@{
-        Overall    = $overall
-        Categories = $cats
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Windows / Network health
-# ---------------------------------------------------------------------------
 $windowsHealth = Get-WindowsHealth -System $sys
 $networkHealth = Get-NetworkHealth -System $sys -Catalog $Script:RawCatalog -Installed $installed
+$motherboard   = Get-MotherboardInfo
+$enrichment    = Invoke-OnlineEnrichment -System $sys
 
-# ---------------------------------------------------------------------------
-# Online enrichment + hardware / OS verification
-# ---------------------------------------------------------------------------
-$motherboard    = Get-MotherboardInfo
-$enrichment     = Invoke-OnlineEnrichment -System $sys
-$systemVerify   = Invoke-SystemOnlineVerification -System $sys -Motherboard $motherboard
-
-# ---------------------------------------------------------------------------
-# Event log scan
-# ---------------------------------------------------------------------------
 Write-Stage "Scanning event logs (last 7 days)..."
 $eventLogs = Get-EventLogIssues
 Write-Ok
-
 $defenderExcl = Get-DefenderExclusions
 
 # =============================================================================
-# 6a-bis. EVENT LOG FINDINGS
+# DISCIPLINE-DRIVEN REQUIREMENT SCAN
 # =============================================================================
-function Add-EventLogFindings {
-    param([pscustomobject]$EventLogs, [pscustomobject]$SystemVerification)
+$requirementResults = @()
 
-    $list = New-Object System.Collections.Generic.List[object]
+if ($Disciplines.Count -gt 0) {
+    Write-Head "Discipline Requirement Scan - $($Disciplines -join ', ')"
+    Write-Host "  For each selected app, every vendor requirement is checked against this PC." -ForegroundColor DarkGray
+    Write-Host ""
 
-    if ($EventLogs.UnexpectedShutdown -gt 0) {
-        $sev = if ($EventLogs.UnexpectedShutdown -ge 3) { 'critical' } else { 'warn' }
-        $list.Add((New-Finding `
-            -Id 'SYS.UNEXPECTED_SHUTDOWN' `
-            -Software 'System' `
-            -Problem "Unexpected shutdowns detected ($($EventLogs.UnexpectedShutdown) in 7 days)." `
-            -Detected "Kernel-Power Event ID 41, count = $($EventLogs.UnexpectedShutdown)." `
-            -WhyItMatters "Unexpected shutdowns can corrupt open project files, checkpoint caches, and license leases." `
-            -Recommendation "Check PSU/battery, review thermal events, and ensure the machine is not being hard-powered-off." `
-            -Severity $sev))
-    }
+    $seen = @{}
+    foreach ($entry in $Script:RawCatalog) {
+        $overlap = $false
+        foreach ($d in $entry.D) { if ($Disciplines -contains $d) { $overlap = $true; break } }
+        if (-not $overlap -or $seen.ContainsKey($entry.N)) { continue }
+        $seen[$entry.N] = $true
 
-    if ($EventLogs.DiskErrors -gt 0) {
-        $sev = if ($EventLogs.DiskErrors -ge 10) { 'critical' } else { 'warn' }
-        $deviceInfo = ''
-        if ($EventLogs.DiskErrorDevices -and $EventLogs.DiskErrorDevices.Count -gt 0) {
-            $deviceInfo = " Affected device(s): Harddisk" + ($EventLogs.DiskErrorDevices -join ', Harddisk')
+        $specs = @()
+        if ($Script:SoftwareRequirements.ContainsKey($entry.N)) {
+            $specs = @($Script:SoftwareRequirements[$entry.N])
+        } else {
+            if ($entry.RAM)  { $specs += @{ Type='RAM';  Min=[int][math]::Ceiling($entry.RAM*0.5); Rec=[int]$entry.RAM } }
+            if ($entry.Disk) { $specs += @{ Type='Disk'; Min=[int][math]::Ceiling($entry.Disk*0.5); Rec=[int]$entry.Disk } }
+            if ($entry.GPU)  { $specs += @{ Type='GPU';  MinVRAM=1; RecVRAM=2; MinDirectX='11' } }
+            if ($entry.Net)  { $specs += @{ Type='NetFx'; Min=$entry.Net } }
+            if ($entry.VCPP) { $specs += @{ Type='VCRedist'; Min='14.30' } }
+            if ($entry.Lsvc) {
+                foreach ($pat in $entry.Lsvc) { $specs += @{ Type='LicenseSvc'; Pattern=$pat; Ports=@($entry.Lport) } }
+            }
         }
-        $sampleMsg = ($EventLogs.Samples | Where-Object Type -eq 'Disk' | ForEach-Object { "#$($_.Id) $($_.Msg)" }) -join ' | '
-        $list.Add((New-Finding `
-            -Id 'SYS.DISK_ERRORS' `
-            -Software 'Storage' `
-            -Problem "Disk/controller errors detected ($($EventLogs.DiskErrors) in 7 days)." `
-            -Detected "$sampleMsg$deviceInfo" `
-            -WhyItMatters "Controller or media errors usually mean a failing cable, port, or drive. Engineering data loss risk." `
-            -Recommendation "Identify the device from the event (e.g. Harddisk1\DR2), run vendor diagnostics, and back up project data." `
-            -Severity $sev))
-    }
 
-    if ($EventLogs.WheaCount -gt 0) {
-        $list.Add((New-Finding `
-            -Id 'SYS.WHEA' `
-            -Software 'Hardware' `
-            -Problem "WHEA hardware errors detected ($($EventLogs.WheaCount) in 7 days)." `
-            -Detected "WHEA-Logger events: $($EventLogs.WheaCount)." `
-            -WhyItMatters "WHEA errors indicate machine-check exceptions from CPU, PCIe, or memory - often unstable overclocks or failing hardware." `
-            -Recommendation "Check RAM with MemTest86, verify XMP/EXPO is stable, and update BIOS/chipset drivers." `
-            -Severity 'critical'))
-    }
-
-    if ($EventLogs.AppCrashes -ge 5) {
-        $list.Add((New-Finding `
-            -Id 'SYS.APP_CRASHES' `
-            -Software 'Applications' `
-            -Problem "High application crash rate ($($EventLogs.AppCrashes) in 7 days)." `
-            -Detected "Application log Event ID 1000 count = $($EventLogs.AppCrashes)." `
-            -WhyItMatters "Frequent crashes can indicate RAM instability, driver issues, or a corrupt runtime." `
-            -Recommendation "Review the crash list, update GPU and chipset drivers, run sfc /scannow and DISM." `
-            -Severity 'warn'))
-    }
-
-    if ($list.Count -gt 0) {
-        $critCount = @($list | Where-Object Severity -eq 'critical').Count
-        $synth = [pscustomobject]@{
-            Name        = 'System Health'
-            Disciplines = 'System'
-            Kind        = 'Events'
-            Installed   = $true
-            IsSynthetic = $true
-            Version     = ''
-            Match       = 'Event log scan (7 days)'
-            State       = if ($critCount -gt 0) { 'Critical' } else { 'Attention' }
-            Severity    = if ($critCount -gt 0) { 'critical' } else { 'warn' }
-            Findings    = $list
-            Notes       = @()
-            CacheGB     = 0
+        $checks = New-Object System.Collections.Generic.List[object]
+        foreach ($spec in $specs) {
+            $checks.Add((Test-Requirement -Spec $spec -System $sys -Enrichment $enrichment))
         }
-        return ,$synth
+
+        # annotate latest published version for software-version types
+        foreach ($c in $checks) {
+            if ($c.Type -in @('NetFx','NetDesktop','VCRedist','Java','Python','WebView2')) {
+                $latest = Get-LatestComponentVersion -Component $c.Component
+                $c | Add-Member -NotePropertyName LatestOnline -NotePropertyValue $latest -Force
+            }
+        }
+
+        $fail = @($checks | Where-Object Status -eq 'FAIL').Count
+        $warn = @($checks | Where-Object Status -eq 'WARN').Count
+        $unk  = @($checks | Where-Object Status -eq 'UNKNOWN').Count
+
+        $verdict =
+            if     ($fail -gt 0) { 'DOES NOT MEET' }
+            elseif ($warn -gt 0) { 'PARTIALLY MEETS' }
+            elseif ($unk  -gt 0) { 'MEETS (unverified)' }
+            else                 { 'MEETS' }
+
+        $requirementResults += [pscustomobject]@{
+            Product     = $entry.N
+            Disciplines = ($entry.D -join ', ')
+            Kind        = $entry.K
+            Verdict     = $verdict
+            Failures    = $fail
+            Warnings    = $warn
+            Unverified  = $unk
+            Checks      = $checks
+        }
     }
-    return $null
-}
 
-$eventSynth = Add-EventLogFindings -EventLogs $eventLogs -SystemVerification $systemVerify
-if ($eventSynth) {
-    $allResults.Add($eventSynth)
-    $gCount = @($allResults | Where-Object State -eq 'Healthy').Count
-    $yCount = @($allResults | Where-Object State -eq 'Attention').Count
-    $rCount = @($allResults | Where-Object State -eq 'Critical').Count
-    $nCount = @($allResults | Where-Object State -eq 'NotInstalled').Count
-    $aCount = @($allResults | Where-Object State -eq 'NotApplicable').Count
-}
+    $requirementResults = @($requirementResults | Sort-Object Failures, Warnings, Product)
+    Write-Host ("  {0} product(s) evaluated." -f $requirementResults.Count) -ForegroundColor Green
+    Write-Host ""
 
-# Live GPU sample (optional)
-$liveGpu = @()
-if ($LiveGpuSample) {
-    Write-Stage "Sampling live GPU utilization..."
-    $liveGpu = Get-LiveGpuSample -DurationSeconds 2
-    Write-Ok
-}
-
-$Script:GuardianRan = $false
-$score = Get-HealthScore -Results $allResults -System $sys -NetFx $netFx -VC $vc `
-                         -WindowsHealth $windowsHealth -NetworkHealth $networkHealth `
-                         -Enrichment $enrichment -SystemVerification $systemVerify `
-                         -Motherboard $motherboard -EventLogs $eventLogs `
-                         -Battery $sys.Battery -DefenderExclusions $defenderExcl
-
-# =============================================================================
-# 8. DISCIPLINE ROLLUP
-# =============================================================================
-Write-Head "Discipline rollup"
-$byDisc = @{}
-foreach ($r in $allResults) {
-    if ($r.State -in @('NotInstalled','NotApplicable')) { continue }
-    if ($r.IsSynthetic) { continue }
-    foreach ($d in ($r.Disciplines -split ',\s*')) {
-        if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
-        $byDisc[$d] += $r
+    foreach ($rr in $requirementResults) {
+        $col = switch ($rr.Verdict) {
+            'MEETS'             { 'Green' }
+            'MEETS (unverified)'{ 'Green' }
+            'PARTIALLY MEETS'   { 'Yellow' }
+            'DOES NOT MEET'     { 'Red' }
+            default             { 'Gray' }
+        }
+        Write-Host ("  {0,-30} {1}" -f $rr.Product, $rr.Verdict) -ForegroundColor $col
+        foreach ($c in $rr.Checks) {
+            $flag = switch ($c.Status) {
+                'PASS'    { 'OK  ' }
+                'WARN'    { 'WARN' }
+                'FAIL'    { 'FAIL' }
+                'UNKNOWN' { 'n/a ' }
+            }
+            $mark = switch ($c.Status) {
+                'PASS'    { '  +' }
+                'WARN'    { '  ~' }
+                'FAIL'    { '  !' }
+                'UNKNOWN' { '  ?' }
+            }
+            $line = "{0} [{1,-4}] {2,-12} need: {3,-34} have: {4}" -f $mark, $flag, $c.Component, $c.Required, $c.Actual
+            if ($c.LatestOnline) { $line += "  (latest: $($c.LatestOnline))" }
+            $lineCol = switch ($c.Status) {
+                'PASS' { 'DarkGray' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'DarkGray' }
+            }
+            Write-Host $line -ForegroundColor $lineCol
+        }
+        Write-Host ""
     }
 }
-foreach ($d in $byDisc.Keys | Sort-Object) {
-    $rs    = $byDisc[$d]
-    $green = @($rs | Where-Object State -eq 'Healthy').Count
-    $yell  = @($rs | Where-Object State -eq 'Attention').Count
-    $red   = @($rs | Where-Object State -eq 'Critical').Count
-    $total = $rs.Count
-    $bar   = ('#' * $green) + ('=' * $yell) + ('.' * $red)
-    Write-Host ("  {0,-18} {1,2}/{2,2} healthy  {3,2} attention  {4,2} critical   [{5}]" `
-                -f $d, $green, $total, $yell, $red, $bar) -ForegroundColor Cyan
-}
 
-# Console score display - no brackets, no GPU/Drivers, no data confidence
-Write-Host ""
-Write-Host ("  SIGMA ENGINEERING SCORE: {0}/100" -f $score.Overall) -ForegroundColor Green
-foreach ($k in $score.Categories.Keys) {
-    $v = if ($score.Categories[$k] -eq $null) { 'N/A' } else { "{0,3}" -f $score.Categories[$k] }
-    Write-Host ("    {0,-22} {1}/100" -f $k, $v)
+# =============================================================================
+# DISCIPLINE ROLLUP (only when no disciplines chosen)
+# =============================================================================
+if ($Disciplines.Count -eq 0) {
+    Write-Head "Full system scan - no discipline filter"
+    Write-Host "  Tip: add -Disciplines Civil,FEA,... to focus the scan on specific apps." -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 # =============================================================================
-# 9. PROJECT GUARDIAN
+# PROJECT GUARDIAN
 # =============================================================================
 function Get-DwgReferences {
     param([string]$FilePath)
-
     $refs = New-Object System.Collections.Generic.List[object]
     $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
-
     try {
         if ($ext -eq '.dxf') {
             if ((Get-Item -LiteralPath $FilePath).Length -gt 200MB) { return $refs }
@@ -3046,20 +2338,13 @@ function Get-DwgReferences {
             foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"IMAGEDEF"\)[\s\S]{0,3000}?\(1\s*\.\s*"([^"]+)"\)')) {
                 $refs.Add([pscustomobject]@{ Type = 'IMAGE'; Path = $m.Groups[1].Value })
             }
-            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"PDFDEFINITION"\)[\s\S]{0,3000}?\(1\s*\.\s*"([^"]+)"\)')) {
-                $refs.Add([pscustomobject]@{ Type = 'PDF'; Path = $m.Groups[1].Value })
-            }
         } elseif ($ext -eq '.dwg') {
             $fi = Get-Item -LiteralPath $FilePath
             if ($fi.Length -gt 250MB) { return $refs }
             $bytes = [System.IO.File]::ReadAllBytes($FilePath)
             $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
             $extPat = '(dwg|dxf|pdf|jpg|jpeg|png|tif|tiff|shx|ttf|shp|dgn|dwf|dwfx)'
-
             foreach ($m in [regex]::Matches($ascii, "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{0,250}\.$extPat", 'IgnoreCase')) {
-                $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
-            }
-            foreach ($m in [regex]::Matches($ascii, "\\\\\\\\[^\x00-\x1F`"<>|]{0,250}\.$extPat", 'IgnoreCase')) {
                 $refs.Add([pscustomobject]@{ Type = 'REF'; Path = $m.Value })
             }
         }
@@ -3071,178 +2356,97 @@ function Get-DwgReferences {
 
 function Invoke-ProjectGuardian {
     param([string]$Root)
-
-    if (-not (Test-Path $Root)) {
-        Write-Host "[ERROR] Project path not found: $Root" -ForegroundColor Red
-        return $null
-    }
-
+    if (-not (Test-Path $Root)) { Write-Host "[ERROR] Path not found: $Root" -ForegroundColor Red; return $null }
     Write-Head "Project Guardian: $Root"
-
-    $engExt = @(
-        '.dwg','.dxf','.rvt','.rfa','.nwd','.nwc','.ifc',
-        '.sldprt','.sldasm','.slddrw','.step','.stp','.iges','.igs','.stl',
-        '.inp','.cdb','.mph','.mat','.m','.slx','.sdb','.edb',
-        '.kicad_pcb','.kicad_sch','.sch','.brd',
-        '.shp','.shx','.dbf','.las','.laz','.tif','.tiff',
-        '.catpart','.catproduct','.prt','.asm','.3dxml',
-        '.model','.exp','.cgr','.cnc'
-    )
+    $engExt = @('.dwg','.dxf','.rvt','.rfa','.nwd','.nwc','.ifc','.sldprt','.sldasm','.slddrw',
+                '.step','.stp','.iges','.igs','.stl','.inp','.cdb','.mph','.mat','.m','.slx',
+                '.kicad_pcb','.kicad_sch','.sch','.brd','.shp','.shx','.dbf','.las','.laz',
+                '.tif','.tiff','.catpart','.catproduct','.prt','.asm','.3dxml','.model','.exp','.cgr')
     $backupExt = @('.bak','.tmp','.sv$','.dwl','.dwl2','.ac$','.err','.log')
-
     $scan = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction SilentlyContinue)
-
-    $byExt = @{}
-    $totalBytes = 0
-    $longPaths = 0
-    $backupFiles = 0
-    $largeFiles = 0
-    $largeBytes = 0
-    $oldBackups = 0
-
+    $byExt = @{}; $totalBytes = 0; $longPaths = 0; $backupFiles = 0
+    $largeFiles = 0; $largeBytes = 0; $oldBackups = 0
     $cutoff = (Get-Date).AddDays(-180)
-
     foreach ($f in $scan) {
         $ext = $f.Extension.ToLower()
         if (-not $byExt.ContainsKey($ext)) { $byExt[$ext] = 0 }
         $byExt[$ext]++
         $totalBytes += $f.Length
-
         if ($f.FullName.Length -gt 240) { $longPaths++ }
-        if ($backupExt -contains $ext) {
-            $backupFiles++
-            if ($f.LastWriteTime -lt $cutoff) { $oldBackups++ }
-        }
+        if ($backupExt -contains $ext) { $backupFiles++; if ($f.LastWriteTime -lt $cutoff) { $oldBackups++ } }
         if ($f.Length -gt 500MB) { $largeFiles++; $largeBytes += $f.Length }
     }
-
     $engFiles = 0
     foreach ($k in $byExt.Keys) { if ($engExt -contains $k) { $engFiles += $byExt[$k] } }
-
     Write-Host ""
     Write-Host ("  Total files:          {0}" -f $scan.Count)
     Write-Host ("  Total size:           {0} GB" -f [math]::Round($totalBytes/1GB, 2))
     Write-Host ("  Engineering files:    {0}" -f $engFiles)
     Write-Host ("  Long paths (>240):    {0}" -f $longPaths)
     Write-Host ("  Backup/temp files:    {0} (older than 180 days: {1})" -f $backupFiles, $oldBackups)
-    Write-Host ("  Large files (>500MB): {0} ({1} GB)" -f $largeFiles, [math]::Round($largeBytes/1GB, 2))
-    Write-Host ""
-
     $penalty = 0
-    if ($longPaths -gt 0)      { $penalty += [math]::Min(25, $longPaths) }
-    if ($oldBackups -gt 5)     { $penalty += [math]::Min(15, [int]($oldBackups / 5)) }
-    if ($largeFiles -gt 10)    { $penalty += [math]::Min(15, [int]($largeFiles / 5)) }
-
-    Write-Host "  Top file types:" -ForegroundColor Cyan
-    $byExt.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object {
-        Write-Host ("    {0,-14} {1,6}" -f $_.Key, $_.Value)
-    }
-
-    $dwgFiles = @($scan | Where-Object { $_.Extension -in @('.dwg','.dxf') })
-    $maxDwg = 200
-    if ($dwgFiles.Count -gt $maxDwg) {
-        Write-Host "  (limiting reference scan to first $maxDwg drawings)" -ForegroundColor Yellow
-        $dwgFiles = $dwgFiles | Select-Object -First $maxDwg
-    }
-
-    $refTotal = 0
-    $refMissing = 0
-    $refMissingList = @()
-
-    if ($dwgFiles.Count -gt 0) {
-        Write-Host ""
-        Write-Host "  Scanning drawing references..." -ForegroundColor Cyan
-        foreach ($dwg in $dwgFiles) {
-            $refs = Get-DwgReferences -FilePath $dwg.FullName
-            foreach ($r in $refs) {
-                $refTotal++
-                $p = $r.Path -replace '/', '\'
-                if (-not [System.IO.Path]::IsPathRooted($p)) {
-                    $p = Join-Path $dwg.DirectoryName $p
-                }
-                if (-not (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) {
-                    $refMissing++
-                    $refMissingList += [pscustomobject]@{
-                        Drawing = $dwg.FullName
-                        Type    = $r.Type
-                        Ref     = $r.Path
-                    }
-                }
-            }
-        }
-        Write-Host ("    References found:   {0}" -f $refTotal)
-        Write-Host ("    Missing / broken:   {0}" -f $refMissing) -ForegroundColor $(if ($refMissing -gt 0) { 'Yellow' } else { 'Green' })
-    }
-
-    if ($refTotal -gt 0) {
-        $missRatio = $refMissing / $refTotal
-        $penalty += [math]::Min(30, [int]($missRatio * 100))
-    }
-
+    if ($longPaths -gt 0)  { $penalty += [math]::Min(25, $longPaths) }
+    if ($oldBackups -gt 5) { $penalty += [math]::Min(15, [int]($oldBackups / 5)) }
     $health = [math]::Max(0, 100 - $penalty)
-    $col = if ($health -ge 80) { 'Green' } elseif ($health -ge 60) { 'Yellow' } else { 'Red' }
+    Write-Host ("  Project Health: {0}%" -f $health) -ForegroundColor Cyan
     Write-Host ""
-    Write-Host ("  Project Health: {0}%" -f $health) -ForegroundColor $col
-    Write-Host ""
-
     return [pscustomobject]@{
-        Root             = $Root
-        TotalFiles       = $scan.Count
-        TotalGB          = [math]::Round($totalBytes/1GB, 2)
-        EngineeringFiles = $engFiles
-        LongPaths        = $longPaths
-        BackupFiles      = $backupFiles
-        OldBackups       = $oldBackups
-        LargeFiles       = $largeFiles
-        LargeGB          = [math]::Round($largeBytes/1GB, 2)
-        ByExtension      = $byExt
-        RefTotal         = $refTotal
-        RefMissing       = $refMissing
-        RefMissingList   = $refMissingList
-        Health           = $health
+        Root = $Root; TotalFiles = $scan.Count; TotalGB = [math]::Round($totalBytes/1GB, 2)
+        EngineeringFiles = $engFiles; LongPaths = $longPaths; BackupFiles = $backupFiles
+        OldBackups = $oldBackups; LargeFiles = $largeFiles
+        LargeGB = [math]::Round($largeBytes/1GB, 2); ByExtension = $byExt; Health = $health
     }
 }
 
 $guardian = $null
-if ($ProjectGuardian) {
-    $guardian = Invoke-ProjectGuardian -Root $ProjectGuardian
-    if ($guardian) {
-        $Script:GuardianRan = $true
-    }
-}
+if ($ProjectGuardian) { $guardian = Invoke-ProjectGuardian -Root $ProjectGuardian }
 
 # =============================================================================
-# 10. WRITE REPORT
+# WRITE REPORT
 # =============================================================================
 Write-Stage "Writing report (HTML / JSON / CSV)..."
 Ensure-Folder $exportPath
 
+# JSON
 [pscustomobject]@{
-    GeneratedAt        = (Get-Date).ToString('s')
-    System             = $sys
-    Motherboard        = $motherboard
-    NetFx              = $netFx
-    VCRedist           = $vc
-    Score              = $score
-    WindowsHealth      = $windowsHealth
-    NetworkHealth      = $networkHealth
-    Enrichment         = $enrichment
-    SystemVerification = $systemVerify
-    EventLogs          = $eventLogs
-    DefenderExclusions = $defenderExcl
-    LiveGpu            = $liveGpu
-    Guardian           = $guardian
-    Results            = $allResults
+    GeneratedAt         = (Get-Date).ToString('s')
+    SelectedDisciplines = $Disciplines
+    System              = $sys
+    Motherboard         = $motherboard
+    NetFx               = $netFx
+    VCRedist            = $vc
+    WindowsHealth       = $windowsHealth
+    NetworkHealth       = $networkHealth
+    Enrichment          = $enrichment
+    EventLogs           = $eventLogs
+    DefenderExclusions  = $defenderExcl
+    Guardian            = $guardian
+    RequirementResults  = $requirementResults
+    InstalledSoftware   = $installed
 } | ConvertTo-Json -Depth 12 | Set-Content "$reportBase.json" -Encoding UTF8
 
-$allResults | Select-Object Name, Disciplines, Kind, State, Version, Installed,
-    @{n='Findings';e={ ($_.Findings | ForEach-Object { "$($_.Severity): $($_.Problem)" }) -join ' | ' }},
-    @{n='Notes';   e={ $_.Notes -join ' | ' }} |
-    Export-Csv "$reportBase.csv" -NoTypeInformation -Encoding UTF8
+# CSV - requirement grid
+if ($requirementResults.Count -gt 0) {
+    $rows = foreach ($rr in $requirementResults) {
+        foreach ($c in $rr.Checks) {
+            [pscustomobject]@{
+                Product     = $rr.Product
+                Disciplines = $rr.Disciplines
+                Verdict     = $rr.Verdict
+                Component   = $c.Component
+                Type        = $c.Type
+                Required    = $c.Required
+                Actual      = $c.Actual
+                Status      = $c.Status
+                Note        = $c.Note
+                LatestOnline = if ($c.PSObject.Properties.Match('LatestOnline').Count) { $c.LatestOnline } else { '' }
+            }
+        }
+    }
+    $rows | Export-Csv "$reportBase.csv" -NoTypeInformation -Encoding UTF8
+}
 
-# ---------------------------------------------------------------------------
 # HTML
-# ---------------------------------------------------------------------------
 $style = @'
 <style>
  body{font-family:'Segoe UI',Arial,sans-serif;margin:24px;color:#1a1a1a;background:#f7f8fa}
@@ -3259,234 +2463,84 @@ $style = @'
  .chip.green{background:#1c9b4b}.chip.yellow{background:#d18b00}.chip.red{background:#c23636}
  .chip.gray{background:#8b95a5}.chip.darkgray{background:#4a5568}.chip.blue{background:#2b6cb0}
  .small{font-size:12px;color:#666}
- .disc{border-left:4px solid #0b5394;padding-left:10px;margin-top:22px}
- .hero{background:linear-gradient(135deg,#0b5394,#0a3d6e);color:#fff;border-radius:12px;padding:28px 24px;margin:10px 0 20px 0;text-align:center;box-shadow:0 6px 20px rgba(11,83,148,.25)}
- .hero-num{font-size:64px;font-weight:800;line-height:1;letter-spacing:-2px}
- .hero-num span{font-size:22px;font-weight:400;opacity:.55}
- .hero-label{font-size:13px;text-transform:uppercase;letter-spacing:3px;opacity:.85;margin-top:6px}
- .hero-cats{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;margin-top:22px}
- .hero-cats > div{background:rgba(255,255,255,.12);padding:10px 14px;border-radius:8px;min-width:100px}
- .hero-cats b{display:block;font-size:20px;font-weight:700}
- .hero-cats span{font-size:10px;text-transform:uppercase;letter-spacing:1px;opacity:.8}
- .hero-cats .na{font-style:italic;opacity:.6}
- .finding{background:#fff;border-left:5px solid #8b95a5;border-radius:6px;padding:14px 18px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.05)}
- .finding.sev-critical{border-left-color:#c23636}
- .finding.sev-warn{border-left-color:#d18b00}
- .finding-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px}
- .finding-title{font-weight:600;font-size:14px}
- .finding-body{width:100%;border:none;font-size:12px;margin:0}
- .finding-body th{background:transparent;border:none;color:#8b95a5;text-transform:uppercase;font-size:10px;letter-spacing:1.2px;width:150px;padding:3px 12px 3px 0;vertical-align:top;font-weight:700}
- .finding-body td{border:none;padding:3px 0}
- .verify{background:#f0fbf1;border-left:5px solid #1c9b4b;border-radius:6px;padding:12px 16px;margin:10px 0;font-size:13px}
- .verify b{color:#0f7233}
+ .hero{background:linear-gradient(135deg,#0b5394,#0a3d6e);color:#fff;border-radius:12px;padding:28px 24px;margin:10px 0 20px 0;text-align:center}
+ .hero-num{font-size:52px;font-weight:800;line-height:1}
+ .hero-cats{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;margin-top:18px}
+ .hero-cats > div{background:rgba(255,255,255,.12);padding:8px 12px;border-radius:8px;min-width:110px}
+ .hero-cats b{display:block;font-size:18px;font-weight:700}
+ .hero-cats span{font-size:10px;text-transform:uppercase;letter-spacing:1px;opacity:.85}
+ .product-block{margin:20px 0;padding:14px 18px;background:#fff;border-left:5px solid #8b95a5;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+ .product-block.meets{border-left-color:#1c9b4b}
+ .product-block.partial{border-left-color:#d18b00}
+ .product-block.fails{border-left-color:#c23636}
+ .product-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+ .product-name{font-size:15px;font-weight:700}
+ .product-disc{font-size:11px;color:#8b95a5}
 </style>
 '@
 
-$chipClass = @{
-    'Healthy'       = 'green'
-    'Attention'     = 'yellow'
-    'Critical'      = 'red'
-    'NotInstalled'  = 'gray'
-    'NotApplicable' = 'darkgray'
-    'Unknown'       = 'blue'
+$chipForVerdict = @{
+    'MEETS'              = 'green'
+    'MEETS (unverified)' = 'green'
+    'PARTIALLY MEETS'    = 'yellow'
+    'DOES NOT MEET'      = 'red'
 }
+$chipForStatus = @{ 'PASS'='green'; 'WARN'='yellow'; 'FAIL'='red'; 'UNKNOWN'='gray' }
 
 $sb = New-Object System.Text.StringBuilder
-[void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Engineer Toolkit - Report</title>$style</head><body>")
+[void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Engineer Toolkit</title>$style</head><body>")
 [void]$sb.AppendLine("<h1>Sigma Engineer Toolkit</h1>")
 [void]$sb.AppendLine("<p class='sub'>Generated $(Get-Date) on $($sys.ComputerName) by $($sys.User)</p>")
 
 # Hero
 [void]$sb.AppendLine("<div class='hero'>")
-[void]$sb.AppendLine("<div class='hero-num'>$($score.Overall)<span>/100</span></div>")
-[void]$sb.AppendLine("<div class='hero-label'>Sigma Engineering Score</div>")
+if ($Disciplines.Count -gt 0) {
+    [void]$sb.AppendLine("<div class='hero-num'>$($requirementResults.Count)</div>")
+    [void]$sb.AppendLine("<div>apps scanned in $($Disciplines -join ', ')</div>")
+} else {
+    [void]$sb.AppendLine("<div class='hero-num'>$($Script:CatalogCount)</div>")
+    [void]$sb.AppendLine("<div>catalog products available</div>")
+}
 [void]$sb.AppendLine("<div class='hero-cats'>")
-foreach ($k in $score.Categories.Keys) {
-    $v = if ($score.Categories[$k] -eq $null) { '<span class="na">N/A</span>' } else { $score.Categories[$k] }
-    [void]$sb.AppendLine("<div><b>$v</b><span>$k</span></div>")
+$meets = @($requirementResults | Where-Object Verdict -eq 'MEETS').Count
+$partial = @($requirementResults | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
+$fails = @($requirementResults | Where-Object Verdict -eq 'DOES NOT MEET').Count
+if ($Disciplines.Count -gt 0) {
+    [void]$sb.AppendLine("<div><b>$meets</b><span>Meets</span></div>")
+    [void]$sb.AppendLine("<div><b>$partial</b><span>Partial</span></div>")
+    [void]$sb.AppendLine("<div><b>$fails</b><span>Fails</span></div>")
+} else {
+    [void]$sb.AppendLine("<div><b>$($sys.RAM_GB) GB</b><span>RAM</span></div>")
+    [void]$sb.AppendLine("<div><b>$($sys.Cores)C/$($sys.LogicalCPUs)T</b><span>CPU</span></div>")
+    [void]$sb.AppendLine("<div><b>$(if($sys.HasDiscreteGPU){'Yes'}else{'No'})</b><span>Discrete GPU</span></div>")
 }
 [void]$sb.AppendLine("</div></div>")
-
-# Verified Components
-[void]$sb.AppendLine("<h2>Verified Components</h2>")
-[void]$sb.AppendLine("<div class='verify'>")
-if (-not $systemVerify.Available) {
-    [void]$sb.AppendLine("<b>Online verification unavailable</b> - using local data only. Values below are from WMI/SMART.")
-} else {
-    [void]$sb.AppendLine("<b>Every checked component has been cross-referenced with an online source where possible.</b>")
-}
-[void]$sb.AppendLine("</div>")
-
-[void]$sb.AppendLine("<div class='card'><table>")
-[void]$sb.AppendLine("<tr><th>Component</th><th>Value</th></tr>")
-
-$winLocal = if ($sys.OSBuild) { $sys.OSBuild } else { 'n/a' }
-[void]$sb.AppendLine("<tr><td><b>Windows Build</b></td><td>$winLocal</td></tr>")
-[void]$sb.AppendLine("<tr><td><b>.NET Framework</b></td><td>$netFx</td></tr>")
-
-$vcLocal = if ($vc.Count -gt 0) { ($vc | ForEach-Object { $_.DisplayVersion } | Sort-Object -Unique) -join ', ' } else { 'none' }
-[void]$sb.AppendLine("<tr><td><b>VC++ Redistributable</b></td><td>$vcLocal</td></tr>")
-
-$defLocal = if ($windowsHealth.DefenderSig) { "$($windowsHealth.DefenderSig) ($($windowsHealth.DefenderSigDate))" } else { 'unknown' }
-[void]$sb.AppendLine("<tr><td><b>Defender Signature</b></td><td>$defLocal</td></tr>")
-
-if ($motherboard) {
-    $biosLocal = "$($motherboard.BiosVendor) $($motherboard.BiosVersion) ($($motherboard.BiosReleaseDate))"
-    [void]$sb.AppendLine("<tr><td><b>Motherboard BIOS</b></td><td>$biosLocal</td></tr>")
-    [void]$sb.AppendLine("<tr><td><b>Motherboard</b></td><td>$($motherboard.Manufacturer) $($motherboard.Product) ($($motherboard.Version))</td></tr>")
-}
-
-if ($enrichment.CpuScore) {
-    [void]$sb.AppendLine("<tr><td><b>CPU</b></td><td>$($sys.CPU) - PassMark CPU Mark: <b>$($enrichment.CpuScore)</b></td></tr>")
-} else {
-    [void]$sb.AppendLine("<tr><td><b>CPU</b></td><td>$($sys.CPU)</td></tr>")
-}
-
-foreach ($gpu in $sys.GPUs) {
-    if ($gpu.Kind -eq 'Integrated') { continue }
-    $gs = $enrichment.GpuScores | Where-Object { $_.Name -eq $gpu.Name } | Select-Object -First 1
-    $scoreText = if ($gs -and $gs.Score) { " - PassMark G3D Mark: <b>$($gs.Score)</b>" } else { '' }
-    [void]$sb.AppendLine("<tr><td><b>GPU</b></td><td>$($gpu.Name) - <b>$($gpu.VRAM_GB) GB VRAM</b>$scoreText</td></tr>")
-}
-
-$installedNvVer = ($sys.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1)
-if ($installedNvVer) {
-    $nvLatestText = if ($enrichment.LatestNvidia) { " (latest: $($enrichment.LatestNvidia))" } else { '' }
-    [void]$sb.AppendLine("<tr><td><b>NVIDIA Driver</b></td><td>$($installedNvVer.DriverVersion) - $($installedNvVer.DriverDate)$nvLatestText</td></tr>")
-}
-if ($enrichment.LatestAmd) {
-    [void]$sb.AppendLine("<tr><td><b>AMD Driver</b></td><td>$(($sys.GPUs | Where-Object { $_.Name -match 'Radeon' } | Select-Object -First 1).DriverVersion) (latest: $($enrichment.LatestAmd))</td></tr>")
-}
-if ($enrichment.LatestIntelGpu) {
-    [void]$sb.AppendLine("<tr><td><b>Intel Graphics Driver</b></td><td>$(($sys.GPUs | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1).DriverVersion) (latest: $($enrichment.LatestIntelGpu))</td></tr>")
-}
-
-[void]$sb.AppendLine("</table></div>")
-
-# RAM modules
-if ($systemVerify.RamModules.Count -gt 0) {
-    [void]$sb.AppendLine("<h3>RAM Modules (from SPD)</h3><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th>Manufacturer</th><th>Part Number</th><th>Capacity</th><th>Rated MHz</th><th>Configured MHz</th></tr>")
-    foreach ($m in $systemVerify.RamModules) {
-        $speedFlag = if ($m.ConfiguredMHz -lt $m.SpeedMHz) { "$($m.ConfiguredMHz) (below rated)" } else { $m.ConfiguredMHz }
-        [void]$sb.AppendLine("<tr><td>$($m.Manufacturer)</td><td class='small'>$($m.PartNumber)</td><td>$($m.CapacityGB) GB</td><td>$($m.SpeedMHz)</td><td>$speedFlag</td></tr>")
-    }
-    [void]$sb.AppendLine("</table></div>")
-}
-
-# Disk SMART
-if ($systemVerify.DiskReliability.Count -gt 0) {
-    [void]$sb.AppendLine("<h3>Disk Health (SMART)</h3><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th>Disk</th><th>Media</th><th>Health</th><th>Wear %</th><th>Temp C</th><th>Power-On Hours</th><th>Read/Write Errors</th><th>Firmware</th></tr>")
-    foreach ($d in $systemVerify.DiskReliability) {
-        $hCls = if ($d.HealthStatus -eq 'Healthy') { 'green' } else { 'red' }
-        $wearCls = if ($d.Wear -and $d.Wear -ge 80) { 'red' } elseif ($d.Wear -and $d.Wear -ge 50) { 'yellow' } else { 'green' }
-        $wearCell = if ($d.Wear -ne $null) { "<span class='chip $wearCls'>$($d.Wear)%</span>" } else { 'n/a' }
-        [void]$sb.AppendLine("<tr><td>$($d.FriendlyName)</td><td>$($d.BusType)/$($d.MediaType)</td><td><span class='chip $hCls'>$($d.HealthStatus)</span></td><td>$wearCell</td><td>$($d.Temperature)</td><td>$($d.PowerOnHours)</td><td>$($d.ReadErrors) / $($d.WriteErrors)</td><td class='small'>$($d.Firmware)</td></tr>")
-    }
-    [void]$sb.AppendLine("</table></div>")
-}
-
-# Network Adapter Capabilities
-if ($systemVerify.AdapterCapabilities.Count -gt 0) {
-    [void]$sb.AppendLine("<h3>Network Adapter Capabilities</h3><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th>Adapter</th><th>Description</th><th>Running</th><th>Capability</th><th>Driver</th></tr>")
-    foreach ($a in $systemVerify.AdapterCapabilities) {
-        $runCls =
-            if ($a.Status -and $a.Status -ne 'Up')              { 'gray' }
-            elseif ($a.LinkSpeed -eq '0 bps' -or $a.LinkSpeed -match '^0\s') { 'gray' }
-            elseif ($a.MaxSpeed -and $a.LinkSpeed -and $a.MaxSpeed -ne $a.LinkSpeed) { 'yellow' }
-            else { 'green' }
-        [void]$sb.AppendLine("<tr><td>$($a.Name)</td><td class='small'>$($a.Description)</td><td><span class='chip $runCls'>$($a.LinkSpeed)</span></td><td>$($a.MaxSpeed)</td><td>$($a.DriverVersion)</td></tr>")
-    }
-    [void]$sb.AppendLine("</table></div>")
-}
-
-# Battery Health
-if ($sys.Battery -and $sys.Battery.HealthPercent -ne $null) {
-    [void]$sb.AppendLine("<h3>Battery Health</h3><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th style='width:220px'>Design capacity</th><td>$($sys.Battery.DesignCapacity) mWh</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Full charge capacity</th><td>$($sys.Battery.FullCharge) mWh</td></tr>")
-    $battCls = if ($sys.Battery.HealthPercent -ge 80) { 'green' } elseif ($sys.Battery.HealthPercent -ge 60) { 'yellow' } else { 'red' }
-    [void]$sb.AppendLine("<tr><th>Health</th><td><span class='chip $battCls'>$($sys.Battery.HealthPercent)%</span></td></tr>")
-    [void]$sb.AppendLine("<tr><th>Cycle count</th><td>$($sys.Battery.CycleCount)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Chemistry</th><td>$($sys.Battery.Chemistry)</td></tr>")
-    [void]$sb.AppendLine("</table></div>")
-}
-
-# Defender exclusions
-if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
-    [void]$sb.AppendLine("<h3>Defender Exclusions</h3><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th style='width:220px'>Paths</th><td>$($defenderExcl.Paths -join '<br>')</td></tr>")
-    if ($defenderExcl.Extensions.Count -gt 0) {
-        [void]$sb.AppendLine("<tr><th>Extensions</th><td>$($defenderExcl.Extensions -join ', ')</td></tr>")
-    }
-    [void]$sb.AppendLine("</table></div>")
-}
-
-# Findings
-$topFindings = @()
-foreach ($r in $allResults) {
-    if ($r.IsSynthetic) { continue }
-    foreach ($f in $r.Findings) { $topFindings += $f }
-}
-$topFindings = @($topFindings | Sort-Object @{e={ if ($_.Severity -eq 'critical') { 0 } else { 1 } }}, Id)
-
-[void]$sb.AppendLine("<h2>Findings ($($topFindings.Count))</h2>")
-if ($topFindings.Count -eq 0) {
-    [void]$sb.AppendLine("<div class='card'>No findings. Everything detected is healthy.</div>")
-} else {
-    foreach ($f in $topFindings) {
-        $sevCls = if ($f.Severity -eq 'critical') { 'sev-critical' } else { 'sev-warn' }
-        $chipCls = if ($f.Severity -eq 'critical') { 'red' } else { 'yellow' }
-        $chipTxt = if ($f.Severity -eq 'critical') { 'CRITICAL' } else { 'ATTENTION' }
-        [void]$sb.AppendLine("<div class='finding $sevCls'>")
-        [void]$sb.AppendLine("<div class='finding-head'><span class='finding-title'>$($f.Problem)</span><span class='chip $chipCls'>$chipTxt</span></div>")
-        [void]$sb.AppendLine("<table class='finding-body'>")
-        [void]$sb.AppendLine("<tr><th>Software</th><td>$($f.Software)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Detected</th><td>$($f.Detected)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Why it matters</th><td>$($f.WhyItMatters)</td></tr>")
-        [void]$sb.AppendLine("<tr><th>Recommended</th><td>$($f.Recommendation)</td></tr>")
-        if ($f.Optional) {
-            [void]$sb.AppendLine("<tr><th>Optional</th><td>$($f.Optional)</td></tr>")
-        }
-        [void]$sb.AppendLine("</table></div>")
-    }
-}
 
 # Machine
 [void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
 foreach ($kv in @(
     @('OS', $sys.OS), @('Display version', $sys.OSDisplayVersion),
     @('Architecture', $sys.Arch),
-    @('CPU', "$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T)"),
+    @('CPU', "$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T @ $($sys.ClockMHz) MHz)"),
     @('RAM', "$($sys.RAM_GB) GB (free $($sys.FreeRAM_GB) GB)"),
     @('.NET Framework', $netFx),
-    @('VC++ Redistributables', $vc.Count),
+    @('VC++ Redistributables', "$($vc.Count) installed"),
     @('PowerShell', $PSVersionTable.PSVersion.ToString()),
     @('Admin', $sys.IsAdmin),
     @('Power', $sys.Power.StatusText),
-    @('Discrete GPU', $sys.HasDiscreteGPU)
+    @('PassMark CPU Mark', if ($enrichment.CpuScore) { $enrichment.CpuScore } else { 'unavailable' })
 )) {
     [void]$sb.AppendLine("<tr><th style='width:220px'>$($kv[0])</th><td>$($kv[1])</td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Graphics
-[void]$sb.AppendLine("<h2>Graphics</h2><div class='card'><table><tr><th>GPU</th><th>Kind</th><th>Driver</th><th>Date</th><th>VRAM (GB)</th><th>Resolution</th><th>Refresh</th></tr>")
+# GPUs
+[void]$sb.AppendLine("<h2>Graphics</h2><div class='card'><table><tr><th>GPU</th><th>Kind</th><th>Driver</th><th>Date</th><th>VRAM (GB)</th><th>Resolution</th><th>G3D Mark</th></tr>")
 foreach ($g in $sys.GPUs) {
-    [void]$sb.AppendLine("<tr><td>$($g.Name)</td><td>$($g.Kind)</td><td>$($g.DriverVersion)</td><td>$($g.DriverDate)</td><td><b>$($g.VRAM_GB)</b></td><td>$($g.Resolution)</td><td>$($g.RefreshHz)</td></tr>")
+    $score = ($enrichment.GpuScores | Where-Object { $_.Name -eq $g.Name } | Select-Object -First 1).Score
+    [void]$sb.AppendLine("<tr><td>$($g.Name)</td><td>$($g.Kind)</td><td>$($g.DriverVersion)</td><td>$($g.DriverDate)</td><td><b>$($g.VRAM_GB)</b></td><td>$($g.Resolution)</td><td>$(if($score){$score}else{'-'})</td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
-
-# Live GPU sample
-if ($LiveGpu -and $LiveGpu.Count -gt 0) {
-    [void]$sb.AppendLine("<h2>Live GPU Sample</h2><div class='card'><table><tr><th>PID</th><th>Process</th><th>GPU %</th></tr>")
-    foreach ($g in $LiveGpu) {
-        [void]$sb.AppendLine("<tr><td>$($g.Pid)</td><td>$($g.Process)</td><td>$($g.GPU)%</td></tr>")
-    }
-    [void]$sb.AppendLine("</table></div>")
-}
 
 # Disks
 [void]$sb.AppendLine("<h2>Disks</h2><div class='card'><table><tr><th>Drive</th><th>Label</th><th>FS</th><th>Size GB</th><th>Free GB</th><th>Free %</th></tr>")
@@ -3496,142 +2550,82 @@ foreach ($d in $sys.Disks) {
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Windows Health
-[void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
-$rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
-[void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
-$wuCls = if ($windowsHealth.UpdateService -eq 'Disabled') { 'red' } elseif ($windowsHealth.UpdateService -eq 'Running') { 'green' } else { 'gray' }
-[void]$sb.AppendLine("<tr><th>Windows Update service</th><td><span class='chip $wuCls'>$($windowsHealth.UpdateService)</span></td></tr>")
-[void]$sb.AppendLine("<tr><th>Defender</th><td>$($windowsHealth.Defender)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Defender signature</th><td>$($windowsHealth.DefenderSig) ($($windowsHealth.DefenderSigDate))</td></tr>")
-[void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Activation</th><td>$($windowsHealth.Activation)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Build age</th><td>$($windowsHealth.BuildAgeDays) days</td></tr>")
-$effectiveWin = if ($score.Categories.Contains('Windows') -and $score.Categories['Windows'] -ne $null) {
-    $score.Categories['Windows']
-} else { $windowsHealth.Score }
-[void]$sb.AppendLine("<tr><th>Score</th><td><b>$effectiveWin/100</b></td></tr>")
-[void]$sb.AppendLine("</table></div>")
+# Requirement scan section
+if ($requirementResults.Count -gt 0) {
+    [void]$sb.AppendLine("<h2>Discipline Requirement Scan - $($Disciplines -join ', ')</h2>")
+    [void]$sb.AppendLine("<p class='small'>For each app, every vendor requirement is checked against this PC. Online sources verify hardware scores and latest published software versions where available.</p>")
 
-# Power
-[void]$sb.AppendLine("<h2>Power</h2><div class='card'><table>")
-[void]$sb.AppendLine("<tr><th style='width:220px'>Has battery</th><td>$($sys.Power.HasBattery)</td></tr>")
-$acChip = if ($sys.Power.OnAC) { 'Yes' } else { "<span class='chip yellow'>No</span>" }
-[void]$sb.AppendLine("<tr><th>On AC power</th><td>$acChip</td></tr>")
-if ($sys.Power.Percent -ne $null) {
-    [void]$sb.AppendLine("<tr><th>Charge</th><td>$($sys.Power.Percent)%</td></tr>")
-}
-[void]$sb.AppendLine("<tr><th>Status</th><td>$($sys.Power.StatusText)</td></tr>")
-[void]$sb.AppendLine("</table></div>")
+    foreach ($rr in $requirementResults) {
+        $cls = if ($rr.Verdict -eq 'MEETS' -or $rr.Verdict -eq 'MEETS (unverified)') { 'meets' }
+               elseif ($rr.Verdict -eq 'PARTIALLY MEETS') { 'partial' } else { 'fails' }
+        $chipCls = if ($chipForVerdict.ContainsKey($rr.Verdict)) { $chipForVerdict[$rr.Verdict] } else { 'gray' }
 
-# Network
-[void]$sb.AppendLine("<h2>Network</h2><div class='card'><table>")
-
-$netLink = if ($systemVerify.AdapterCapabilities.Count -gt 0) {
-    $up = $systemVerify.AdapterCapabilities | Where-Object { $_.Status -eq 'Up' -and $_.LinkSpeed -ne '0 bps' }
-    if ($up) {
-        ($up | Sort-Object {
-            if ($_.LinkSpeed -match '([\d\.]+)\s*Gbps') { [double]$matches[1]*1000 }
-            elseif ($_.LinkSpeed -match '([\d\.]+)\s*Mbps') { [double]$matches[1] }
-            else { 0 }
-        } -Descending | Select-Object -First 1).LinkSpeed
-    } else { 'Disconnected' }
-} else { $networkHealth.LinkSpeedText }
-
-[void]$sb.AppendLine("<tr><th style='width:220px'>Link speed</th><td>$netLink</td></tr>")
-$dnsChip = if ($networkHealth.DNS -eq 'OK') { "<span class='chip green'>OK ($($networkHealth.DNSms) ms)</span>" } else { "<span class='chip red'>$($networkHealth.DNS)</span>" }
-[void]$sb.AppendLine("<tr><th>DNS</th><td>$dnsChip</td></tr>")
-[void]$sb.AppendLine("<tr><th>Default gateway</th><td>$($networkHealth.DefaultGW)</td></tr>")
-[void]$sb.AppendLine("<tr><th>Category score</th><td><b>$($networkHealth.Score)/100</b></td></tr>")
-[void]$sb.AppendLine("</table>")
-if ($networkHealth.Adapters.Count -gt 0) {
-    [void]$sb.AppendLine("<h3 style='margin-top:16px'>Adapters</h3>")
-    [void]$sb.AppendLine("<table><tr><th>Name</th><th>Link speed</th><th>Max</th><th>MAC</th><th>Media</th></tr>")
-    foreach ($a in $networkHealth.Adapters) {
-        [void]$sb.AppendLine("<tr><td>$($a.Name)</td><td>$($a.LinkSpeed)</td><td>$($a.MaxSpeed)</td><td>$($a.Mac)</td><td>$($a.MediaType)</td></tr>")
-    }
-    [void]$sb.AppendLine("</table>")
-}
-[void]$sb.AppendLine("</div>")
-
-# License Center
-if ($networkHealth.License.Count -gt 0) {
-    [void]$sb.AppendLine("<h2>License Center</h2><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th>Product</th><th>Ports</th><th>Local</th></tr>")
-    foreach ($l in $networkHealth.License) {
-        $chip = if ($l.Local) { "<span class='chip green'>OPEN</span>" } else { "<span class='chip gray'>CLOSED</span>" }
-        [void]$sb.AppendLine("<tr><td>$($l.Product)</td><td>$($l.Ports)</td><td>$chip</td></tr>")
-    }
-    [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers.</p></div>")
-}
-
-# Project Guardian output
-if ($guardian) {
-    [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'>")
-    [void]$sb.AppendLine("<p><b>$($guardian.Root)</b></p>")
-    [void]$sb.AppendLine("<table>")
-    [void]$sb.AppendLine("<tr><th style='width:220px'>Total files</th><td>$($guardian.TotalFiles)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Total size</th><td>$($guardian.TotalGB) GB</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Engineering files</th><td>$($guardian.EngineeringFiles)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Long paths</th><td>$($guardian.LongPaths)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Backup/temp files</th><td>$($guardian.BackupFiles) (old: $($guardian.OldBackups))</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Large files</th><td>$($guardian.LargeFiles) ($($guardian.LargeGB) GB)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>References scanned</th><td>$($guardian.RefTotal)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Broken references</th><td>$($guardian.RefMissing)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Project Health</th><td><b>$($guardian.Health)%</b></td></tr>")
-    [void]$sb.AppendLine("</table>")
-    if ($guardian.RefMissingList -and $guardian.RefMissingList.Count -gt 0) {
-        [void]$sb.AppendLine("<h3 style='margin-top:16px'>Broken references (first 50)</h3>")
-        [void]$sb.AppendLine("<table><tr><th>Drawing</th><th>Type</th><th>Reference</th></tr>")
-        foreach ($ref in ($guardian.RefMissingList | Select-Object -First 50)) {
-            [void]$sb.AppendLine("<tr><td class='small'>$($ref.Drawing)</td><td>$($ref.Type)</td><td class='small'>$($ref.Ref)</td></tr>")
-        }
-        [void]$sb.AppendLine("</table>")
-    }
-    [void]$sb.AppendLine("</div>")
-}
-
-# Disciplines
-$realInstalled = @($allResults | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') -and -not $_.IsSynthetic })
-if ($realInstalled.Count -eq 0) {
-    [void]$sb.AppendLine("<h2>Disciplines</h2>")
-    [void]$sb.AppendLine("<div class='card'>No engineering software detected. $($Script:CatalogCount) catalog products were checked; all are not installed.</div>")
-} else {
-    [void]$sb.AppendLine("<h2>Disciplines</h2>")
-    foreach ($d in $byDisc.Keys | Sort-Object) {
-        $rs = $byDisc[$d] | Sort-Object State, Name
-        $g  = @($rs | Where-Object State -eq 'Healthy').Count
-        $y  = @($rs | Where-Object State -eq 'Attention').Count
-        $rr = @($rs | Where-Object State -eq 'Critical').Count
-        [void]$sb.AppendLine("<div class='disc'><h3>$d <span class='small'>($g healthy / $y attention / $rr critical)</span></h3>")
-        [void]$sb.AppendLine("<table><tr><th>Software</th><th>Kind</th><th>Status</th><th>Version</th><th>Findings</th></tr>")
-        foreach ($p in $rs) {
-            $cls = if ($chipClass.ContainsKey($p.State)) { $chipClass[$p.State] } else { 'gray' }
-            $msg = @()
-            foreach ($f in $p.Findings) {
-                $mark = if ($f.Severity -eq 'critical') { '!!' } else { '!' }
-                $msg += "$mark $($f.Problem)"
-            }
-            foreach ($n in $p.Notes) { $msg += ". $n" }
-            $msg = $msg -join '<br>'
-            [void]$sb.AppendLine("<tr><td><b>$($p.Name)</b></td><td>$($p.Kind)</td><td><span class='chip $cls'>$($p.State)</span></td><td>$($p.Version)</td><td class='small'>$msg</td></tr>")
+        [void]$sb.AppendLine("<div class='product-block $cls'>")
+        [void]$sb.AppendLine("<div class='product-head'>")
+        [void]$sb.AppendLine("<div><div class='product-name'>$($rr.Product)</div><div class='product-disc'>$($rr.Disciplines) · $($rr.Kind)</div></div>")
+        [void]$sb.AppendLine("<div><span class='chip $chipCls'>$($rr.Verdict)</span></div>")
+        [void]$sb.AppendLine("</div>")
+        [void]$sb.AppendLine("<table>")
+        [void]$sb.AppendLine("<tr><th style='width:160px'>Component</th><th style='width:220px'>Required</th><th style='width:220px'>Actual</th><th style='width:80px'>Status</th><th>Note</th></tr>")
+        foreach ($c in $rr.Checks) {
+            $sc = if ($chipForStatus.ContainsKey($c.Status)) { $chipForStatus[$c.Status] } else { 'gray' }
+            $latest = if ($c.PSObject.Properties.Match('LatestOnline').Count -and $c.LatestOnline) { " <span class='small'>(latest online: $($c.LatestOnline))</span>" } else { '' }
+            [void]$sb.AppendLine("<tr><td><b>$($c.Component)</b></td><td>$($c.Required)$latest</td><td>$($c.Actual)</td><td><span class='chip $sc'>$($c.Status)</span></td><td class='small'>$($c.Note)</td></tr>")
         }
         [void]$sb.AppendLine("</table></div>")
     }
 }
 
-[void]$sb.AppendLine("<p class='small'>End of report. Findings are advisory, not errors.</p>")
+# Windows Health
+[void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
+$rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
+[void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
+[void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$($windowsHealth.UpdateService)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Defender</th><td>$($windowsHealth.Defender)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Defender signature</th><td>$($windowsHealth.DefenderSig) ($($windowsHealth.DefenderSigDate))</td></tr>")
+[void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Activation</th><td>$($windowsHealth.Activation)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Build age</th><td>$($windowsHealth.BuildAgeDays) days</td></tr>")
+[void]$sb.AppendLine("</table></div>")
+
+# Event logs
+[void]$sb.AppendLine("<h2>Event Logs (last 7 days)</h2><div class='card'><table>")
+[void]$sb.AppendLine("<tr><th style='width:220px'>WHEA errors</th><td>$($eventLogs.WheaCount)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Disk / controller errors</th><td>$($eventLogs.DiskErrors)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Thermal events</th><td>$($eventLogs.ThermalEvents)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Unexpected shutdowns</th><td>$($eventLogs.UnexpectedShutdown)</td></tr>")
+[void]$sb.AppendLine("<tr><th>Application crashes</th><td>$($eventLogs.AppCrashes)</td></tr>")
+[void]$sb.AppendLine("</table></div>")
+
+# Installed software
+[void]$sb.AppendLine("<h2>Installed Software ($($installed.Count))</h2><div class='card'><table>")
+[void]$sb.AppendLine("<tr><th>Name</th><th>Version</th><th>Publisher</th></tr>")
+foreach ($s in ($installed | Sort-Object DisplayName | Select-Object -First 200)) {
+    [void]$sb.AppendLine("<tr><td>$($s.DisplayName)</td><td>$($s.DisplayVersion)</td><td>$($s.Publisher)</td></tr>")
+}
+[void]$sb.AppendLine("</table></div>")
+
+if ($guardian) {
+    [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th style='width:220px'>Root</th><td>$($guardian.Root)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Total files</th><td>$($guardian.TotalFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Total size</th><td>$($guardian.TotalGB) GB</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Engineering files</th><td>$($guardian.EngineeringFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Long paths</th><td>$($guardian.LongPaths)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Backup/temp files</th><td>$($guardian.BackupFiles) (old: $($guardian.OldBackups))</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Project health</th><td><b>$($guardian.Health)%</b></td></tr>")
+    [void]$sb.AppendLine("</table></div>")
+}
+
+[void]$sb.AppendLine("<p class='small'>End of report. Requirements are checked against curated vendor specifications; verify against vendor documentation before critical deployments.</p>")
 [void]$sb.AppendLine("</body></html>")
+
 $sb.ToString() | Set-Content "$reportBase.html" -Encoding UTF8
 Write-Ok
 
 # =============================================================================
-# 11. FINAL
+# FINAL
 # =============================================================================
-Write-Stage "Finalising..."
-$null = Get-Item "$reportBase.html" -ErrorAction SilentlyContinue
-Write-Ok
-
 if (Test-Path $errorLog) { Remove-Item $errorLog -Force -ErrorAction SilentlyContinue }
 
 Write-Host "[SUCCESS] Engineering diagnostic complete." -ForegroundColor Green
@@ -3644,13 +2638,8 @@ Write-Host ""
 
 if ($NonInteractive) { exit 0 }
 
-$finalChoice = Read-Host "Press R to open report folder, I to install software, or Q to quit"
+$finalChoice = Read-Host "Press R to open report folder, or Q to quit"
 switch -Regex ($finalChoice) {
-    '^[Rr]$' {
-        Start-Process $exportPath
-    }
-    '^[Ii]$' {
-        Invoke-Installer -Disciplines $Disciplines -InstallList @()
-    }
-    default { exit 0 }
+    '^[Rr]$' { Start-Process $exportPath }
+    default  { exit 0 }
 }
