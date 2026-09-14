@@ -4,38 +4,10 @@
     Sigma Engineer Toolkit — engineering workstation diagnostic + software installer.
 .DESCRIPTION
     Read-only diagnostic pass over every engineering discipline.
-    Detects installed software, checks prerequisites, writes a report.
-
-    Accuracy fixes:
-      * GPU VRAM read from registry (not Win32_VideoController.AdapterRAM)
-      * Channel-aware Windows build comparison
-      * Robust winget upgrade parsing
-      * SMART via smartctl fallback
-      * N/A categories excluded from weighted score + DataConfidence score
-      * Real CPU/GPU/SSD thermals when available
-      * Battery health, event log scan, Defender exclusion audit
-      * Wi-Fi band/channel/signal, driver age penalties, BIOS lookup
-.PARAMETER Disciplines
-    Optional filter. If set, only products relevant to these disciplines are
-    fully evaluated. Others are marked NotApplicable.
-.PARAMETER Preflight
-    Single-product preflight readiness check (e.g. -Preflight ANSYS).
-.PARAMETER ProjectGuardian
-    Path to a project folder to inspect for engineering project issues.
-.PARAMETER DeepScan
-    Also measure cache folders. Slower.
-.PARAMETER WhySlow
-    Quick bottleneck snapshot.
-.PARAMETER LiveGpuSample
-    Sample GPU engine utilization via performance counters.
-.PARAMETER NonInteractive
-    Skip confirmation prompts.
-.PARAMETER Offline
-    Skip all online enrichment.
-.PARAMETER Install
-    Interactive software installer.
-.PARAMETER InstallList
-    Non-interactive batch install by product name(s).
+    Accuracy patches applied: Windows Update trigger-start handling, event-log
+    to findings conversion, Wi-Fi detail capture, disk enumeration for SMART,
+    Defender exclusion filtering, GPU resolution guard, PassMark scraper fixes,
+    NVIDIA driver feed fallback, VC++ online lookup fix, honest N/A confidence.
 #>
 [CmdletBinding()]
 param(
@@ -150,7 +122,6 @@ function Get-GpuKind {
     return 'Unknown'
 }
 
-# [FIX] Read GPU VRAM from the registry (Win32_VideoController.AdapterRAM caps at ~4 GB)
 function Get-GpuVramMap {
     $map = @{}
     $base = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
@@ -162,15 +133,9 @@ function Get-GpuVramMap {
                 $sz   = $p.'HardwareInformation.qwMemorySize'
                 if (-not $sz) { $sz = $p.'HardwareInformation.MemorySize' }
                 if ($desc -and $sz) {
-                    # Some Intel entries store MemorySize as a UInt32 with a signed bug.
-                    try {
-                        $bytes = [uint64]$sz
-                    } catch {
-                        $bytes = 0
-                    }
+                    try { $bytes = [uint64]$sz } catch { $bytes = 0 }
                     if ($bytes -gt 0) {
                         $gb = [math]::Round($bytes / 1GB, 2)
-                        # Keep largest per description (some entries duplicate)
                         if (-not $map.ContainsKey($desc) -or $map[$desc] -lt $gb) {
                             $map[$desc] = $gb
                         }
@@ -184,7 +149,6 @@ function Get-GpuVramMap {
     return $map
 }
 
-# [FIX] Look up a GPU description in the VRAM map, matching loosely
 function Resolve-GpuVram {
     param([string]$GpuName, [hashtable]$Map)
     if (-not $GpuName -or -not $Map) { return $null }
@@ -197,12 +161,9 @@ function Resolve-GpuVram {
     return $null
 }
 
-# [FIX] Real CPU/GPU/SSD thermals via LibreHardwareMonitor / OpenHardwareMonitor WMI,
-# falling back to MSAcpi thermal zones, and finally disk temperatures.
 function Get-ThermalInfo {
     $zones = @()
 
-    # 1) LibreHardwareMonitor / OpenHardwareMonitor WMI root
     foreach ($ns in @('root\LibreHardwareMonitor','root\OpenHardwareMonitor')) {
         try {
             $sensors = Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop |
@@ -218,7 +179,6 @@ function Get-ThermalInfo {
         } catch { }
     }
 
-    # 2) ACPI thermal zones
     if ($zones.Count -eq 0) {
         try {
             $t = Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop
@@ -237,7 +197,6 @@ function Get-ThermalInfo {
         } catch { }
     }
 
-    # 3) Disk temperatures from storage reliability counters
     try {
         foreach ($d in Get-PhysicalDisk -ErrorAction Stop) {
             try {
@@ -293,7 +252,6 @@ function Get-PowerState {
     }
 }
 
-# [FIX] Battery health from battery WMI classes
 function Get-BatteryHealth {
     $r = [ordered]@{
         DesignCapacity = $null
@@ -324,16 +282,17 @@ function Get-BatteryHealth {
     return [pscustomobject]$r
 }
 
-# [FIX] Scan recent event logs for hardware and application problems
+# [PATCH D] Event log scan with disk-number resolution
 function Get-EventLogIssues {
     $since = (Get-Date).AddDays(-7)
     $r = [ordered]@{
-        WheaCount        = 0
-        DiskErrors       = 0
-        ThermalEvents    = 0
+        WheaCount          = 0
+        DiskErrors         = 0
+        DiskErrorDevices   = @()
+        ThermalEvents      = 0
         UnexpectedShutdown = 0
-        AppCrashes       = 0
-        Samples          = @()
+        AppCrashes         = 0
+        Samples            = @()
     }
     try {
         $whea = @(Get-WinEvent -FilterHashtable @{
@@ -351,6 +310,13 @@ function Get-EventLogIssues {
             StartTime=$since; Level=@(1,2,3)
         } -ErrorAction SilentlyContinue)
         $r.DiskErrors = $disk.Count
+        $devSet = @{}
+        foreach ($e in $disk) {
+            if ($e.Message -match 'Harddisk(\d+)') {
+                $devSet[$matches[1]] = $true
+            }
+        }
+        $r.DiskErrorDevices = @($devSet.Keys)
         foreach ($e in ($disk | Select-Object -First 3)) {
             $r.Samples += [pscustomobject]@{ Type='Disk'; Id=$e.Id; Time=$e.TimeCreated.ToString('s'); Msg=$e.Message.Split("`n")[0] }
         }
@@ -381,23 +347,32 @@ function Get-EventLogIssues {
     return [pscustomobject]$r
 }
 
-# [FIX] Check Defender exclusions for engineering/project folders
+# [PATCH E] Filter empty exclusion entries
 function Get-DefenderExclusions {
     try {
         $pref = Get-MpPreference -ErrorAction Stop
         return [pscustomobject]@{
-            Paths       = @($pref.ExclusionPath)
-            Extensions  = @($pref.ExclusionExtension)
-            Processes   = @($pref.ExclusionProcess)
+            Paths      = @($pref.ExclusionPath      | Where-Object { $_ -and $_.Trim() })
+            Extensions = @($pref.ExclusionExtension | Where-Object { $_ -and $_.Trim() })
+            Processes  = @($pref.ExclusionProcess   | Where-Object { $_ -and $_.Trim() })
         }
     } catch {
         return [pscustomobject]@{ Paths = @(); Extensions = @(); Processes = @() }
     }
 }
 
-# [FIX] Wi-Fi details via netsh
+# [PATCH C] Wi-Fi details with service start + NetConnectionProfile fallback
 function Get-WifiDetails {
     $r = [ordered]@{ Interfaces = @() }
+
+    try {
+        $svc = Get-Service wlansvc -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Running') {
+            Start-Service wlansvc -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        }
+    } catch { }
+
     try {
         $raw = netsh wlan show interfaces 2>$null | Out-String
         $block = @{}
@@ -406,23 +381,33 @@ function Get-WifiDetails {
                 if ($block.Count -gt 0) { $r.Interfaces += [pscustomobject]$block; $block = @{} }
                 $block['Name'] = $matches[1].Trim()
             }
-            elseif ($line -match '^\s*Description\s*:\s*(.+)$')        { $block['Description']    = $matches[1].Trim() }
-            elseif ($line -match '^\s*State\s*:\s*(.+)$')              { $block['State']          = $matches[1].Trim() }
-            elseif ($line -match '^\s*SSID\s*:\s*(.+)$')               { $block['SSID']           = $matches[1].Trim() }
-            elseif ($line -match '^\s*BSSID\s*:\s*(.+)$')              { $block['BSSID']          = $matches[1].Trim() }
-            elseif ($line -match '^\s*Radio type\s*:\s*(.+)$')         { $block['RadioType']      = $matches[1].Trim() }
-            elseif ($line -match '^\s*Band\s*:\s*(.+)$')               { $block['Band']           = $matches[1].Trim() }
-            elseif ($line -match '^\s*Channel\s*:\s*(.+)$')            { $block['Channel']        = $matches[1].Trim() }
-            elseif ($line -match '^\s*Signal\s*:\s*(.+)$')             { $block['Signal']         = $matches[1].Trim() }
-            elseif ($line -match '^\s*Receive rate.*:\s*(.+)$')        { $block['ReceiveRate']    = $matches[1].Trim() }
-            elseif ($line -match '^\s*Transmit rate.*:\s*(.+)$')       { $block['TransmitRate']   = $matches[1].Trim() }
+            elseif ($line -match '^\s*Description\s*:\s*(.+)$')   { $block['Description'] = $matches[1].Trim() }
+            elseif ($line -match '^\s*State\s*:\s*(.+)$')         { $block['State']       = $matches[1].Trim() }
+            elseif ($line -match '^\s*SSID\s*:\s*(.+)$')          { $block['SSID']        = $matches[1].Trim() }
+            elseif ($line -match '^\s*BSSID\s*:\s*(.+)$')         { $block['BSSID']       = $matches[1].Trim() }
+            elseif ($line -match '^\s*Radio type\s*:\s*(.+)$')    { $block['RadioType']   = $matches[1].Trim() }
+            elseif ($line -match '^\s*Band\s*:\s*(.+)$')          { $block['Band']        = $matches[1].Trim() }
+            elseif ($line -match '^\s*Channel\s*:\s*(.+)$')       { $block['Channel']     = $matches[1].Trim() }
+            elseif ($line -match '^\s*Signal\s*:\s*(.+)$')        { $block['Signal']      = $matches[1].Trim() }
+            elseif ($line -match '^\s*Receive rate.*:\s*(.+)$')   { $block['ReceiveRate'] = $matches[1].Trim() }
+            elseif ($line -match '^\s*Transmit rate.*:\s*(.+)$')  { $block['TransmitRate']= $matches[1].Trim() }
         }
         if ($block.Count -gt 0) { $r.Interfaces += [pscustomobject]$block }
     } catch { }
+
+    if ($r.Interfaces.Count -eq 0) {
+        try {
+            $cp = Get-NetConnectionProfile -InterfaceAlias 'Wi-Fi' -ErrorAction Stop
+            $r.Interfaces += [pscustomobject]@{
+                Name = 'Wi-Fi'; SSID = $cp.Name; State = 'Connected'
+                Band = ''; Channel = ''; RadioType = $cp.NetworkCategory; Signal = ''
+            }
+        } catch { }
+    }
     return [pscustomobject]$r
 }
 
-# [FIX] SMART data with smartctl fallback
+# [PATCH D] Enumerate via Get-Disk so all physical devices appear
 function Get-DiskReliability {
     $out = @()
     $smartctl = Get-Command smartctl -ErrorAction SilentlyContinue
@@ -446,7 +431,6 @@ function Get-DiskReliability {
             Source        = 'Win32'
         }
 
-        # smartctl fallback for NVMe / SSD details
         if ($smartctl -and -not $entry.PowerOnHours) {
             try {
                 $devPath = "\\.\PHYSICALDRIVE$($d.DeviceId)"
@@ -461,8 +445,8 @@ function Get-DiskReliability {
                         if ($log.media_errors   -ne $null)                 { $entry.ReadErrors   = $log.media_errors }
                         if ($log.num_err_log_entries -ne $null)            { $entry.WriteErrors  = $log.num_err_log_entries }
                     }
-                    if ($sd.serial_number)  { $entry.Serial   = $sd.serial_number }
-                    if ($sd.firmware_version) { $entry.Firmware = $sd.firmware_version }
+                    if ($sd.serial_number)   { $entry.Serial   = $sd.serial_number }
+                    if ($sd.firmware_version){ $entry.Firmware = $sd.firmware_version }
                     $entry.Source = 'smartctl'
                 }
             } catch { }
@@ -593,7 +577,7 @@ $baseline = [pscustomobject]@{
 Write-Host "[INFO] Baseline: $($baseline.When) on $($baseline.Computer) as $($baseline.User)" -ForegroundColor DarkGray
 
 # =============================================================================
-# 1. MASTER CATALOG (unchanged)
+# 1. MASTER CATALOG
 # =============================================================================
 Write-Stage "Loading master catalog..."
 $Script:RawCatalog = @(
@@ -840,7 +824,7 @@ $Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
 
 # =============================================================================
-# 2. DISCIPLINE PROFILES (unchanged)
+# 2. DISCIPLINE PROFILES
 # =============================================================================
 Write-Stage "Loading discipline profiles..."
 $Script:Profiles = @{
@@ -899,7 +883,7 @@ $installed = Get-InstalledSoftware
 Write-Host " $($installed.Count) entries." -ForegroundColor Green
 
 # =============================================================================
-# 4. SYSTEM INVENTORY (with fixed VRAM + richer thermals)
+# 4. SYSTEM INVENTORY
 # =============================================================================
 Write-Stage "Capturing system inventory..."
 $sys = & {
@@ -908,23 +892,24 @@ $sys = & {
     $cpu  = Get-CimInstance Win32_Processor | Select-Object -First 1
     $gpus = @(Get-CimInstance Win32_VideoController)
 
-    # [FIX] Accurate VRAM from registry
     $vramMap = Get-GpuVramMap
 
     $gpuInfo = foreach ($g in $gpus) {
         $regVram = Resolve-GpuVram -GpuName $g.Name -Map $vramMap
-
-        # Fall back to WMI AdapterRAM, but only if registry missed it
         $wmiVram = if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) {
             [math]::Round($g.AdapterRAM / 1GB, 2)
         } else { $null }
-
-        # If WMI says ~4.0 GB and registry says something bigger, trust registry.
         $finalVram = if ($regVram) { $regVram } else { $wmiVram }
+
+        # [PATCH F] Guard resolution
+        $res = if ($g.CurrentHorizontalResolution -and $g.CurrentVerticalResolution -and
+                   $g.CurrentHorizontalResolution -gt 0 -and $g.CurrentVerticalResolution -gt 0) {
+            "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
+        } else { '' }
 
         $refresh = $null
         try {
-            if ($g.CurrentRefreshRate) { $refresh = [int]$g.CurrentRefreshRate }
+            if ($g.CurrentRefreshRate -and $g.CurrentRefreshRate -gt 0) { $refresh = [int]$g.CurrentRefreshRate }
         } catch { }
 
         [pscustomobject]@{
@@ -934,7 +919,7 @@ $sys = & {
             DriverDate    = if ($g.DriverDate) { ([datetime]$g.DriverDate).ToString('yyyy-MM-dd') } else { '' }
             VRAM_GB       = $finalVram
             VRAM_Source   = if ($regVram) { 'registry' } else { 'wmi' }
-            Resolution    = "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
+            Resolution    = $res
             RefreshHz     = $refresh
             VideoProcessor= $g.VideoProcessor
         }
@@ -1013,7 +998,7 @@ $vc    = @(Get-VCRedist)
 Write-Ok
 
 # =============================================================================
-# 5b. WINDOWS HEALTH
+# 5b. WINDOWS HEALTH (with trigger-start fix)
 # =============================================================================
 function Get-WindowsHealth {
     param([pscustomobject]$System)
@@ -1022,6 +1007,7 @@ function Get-WindowsHealth {
         PendingReboot = $false
         RebootReason  = ''
         UpdateService = 'Unknown'
+        UpdateStartMode = ''
         Defender      = 'Unknown'
         DefenderSig   = 'Unknown'
         DefenderSigDate = ''
@@ -1051,9 +1037,18 @@ function Get-WindowsHealth {
         }
     } catch { }
 
+    # [PATCH A] wuauserv is Manual (Trigger Start) on modern Windows — "Stopped" is normal
     try {
         $wu = Get-Service wuauserv -ErrorAction Stop
-        $r.UpdateService = $wu.Status.ToString()
+        $wuStart = (Get-CimInstance Win32_Service -Filter "Name='wuauserv'" -ErrorAction SilentlyContinue).StartMode
+        $r.UpdateStartMode = $wuStart
+        if ($wuStart -eq 'Disabled') {
+            $r.UpdateService = 'Disabled'
+        } elseif ($wu.Status -eq 'Running') {
+            $r.UpdateService = 'Running'
+        } else {
+            $r.UpdateService = "Stopped ($wuStart)"
+        }
     } catch { }
 
     try {
@@ -1102,7 +1097,7 @@ function Get-WindowsHealth {
 
     $s = 100
     if ($r.PendingReboot)                                   { $s -= 20 }
-    if ($r.UpdateService -ne 'Running')                     { $s -= 15 }
+    if ($r.UpdateService -eq 'Disabled')                    { $s -= 15 }
     if ($r.Defender -eq 'Off')                              { $s -= 15 }
     if ($r.Firewall -eq 'Off')                              { $s -= 10 }
     if ($r.Activation -in @('Unlicensed','Notification','Non-Genuine Grace')) { $s -= 25 }
@@ -1114,7 +1109,7 @@ function Get-WindowsHealth {
 }
 
 # =============================================================================
-# 5c. NETWORK HEALTH (with better Wi-Fi and adapter capability)
+# 5c. NETWORK HEALTH
 # =============================================================================
 function Get-NetworkHealth {
     param([pscustomobject]$System, [array]$Catalog, [array]$Installed)
@@ -1141,7 +1136,6 @@ function Get-NetworkHealth {
             elseif ($n.LinkSpeed -match '([\d\.]+)\s*Mbps')  { $mbps = [double]$Matches[1] }
             if ($mbps -gt $maxMbps) { $maxMbps = $mbps }
 
-            # [FIX] Try to detect max capability from advanced properties
             $maxCap = $null
             try {
                 $adv = Get-NetAdapterAdvancedProperty -Name $n.Name -ErrorAction Stop |
@@ -1168,7 +1162,6 @@ function Get-NetworkHealth {
                            elseif ($maxMbps -gt 0) { "$maxMbps Mbps" } else { '' }
     } catch { }
 
-    # [FIX] Wi-Fi details
     try {
         $wifi = Get-WifiDetails
         if ($wifi.Interfaces.Count -gt 0) { $r.WifiDetails = @($wifi.Interfaces) }
@@ -1498,7 +1491,7 @@ function Invoke-WhySlow {
 }
 
 # =============================================================================
-# 5f. DISPATCH PREFLIGHT / WHYSLOW
+# 5f. DISPATCH
 # =============================================================================
 if ($Preflight) {
     Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog `
@@ -1512,7 +1505,7 @@ if ($WhySlow) {
 }
 
 # =============================================================================
-# 5g. SOFTWARE INSTALLER (unchanged)
+# 5g. SOFTWARE INSTALLER
 # =============================================================================
 $Script:WingetMap = @{
     'Python'             = 'Python.Python.3.12'
@@ -2252,7 +2245,7 @@ function Get-Cached {
 function Invoke-SafeWebRequest {
     param([string]$Url, [int]$TimeoutSec = 8, [hashtable]$Headers = @{})
     if (-not $Headers.ContainsKey('User-Agent')) {
-        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.1'
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/1.2'
     }
     try {
         return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing `
@@ -2263,6 +2256,7 @@ function Invoke-SafeWebRequest {
     }
 }
 
+# [PATCH G] Multiple HTML patterns + lookup fallback
 function Get-CpuPassMarkScore {
     param([string]$CpuName)
     if (-not $CpuName) { return $null }
@@ -2274,77 +2268,88 @@ function Get-CpuPassMarkScore {
                       -replace '\s+@.*$','' `
                       -replace '\s+',' '
     $clean = $clean.Trim()
-    $key   = "cpu_passmark_$clean"
+    $key   = "cpu_passmark_v2_$clean"
 
     Get-Cached -Key $key -TtlHours 168 -Fetch {
         $q = [uri]::EscapeDataString($clean)
         $r = Invoke-SafeWebRequest -Url "https://www.cpubenchmark.net/cpu.php?cpu=$q"
-        if (-not $r) { return $null }
-        $html = $r.Content
-        if ($html -match 'mark-neww[^>]*>\s*([\d,]+)\s*<') { return [int]($matches[1] -replace ',','') }
-        if ($html -match 'CPU Mark[^<]*<[^>]*>\s*([\d,]+)')  { return [int]($matches[1] -replace ',','') }
+        if ($r) {
+            $html = $r.Content
+            if ($html -match 'id="mark-neww"[^>]*>\s*([\d,]+)')             { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'class="[^"]*mark-neww[^"]*"[^>]*>\s*([\d,]+)'){ return [int]($matches[1] -replace ',','') }
+            if ($html -match 'CPU Mark[^<]*<[^>]*>\s*([\d,]+)')              { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'class="[^"]*mark[^"]*"[^>]*>\s*([\d,]+)')      { return [int]($matches[1] -replace ',','') }
+        }
+        $r2 = Invoke-SafeWebRequest -Url "https://www.cpubenchmark.net/cpu_lookup.php?cpu=$q"
+        if ($r2 -and $r2.Content -match '(\d{4,6})\s*<[^>]*>\s*CPU Mark') {
+            return [int]$matches[1]
+        }
         return $null
     }
 }
 
+# [PATCH G] Same pattern expansion for GPU
 function Get-GpuPassMarkScore {
     param([string]$GpuName)
     if (-not $GpuName) { return $null }
 
     $clean = $GpuName -replace '^NVIDIA\s+','' -replace '^AMD\s+','' -replace '^Intel\s+',''
     $clean = $clean.Trim()
-    $key   = "gpu_passmark_$clean"
+    $key   = "gpu_passmark_v2_$clean"
 
     Get-Cached -Key $key -TtlHours 168 -Fetch {
         $q = [uri]::EscapeDataString($clean)
         $r = Invoke-SafeWebRequest -Url "https://www.videocardbenchmark.net/gpu.php?gpu=$q"
-        if (-not $r) { return $null }
-        $html = $r.Content
-        if ($html -match 'mark-neww[^>]*>\s*([\d,]+)\s*<')  { return [int]($matches[1] -replace ',','') }
-        if ($html -match 'G3D Mark[^<]*<[^>]*>\s*([\d,]+)') { return [int]($matches[1] -replace ',','') }
+        if ($r) {
+            $html = $r.Content
+            if ($html -match 'id="mark-neww"[^>]*>\s*([\d,]+)')             { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'class="[^"]*mark-neww[^"]*"[^>]*>\s*([\d,]+)'){ return [int]($matches[1] -replace ',','') }
+            if ($html -match 'G3D Mark[^<]*<[^>]*>\s*([\d,]+)')              { return [int]($matches[1] -replace ',','') }
+            if ($html -match 'class="[^"]*mark[^"]*"[^>]*>\s*([\d,]+)')      { return [int]($matches[1] -replace ',','') }
+        }
         return $null
     }
 }
 
+# [PATCH H] Multi-source NVIDIA driver lookup
 function Get-NvidiaLatestDriver {
     param([string]$GpuName)
-    $series = switch -Regex ($GpuName) {
-        'RTX\s*50'  { 'rtx50' }
-        'RTX\s*40'  { 'rtx40' }
-        'RTX\s*30'  { 'rtx30' }
-        'RTX\s*20'  { 'rtx20' }
-        'GTX\s*16'  { 'gtx16' }
-        'GTX\s*10'  { 'gtx10' }
-        default     { 'unknown' }
-    }
-    if ($series -eq 'unknown') { return $null }
-
-    $key = "nvidia_driver_$series"
+    $key = 'nvidia_latest_v2'
     Get-Cached -Key $key -TtlHours 24 -Fetch {
-        $psid = switch ($series) {
-            'rtx50' { 129 }
-            'rtx40' { 127 }
-            'rtx30' { 124 }
-            'rtx20' { 120 }
-            'gtx16' { 118 }
-            'gtx10' { 101 }
-        }
+        # Source 1: NVIDIA drivers landing page banner
         try {
-            $body = @{
-                func = 'DriverManualLookup'
-                psid = $psid
-                pfid = 0
-                osID = 135
-                lid  = 1
-                whql = 1
-                dch  = 1
-                sort1 = 0
-                numberOfResults = 1
+            $r = Invoke-SafeWebRequest -Url 'https://www.nvidia.com/en-us/geforce/drivers/' -TimeoutSec 10
+            if ($r -and $r.Content -match '(\d{3}\.\d{2,3})') {
+                return $matches[1]
             }
-            $r = Invoke-RestMethod -Uri 'https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php' `
-                                   -Method Get -Body $body -TimeoutSec 8 -ErrorAction Stop
-            if ($r -and $r.IDS -and $r.IDS.Count -gt 0) {
-                return $r.IDS[0].downloadInfo.Version
+        } catch { }
+        # Source 2: TechPowerUp aggregate
+        try {
+            $r = Invoke-SafeWebRequest -Url 'https://www.techpowerup.com/download/nvidia-geforce-graphics-drivers/' -TimeoutSec 10
+            if ($r -and $r.Content -match '(\d{3}\.\d{2,3})') { return $matches[1] }
+        } catch { }
+        # Source 3: original AjaxDriverService (may still work for some)
+        try {
+            $series = switch -Regex ($GpuName) {
+                'RTX\s*50'  { 129 }
+                'RTX\s*40'  { 127 }
+                'RTX\s*30'  { 124 }
+                'RTX\s*20'  { 120 }
+                'GTX\s*16'  { 118 }
+                'GTX\s*10'  { 101 }
+                default     { $null }
+            }
+            if ($series) {
+                $body = @{
+                    func = 'DriverManualLookup'; psid = $series; pfid = 0
+                    osID = 135; lid = 1; whql = 1; dch = 1
+                    sort1 = 0; numberOfResults = 1
+                }
+                $r = Invoke-RestMethod -Uri 'https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php' `
+                                       -Method Get -Body $body -TimeoutSec 8 -ErrorAction Stop
+                if ($r -and $r.IDS -and $r.IDS.Count -gt 0) {
+                    return $r.IDS[0].downloadInfo.Version
+                }
             }
         } catch { }
         return $null
@@ -2383,21 +2388,18 @@ function Get-IntelLatestGraphicsDriver {
     }
 }
 
-# [FIX] More robust winget upgrade parsing
 function Get-WingetUpgradeable {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return @() }
 
     $key = 'winget_upgradeable_v2'
     Get-Cached -Key $key -TtlHours 6 -Fetch {
         try {
-            # --disable-interactivity prevents spinner control chars confusing the parser
             $raw = & winget upgrade --include-unknown `
                     --accept-source-agreements --disable-interactivity 2>$null | Out-String
 
             $list = @()
             $lines = $raw -split "`r?`n"
 
-            # Find the header line: Name  Id  Version  Available  Source
             $headerIdx = -1
             for ($i = 0; $i -lt $lines.Count; $i++) {
                 if ($lines[$i] -match '^\s*Name\s+Id\s+Version\s+Available\s+Source\s*$') {
@@ -2407,18 +2409,15 @@ function Get-WingetUpgradeable {
             }
             if ($headerIdx -lt 0) { return @() }
 
-            # Collect data rows until the separator dashes or the "upgrades available" footer
             $dataLines = @()
             for ($i = $headerIdx + 1; $i -lt $lines.Count; $i++) {
                 $line = $lines[$i]
                 if ($line -match '^-{5,}') { continue }
                 if ($line -match '^\s*\d+\s+upgrades?\s+available') { break }
                 if (-not $line.Trim()) { continue }
-                if ($line -match '^\s*$') { break }
                 $dataLines += $line
             }
 
-            # The real output uses fixed column starts. Find column boundaries from the header.
             $headerLine = $lines[$headerIdx]
             $colStarts = @()
             foreach ($m in [regex]::Matches($headerLine, '\S+')) {
@@ -2428,7 +2427,6 @@ function Get-WingetUpgradeable {
 
             foreach ($dl in $dataLines) {
                 if ($dl.Length -lt $colStarts[-1] + 1) {
-                    # Line may be too short due to trailing whitespace strip; pad for slicing
                     $dl = $dl.PadRight($colStarts[-1] + 40)
                 }
                 $name      = $dl.Substring($colStarts[0], $colStarts[1] - $colStarts[0]).Trim()
@@ -2560,9 +2558,6 @@ function Invoke-OnlineEnrichment {
 # =============================================================================
 # 6c. SYSTEM ONLINE VERIFICATION
 # =============================================================================
-
-# [FIX] Channel-aware Windows build lookup. Prefers the current release channel,
-# does not return Insider build numbers as "latest stable".
 function Get-LatestWindowsBuild {
     param([string]$CurrentBuild)
     $key = 'ms_latest_windows_v2'
@@ -2570,22 +2565,14 @@ function Get-LatestWindowsBuild {
         try {
             $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information' -TimeoutSec 10
             if (-not $r) { return $null }
-            # Match OS build patterns like 26100.2314, 26200.xxxx
             $m = [regex]::Matches($r.Content, '\b(2[0-9]{4})\.(\d{3,5})\b')
             if ($m.Count -eq 0) { return $null }
             $versions = @()
             foreach ($x in $m) {
                 $v = "$($x.Groups[1].Value).$($x.Groups[2].Value)"
-                try {
-                    $null = [version]$v
-                    $versions += $v
-                } catch { }
+                try { $null = [version]$v; $versions += $v } catch { }
             }
             if ($versions.Count -eq 0) { return $null }
-            # Return the highest *stable* build number (not Insider). We filter
-            # to the base of the highest major.minor we see, then take the max
-            # patch on that base. This avoids returning 28000.x (Insider) when
-            # the user is on 26200.x.
             $parsed = $versions | ForEach-Object {
                 $parts = $_ -split '\.'
                 [pscustomobject]@{ Base = [int]$parts[0]; Rev = [int]$parts[1]; Full = $_ }
@@ -2594,7 +2581,6 @@ function Get-LatestWindowsBuild {
                 $cb = $CurrentBuild -replace '^.*?(\d{5})\.(\d+)$','$1.$2'
                 try {
                     $cbBase = [int]($cb -split '\.')[0]
-                    # Prefer the highest version whose Base is within 500 of current
                     $near = $parsed | Where-Object { [math]::Abs($_.Base - $cbBase) -lt 500 }
                     if ($near) {
                         return ($near | Sort-Object Base, Rev | Select-Object -Last 1).Full
@@ -2619,13 +2605,19 @@ function Get-LatestDotNetFrameworkVersion {
     }
 }
 
+# [PATCH I] Multiple patterns for VC++ online
 function Get-LatestVCRedistVersion {
-    $key = 'ms_latest_vcredist'
+    $key = 'ms_latest_vcredist_v2'
     Get-Cached -Key $key -TtlHours 168 -Fetch {
         try {
             $r = Invoke-SafeWebRequest -Url 'https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist' -TimeoutSec 10
-            if ($r -and $r.Content -match 'v14\.(\d+)\.(\d+)\.(\d+)') {
-                return "14.$($matches[1]).$($matches[2]).$($matches[3])"
+            if ($r) {
+                if ($r.Content -match 'v14\.(\d+)\.(\d+)\.(\d+)') {
+                    return "14.$($matches[1]).$($matches[2]).$($matches[3])"
+                }
+                if ($r.Content -match 'Redistributable[^<]{0,120}?(\d+\.\d+\.\d+\.\d+)') {
+                    return $matches[1]
+                }
             }
         } catch { }
         return $null
@@ -2661,7 +2653,6 @@ function Get-MotherboardInfo {
     } catch { return $null }
 }
 
-# [FIX] BIOS lookup with more vendors and better matching
 function Get-LatestBiosVersion {
     param([pscustomobject]$Board)
     if (-not $Board -or -not $Board.Manufacturer) { return $null }
@@ -2671,7 +2662,6 @@ function Get-LatestBiosVersion {
 
     Get-Cached -Key $key -TtlHours 168 -Fetch {
         try {
-            # Dell via service tag
             if ($mfg -match 'dell') {
                 $svcTag = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
                 if ($svcTag) {
@@ -2681,26 +2671,21 @@ function Get-LatestBiosVersion {
                     }
                 }
             }
-            # ASUS: best-effort scrape of the model's support page
             if ($mfg -match 'asus') {
-                $model = ($Board.Product -replace ' ','').ToLower()
                 $r = Invoke-SafeWebRequest -Url "https://www.asus.com/support/download-center/" -TimeoutSec 10
                 if ($r) {
-                    # ASUS pages are JS-heavy; grab any FA507RM.xxx pattern for this model
                     $modelId = $Board.Product -replace '\s.*',''
                     if ($r.Content -match "$modelId\.(\d{3})") {
                         return "$modelId.$($matches[1])"
                     }
                 }
             }
-            # MSI
             if ($mfg -match 'msi|micro-star') {
                 $r = Invoke-SafeWebRequest -Url "https://www.msi.com/support/" -TimeoutSec 10
                 if ($r -and $r.Content -match 'BIOS[^<]{0,200}?(\d+\.\d+)') {
                     return $matches[1]
                 }
             }
-            # Gigabyte
             if ($mfg -match 'gigabyte') {
                 $r = Invoke-SafeWebRequest -Url "https://www.gigabyte.com/Support" -TimeoutSec 10
                 if ($r -and $r.Content -match 'BIOS[^<]{0,200}?([A-Z]\d+[a-z]?)') {
@@ -2803,7 +2788,7 @@ function Invoke-SystemOnlineVerification {
 }
 
 # =============================================================================
-# 7. HEALTH SCORE (with N/A handling and Data Confidence)
+# 7. HEALTH SCORE
 # =============================================================================
 function Get-HealthScore {
     param(
@@ -2822,12 +2807,9 @@ function Get-HealthScore {
     )
 
     $cats = [ordered]@{}
-    $na   = [ordered]@{}
     $conf = [ordered]@{}
 
-    # -----------------------------------------------------------------
     # HARDWARE
-    # -----------------------------------------------------------------
     $ramScore = 100
     if ($System.RAM_GB -lt 16)                        { $ramScore -= 30 }
     elseif ($System.RAM_GB -lt 32)                    { $ramScore -= 10 }
@@ -2838,7 +2820,7 @@ function Get-HealthScore {
     }
 
     $cpuScore = 100
-    $cpuConf  = 'Low'
+    $cpuConf  = 'N/A'
     if ($Enrichment -and $Enrichment.CpuScore) {
         $mark = $Enrichment.CpuScore
         $cpuScore = if     ($mark -ge 35000) { 100 }
@@ -2848,18 +2830,22 @@ function Get-HealthScore {
                     elseif ($mark -ge 3500)  { 55 }
                     else                     { 30 }
         $cpuConf = 'High'
-    } else {
+    } elseif (-not $Script:OnlineEnabled) {
         if ($System.LogicalCPUs -lt 8)      { $cpuScore = 60 }
         elseif ($System.LogicalCPUs -ge 16) { $cpuScore = 95 }
+        $cpuConf = 'Medium'
+    } else {
+        # Online was attempted and failed — do not penalize, mark N/A
+        if ($System.LogicalCPUs -lt 8)      { $cpuScore = 60 }
+        elseif ($System.LogicalCPUs -ge 16) { $cpuScore = 95 }
+        $cpuConf = 'N/A'
     }
 
     $hw = [int](($ramScore * 0.4) + ($cpuScore * 0.6))
     $cats['Hardware'] = [math]::Max(0, $hw)
     $conf['Hardware'] = $cpuConf
 
-    # -----------------------------------------------------------------
     # STORAGE
-    # -----------------------------------------------------------------
     $st = 100
     $stConf = 'High'
     if ($System.Disks.Count -gt 0) {
@@ -2895,12 +2881,10 @@ function Get-HealthScore {
     $cats['Storage'] = $st
     $conf['Storage'] = $stConf
 
-    # -----------------------------------------------------------------
-    # ENGINEERING SOFTWARE — N/A if nothing relevant installed
-    # -----------------------------------------------------------------
+    # ENGINEERING SOFTWARE
     $rel = @($Results | Where-Object { $_.State -notin @('NotInstalled','NotApplicable') })
     if ($rel.Count -eq 0) {
-        $cats['EngineeringSoftware'] = $null   # N/A
+        $cats['EngineeringSoftware'] = $null
         $conf['EngineeringSoftware'] = 'N/A'
     } else {
         $healthy = @($rel | Where-Object State -eq 'Healthy').Count
@@ -2925,11 +2909,9 @@ function Get-HealthScore {
         $conf['EngineeringSoftware'] = if ($Enrichment -and $Enrichment.Upgradeable.Count -gt 0) { 'High' } else { 'Medium' }
     }
 
-    # -----------------------------------------------------------------
     # GPU
-    # -----------------------------------------------------------------
     $gpuScore = 100
-    $gpuConf  = 'Low'
+    $gpuConf  = 'N/A'
     if ($Enrichment -and $Enrichment.GpuScores.Count -gt 0) {
         $best = ($Enrichment.GpuScores | Where-Object Score | Sort-Object Score -Descending | Select-Object -First 1)
         if ($best -and $best.Score) {
@@ -2945,11 +2927,12 @@ function Get-HealthScore {
     } elseif (-not $System.HasDiscreteGPU) {
         $gpuScore = 40
         $gpuConf  = 'Medium'
+    } elseif (-not $Script:OnlineEnabled) {
+        $gpuConf = 'Medium'
     }
 
     $driverPenalty = 0
 
-    # [FIX] Driver age penalties from DriverDate
     $nvGpu = $System.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1
     $amdGpu = $System.GPUs | Where-Object { $_.Name -match 'Radeon' } | Select-Object -First 1
     $intelGpu = $System.GPUs | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1
@@ -2987,11 +2970,9 @@ function Get-HealthScore {
     $cats['GPU'] = [math]::Max(0, $gpuScore - $driverPenalty)
     $conf['GPU'] = $gpuConf
 
-    # -----------------------------------------------------------------
     # DRIVERS
-    # -----------------------------------------------------------------
     $drv = 100
-    $drvConf = 'Medium'
+    $drvConf = 'N/A'
     if ($NetFx -match '^4\.[0-6]')    { $drv -= 40 }
     elseif ($NetFx -eq '4.7')         { $drv -= 15 }
     if (-not $VC -or $VC.Count -eq 0) { $drv -= 30 }
@@ -3026,9 +3007,7 @@ function Get-HealthScore {
     $cats['Drivers'] = [math]::Max(0, $drv)
     $conf['Drivers'] = $drvConf
 
-    # -----------------------------------------------------------------
     # LICENSING
-    # -----------------------------------------------------------------
     if ($rel.Count -eq 0) {
         $cats['Licensing'] = $null
         $conf['Licensing'] = 'N/A'
@@ -3038,9 +3017,7 @@ function Get-HealthScore {
         $conf['Licensing'] = 'High'
     }
 
-    # -----------------------------------------------------------------
     # WINDOWS
-    # -----------------------------------------------------------------
     $winScore = if ($WindowsHealth) { $WindowsHealth.Score } else { 85 }
     $winConf  = 'Medium'
     if ($SystemVerification -and $SystemVerification.LatestWindowsBuild -and $System.OSBuildNumber) {
@@ -3048,15 +3025,12 @@ function Get-HealthScore {
             $haveBuildNum = [int]$System.OSBuildNumber
             $wantParts = $SystemVerification.LatestWindowsBuild -split '\.'
             $wantBuildNum = [int]$wantParts[0]
-
-            # Only compare if same generation (within ~1000 of each other)
             if ([math]::Abs($wantBuildNum - $haveBuildNum) -lt 1000) {
                 if ($haveBuildNum -lt $wantBuildNum - 5) {
                     $winScore = [math]::Max(0, $winScore - 5)
                 }
                 $winConf = 'High'
             } else {
-                # Local is on a different channel (Insider vs stable). Confidence low.
                 $winConf = 'Low'
             }
         } catch { }
@@ -3064,9 +3038,7 @@ function Get-HealthScore {
     $cats['Windows'] = $winScore
     $conf['Windows'] = $winConf
 
-    # -----------------------------------------------------------------
     # NETWORK
-    # -----------------------------------------------------------------
     $netScore = if ($NetworkHealth) { $NetworkHealth.Score } else { 90 }
     $netConf  = 'Medium'
     if ($SystemVerification -and $SystemVerification.AdapterCapabilities.Count -gt 0) {
@@ -3082,11 +3054,9 @@ function Get-HealthScore {
     $cats['Network'] = $netScore
     $conf['Network'] = $netConf
 
-    # -----------------------------------------------------------------
-    # THERMALS — N/A if only ACPI placeholder
-    # -----------------------------------------------------------------
+    # THERMALS
     $th = 85
-    $thConf = 'Low'
+    $thConf = 'N/A'
     $realThermal = @($System.ThermalZones | Where-Object { $_.Source -and $_.Source -ne 'ACPI' })
     if ($realThermal.Count -gt 0) {
         $max = ($realThermal | Measure-Object Celsius -Maximum).Maximum
@@ -3095,37 +3065,45 @@ function Get-HealthScore {
         elseif ($max -lt 95)  { $th = 60 }
         else                  { $th = 30 }
         $thConf = 'High'
+        $cats['Thermals'] = $th
+        $conf['Thermals'] = $thConf
     } elseif ($System.ThermalZones.Count -gt 0) {
         $max = ($System.ThermalZones | Measure-Object Celsius -Maximum).Maximum
         if ($max -lt 60)      { $th = 100 }
         elseif ($max -lt 80)  { $th = 88 }
         elseif ($max -lt 95)  { $th = 60 }
         else                  { $th = 30 }
-        $thConf = 'Medium'
+        $cats['Thermals'] = $th
+        $conf['Thermals'] = 'Medium'
     } else {
         $cats['Thermals'] = $null
         $conf['Thermals'] = 'N/A'
     }
-    if ($cats.Contains('Thermals') -and $cats['Thermals'] -ne $null) {
-        $cats['Thermals'] = $th
-        $conf['Thermals'] = $thConf
-    }
 
-    # -----------------------------------------------------------------
-    # PROJECT SAFETY — N/A unless ProjectGuardian ran
-    # -----------------------------------------------------------------
+    # PROJECT SAFETY
     if (-not $Script:GuardianRan) {
         $cats['ProjectSafety'] = $null
         $conf['ProjectSafety'] = 'N/A'
     }
 
-    # -----------------------------------------------------------------
-    # HARDWARE CONFIDENCE improvements
-    # -----------------------------------------------------------------
+    # Event log adjustments — apply AFTER individual categories are set
     if ($EventLogs) {
-        # Hardware confidence drops if WHEA errors detected
         if ($EventLogs.WheaCount -gt 0) {
-            $cats['Hardware'] = [math]::Max(0, $cats['Hardware'] - 10)
+            $cats['Hardware'] = [math]::Max(0, $cats['Hardware'] - 15)
+        }
+        if ($EventLogs.UnexpectedShutdown -ge 3) {
+            $cats['Windows'] = [math]::Max(0, $cats['Windows'] - 15)
+            $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 5)
+        } elseif ($EventLogs.UnexpectedShutdown -ge 1) {
+            $cats['Windows'] = [math]::Max(0, $cats['Windows'] - 8)
+        }
+        if ($EventLogs.DiskErrors -ge 10) {
+            $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 25)
+        } elseif ($EventLogs.DiskErrors -ge 1) {
+            $cats['Storage'] = [math]::Max(0, $cats['Storage'] - 10)
+        }
+        if ($EventLogs.ThermalEvents -gt 0 -and $cats['Thermals'] -ne $null) {
+            $cats['Thermals'] = [math]::Max(0, $cats['Thermals'] - 15)
         }
     }
 
@@ -3135,9 +3113,7 @@ function Get-HealthScore {
         }
     }
 
-    # -----------------------------------------------------------------
-    # Overall — only weight non-null categories
-    # -----------------------------------------------------------------
+    # Overall — renormalized over non-null categories
     $weights = @{
         Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
         GPU = 0.08; Drivers = 0.10; Licensing = 0.07
@@ -3154,7 +3130,6 @@ function Get-HealthScore {
     }
     $overall = if ($sumW -gt 0) { [int][math]::Round($sumWS / $sumW) } else { 0 }
 
-    # Data confidence: fraction of weight that had High confidence
     $confMap = @{ 'High' = 1.0; 'Medium' = 0.6; 'Low' = 0.3; 'N/A' = 0.0 }
     $confSum = 0
     foreach ($k in $conf.Keys) {
@@ -3187,16 +3162,115 @@ $enrichment     = Invoke-OnlineEnrichment -System $sys
 $systemVerify   = Invoke-SystemOnlineVerification -System $sys -Motherboard $motherboard
 
 # ---------------------------------------------------------------------------
-# [FIX] Event log scan
+# Event log scan
 # ---------------------------------------------------------------------------
 Write-Stage "Scanning event logs (last 7 days)..."
 $eventLogs = Get-EventLogIssues
 Write-Ok
 
-# ---------------------------------------------------------------------------
-# [FIX] Defender exclusions
-# ---------------------------------------------------------------------------
+# Defender exclusions
 $defenderExcl = Get-DefenderExclusions
+
+# =============================================================================
+# 6a-bis. EVENT LOG FINDINGS — convert logs to findings + synth product
+# =============================================================================
+function Add-EventLogFindings {
+    param([pscustomobject]$EventLogs, [pscustomobject]$SystemVerification)
+
+    $list = New-Object System.Collections.Generic.List[object]
+
+    if ($EventLogs.UnexpectedShutdown -gt 0) {
+        $sev = if ($EventLogs.UnexpectedShutdown -ge 3) { 'critical' } else { 'warn' }
+        $list.Add((New-Finding `
+            -Id 'SYS.UNEXPECTED_SHUTDOWN' `
+            -Software 'System' `
+            -Problem "Unexpected shutdowns detected ($($EventLogs.UnexpectedShutdown) in 7 days)." `
+            -Detected "Kernel-Power Event ID 41, count = $($EventLogs.UnexpectedShutdown)." `
+            -WhyItMatters "Unexpected shutdowns can corrupt open project files, checkpoint caches, and license leases." `
+            -Recommendation "Check PSU/battery, review thermal events, and ensure the machine is not being hard-powered-off." `
+            -Severity $sev))
+    }
+
+    if ($EventLogs.DiskErrors -gt 0) {
+        $sev = if ($EventLogs.DiskErrors -ge 10) { 'critical' } else { 'warn' }
+        $deviceInfo = ''
+        if ($EventLogs.DiskErrorDevices -and $EventLogs.DiskErrorDevices.Count -gt 0) {
+            $deviceInfo = " Affected device(s): Harddisk" + ($EventLogs.DiskErrorDevices -join ', Harddisk')
+        }
+        $sampleMsg = ($EventLogs.Samples | Where-Object Type -eq 'Disk' | ForEach-Object { "#$($_.Id) $($_.Msg)" }) -join ' | '
+        $list.Add((New-Finding `
+            -Id 'SYS.DISK_ERRORS' `
+            -Software 'Storage' `
+            -Problem "Disk/controller errors detected ($($EventLogs.DiskErrors) in 7 days)." `
+            -Detected "$sampleMsg$deviceInfo" `
+            -WhyItMatters "Controller or media errors usually mean a failing cable, port, or drive. Engineering data loss risk." `
+            -Recommendation "Identify the device from the event (e.g. Harddisk1\DR2), run vendor diagnostics, and back up project data." `
+            -Severity $sev))
+    }
+
+    if ($EventLogs.WheaCount -gt 0) {
+        $list.Add((New-Finding `
+            -Id 'SYS.WHEA' `
+            -Software 'Hardware' `
+            -Problem "WHEA hardware errors detected ($($EventLogs.WheaCount) in 7 days)." `
+            -Detected "WHEA-Logger events: $($EventLogs.WheaCount)." `
+            -WhyItMatters "WHEA errors indicate machine-check exceptions from CPU, PCIe, or memory - often unstable overclocks or failing hardware." `
+            -Recommendation "Check RAM with MemTest86, verify XMP/EXPO is stable, and update BIOS/chipset drivers." `
+            -Severity 'critical'))
+    }
+
+    if ($EventLogs.ThermalEvents -gt 0) {
+        $list.Add((New-Finding `
+            -Id 'SYS.THERMAL_THROTTLE' `
+            -Software 'Thermals' `
+            -Problem "CPU thermal throttling events detected ($($EventLogs.ThermalEvents) in 7 days)." `
+            -Detected "Kernel-Processor-Power events 86/87/88 = $($EventLogs.ThermalEvents)." `
+            -WhyItMatters "Throttling stretches solve times 2-5x and often indicates dried paste or a blocked fan." `
+            -Recommendation "Clean fans and heatsinks; consider repasting on a 3+ year old laptop." `
+            -Severity 'warn'))
+    }
+
+    if ($EventLogs.AppCrashes -ge 5) {
+        $list.Add((New-Finding `
+            -Id 'SYS.APP_CRASHES' `
+            -Software 'Applications' `
+            -Problem "High application crash rate ($($EventLogs.AppCrashes) in 7 days)." `
+            -Detected "Application log Event ID 1000 count = $($EventLogs.AppCrashes)." `
+            -WhyItMatters "Frequent crashes can indicate RAM instability, driver issues, or a corrupt runtime." `
+            -Recommendation "Review the crash list, update GPU and chipset drivers, run sfc /scannow and DISM." `
+            -Severity 'warn'))
+    }
+
+    if ($list.Count -gt 0) {
+        $critCount = @($list | Where-Object Severity -eq 'critical').Count
+        $synth = [pscustomobject]@{
+            Name        = 'System Health'
+            Disciplines = 'System'
+            Kind        = 'Events'
+            Installed   = $true
+            Version     = ''
+            Match       = 'Event log scan (7 days)'
+            State       = if ($critCount -gt 0) { 'Critical' } else { 'Attention' }
+            Severity    = if ($critCount -gt 0) { 'critical' } else { 'warn' }
+            Findings    = $list
+            Notes       = @()
+            CacheGB     = 0
+        }
+        return ,$synth
+    }
+    return $null
+}
+
+$eventSynth = Add-EventLogFindings -EventLogs $eventLogs -SystemVerification $systemVerify
+if ($eventSynth) {
+    $allResults.Add($eventSynth)
+    # Recompute counters
+    $gCount = @($allResults | Where-Object State -eq 'Healthy').Count
+    $yCount = @($allResults | Where-Object State -eq 'Attention').Count
+    $rCount = @($allResults | Where-Object State -eq 'Critical').Count
+    $nCount = @($allResults | Where-Object State -eq 'NotInstalled').Count
+    $aCount = @($allResults | Where-Object State -eq 'NotApplicable').Count
+}
 
 # ---------------------------------------------------------------------------
 # Live GPU sample (optional)
@@ -3247,7 +3321,7 @@ foreach ($k in $score.Categories.Keys) {
 }
 
 # =============================================================================
-# 9. PROJECT GUARDIAN (unchanged logic)
+# 9. PROJECT GUARDIAN
 # =============================================================================
 function Get-DwgReferences {
     param([string]$FilePath)
@@ -3430,7 +3504,6 @@ if ($ProjectGuardian) {
         $score.Categories['ProjectSafety'] = $guardian.Health
         $score.Confidence['ProjectSafety'] = 'High'
 
-        # Recalculate overall with ProjectSafety now populated
         $weights = @{
             Hardware = 0.20; Storage = 0.15; EngineeringSoftware = 0.20
             GPU = 0.08; Drivers = 0.10; Licensing = 0.07
@@ -3581,7 +3654,7 @@ foreach ($k in $score.Categories.Keys) {
 [void]$sb.AppendLine("<h2>Verified Components (Local vs Online)</h2>")
 [void]$sb.AppendLine("<div class='verify'>")
 if (-not $systemVerify.Available) {
-    [void]$sb.AppendLine("<b>Online verification unavailable</b> — using local data only. Values below are from WMI/SMART.")
+    [void]$sb.AppendLine("<b>Online verification unavailable</b> - using local data only. Values below are from WMI/SMART.")
 } else {
     [void]$sb.AppendLine("<b>Every checked component has been cross-referenced with an online source where possible. UNKNOWN means we could not verify either way.</b>")
 }
@@ -3590,7 +3663,6 @@ if (-not $systemVerify.Available) {
 [void]$sb.AppendLine("<div class='card'><table>")
 [void]$sb.AppendLine("<tr><th>Component</th><th>Local Value</th><th>Online / Expected</th><th>Status</th><th>Source</th></tr>")
 
-# Windows build — channel-aware
 $winLocal = if ($sys.OSBuild) { $sys.OSBuild } else { 'n/a' }
 $winOnline = if ($systemVerify.LatestWindowsBuild) { $systemVerify.LatestWindowsBuild } else { 'unknown' }
 $winStatus = 'unknown'
@@ -3601,20 +3673,17 @@ if ($systemVerify.LatestWindowsBuild -and $sys.OSBuildNumber) {
         if ([math]::Abs($wantB - $haveB) -lt 1000) {
             $winStatus = if ($haveB -ge $wantB - 5) { 'match' } else { 'mismatch' }
         } else {
-            # different channel — cannot compare cleanly
             $winStatus = 'unknown'
         }
     } catch { $winStatus = 'unknown' }
 }
 [void]$sb.AppendLine("<tr><td><b>Windows Build</b></td><td>$winLocal</td><td>$winOnline</td><td><span class='$winStatus'>$($winStatus.ToUpper())</span></td><td class='small'>Learn/Microsoft</td></tr>")
 
-# .NET
 $netStatus = if (-not $systemVerify.LatestDotNetFx) { 'unknown' }
              elseif ($netFx -match 'Not found') { 'mismatch' }
              else { 'match' }
 [void]$sb.AppendLine("<tr><td><b>.NET Framework</b></td><td>$netFx</td><td>$($systemVerify.LatestDotNetFx)</td><td><span class='$netStatus'>$($netStatus.ToUpper())</span></td><td class='small'>dotnet.microsoft.com</td></tr>")
 
-# VC++ Redist
 $vcLocal = if ($vc.Count -gt 0) { ($vc | ForEach-Object { $_.DisplayVersion } | Sort-Object -Unique) -join ', ' } else { 'none' }
 $vcOnline = if ($systemVerify.LatestVCRedist) { $systemVerify.LatestVCRedist } else { 'unknown' }
 $vcStatus = 'unknown'
@@ -3631,7 +3700,6 @@ if ($systemVerify.LatestVCRedist -and $vc.Count -gt 0) {
 }
 [void]$sb.AppendLine("<tr><td><b>VC++ Redistributable</b></td><td>$vcLocal</td><td>$vcOnline</td><td><span class='$vcStatus'>$($vcStatus.ToUpper())</span></td><td class='small'>learn.microsoft.com</td></tr>")
 
-# Defender
 $defLocal = if ($windowsHealth.DefenderSig) { $windowsHealth.DefenderSig } else { 'unknown' }
 $defOnline = if ($systemVerify.LatestDefenderSig) { $systemVerify.LatestDefenderSig } else { 'unknown' }
 $defStatus = 'unknown'
@@ -3644,7 +3712,6 @@ if ($systemVerify.LatestDefenderSig -and $windowsHealth.DefenderSig) {
 }
 [void]$sb.AppendLine("<tr><td><b>Defender Signature</b></td><td>$defLocal</td><td>$defOnline</td><td><span class='$defStatus'>$($defStatus.ToUpper())</span></td><td class='small'>WDSI</td></tr>")
 
-# BIOS
 if ($motherboard) {
     $biosLocal = "$($motherboard.BiosVendor) $($motherboard.BiosVersion) ($($motherboard.BiosReleaseDate))"
     $biosOnline = if ($systemVerify.LatestBios) { $systemVerify.LatestBios } else { 'not available' }
@@ -3653,23 +3720,20 @@ if ($motherboard) {
     [void]$sb.AppendLine("<tr><td><b>Motherboard</b></td><td colspan='4'>$($motherboard.Manufacturer) $($motherboard.Product) ($($motherboard.Version))</td></tr>")
 }
 
-# CPU PassMark
 if ($enrichment.CpuScore) {
     [void]$sb.AppendLine("<tr><td><b>CPU Benchmark</b></td><td>$($sys.CPU)</td><td>PassMark CPU Mark: <b>$($enrichment.CpuScore)</b></td><td><span class='match'>VERIFIED</span></td><td class='small'>cpubenchmark.net</td></tr>")
 } elseif ($enrichment.OnlineAvailable) {
     [void]$sb.AppendLine("<tr><td><b>CPU Benchmark</b></td><td>$($sys.CPU)</td><td>PassMark lookup failed</td><td><span class='unknown'>UNKNOWN</span></td><td class='small'>cpubenchmark.net</td></tr>")
 }
 
-# GPU PassMark + real VRAM
 foreach ($gpu in $sys.GPUs) {
     if ($gpu.Kind -eq 'Integrated') { continue }
     $gs = $enrichment.GpuScores | Where-Object { $_.Name -eq $gpu.Name } | Select-Object -First 1
     $sc = if ($gs -and $gs.Score) { $gs.Score } else { 'n/a' }
     $st = if ($gs -and $gs.Score) { 'match' } else { 'unknown' }
-    [void]$sb.AppendLine("<tr><td><b>GPU</b></td><td>$($gpu.Name) — <b>$($gpu.VRAM_GB) GB VRAM</b> (from $($gpu.VRAM_Source))</td><td>PassMark G3D Mark: <b>$sc</b></td><td><span class='$st'>$(if ($gs -and $gs.Score) {'VERIFIED'} else {'UNKNOWN'})</span></td><td class='small'>videocardbenchmark.net</td></tr>")
+    [void]$sb.AppendLine("<tr><td><b>GPU</b></td><td>$($gpu.Name) - <b>$($gpu.VRAM_GB) GB VRAM</b> (from $($gpu.VRAM_Source))</td><td>PassMark G3D Mark: <b>$sc</b></td><td><span class='$st'>$(if ($gs -and $gs.Score) {'VERIFIED'} else {'UNKNOWN'})</span></td><td class='small'>videocardbenchmark.net</td></tr>")
 }
 
-# GPU driver version comparison with driver date
 $installedNvVer = ($sys.GPUs | Where-Object { $_.Name -match 'NVIDIA|GeForce|RTX|Quadro' } | Select-Object -First 1)
 if ($installedNvVer) {
     $nvStatus = 'unknown'
@@ -3691,7 +3755,6 @@ if ($enrichment.LatestIntelGpu) {
 
 [void]$sb.AppendLine("</table></div>")
 
-# RAM modules
 if ($systemVerify.RamModules.Count -gt 0) {
     [void]$sb.AppendLine("<h3>RAM Modules (from SPD)</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Manufacturer</th><th>Part Number</th><th>Capacity</th><th>Rated MHz</th><th>Configured MHz</th><th>Source</th></tr>")
@@ -3702,7 +3765,6 @@ if ($systemVerify.RamModules.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Disk SMART
 if ($systemVerify.DiskReliability.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Disk Health (SMART)</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Disk</th><th>Media</th><th>Health</th><th>Wear %</th><th>Temp C</th><th>Power-On Hours</th><th>Read/Write Errors</th><th>Firmware</th><th>Source</th></tr>")
@@ -3715,7 +3777,6 @@ if ($systemVerify.DiskReliability.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Adapter capability
 if ($systemVerify.AdapterCapabilities.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Network Adapter Capabilities</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Adapter</th><th>Description</th><th>Running</th><th>Capability</th><th>Driver</th></tr>")
@@ -3726,7 +3787,6 @@ if ($systemVerify.AdapterCapabilities.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Wi-Fi details
 if ($networkHealth.WifiDetails.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Wi-Fi Details</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Name</th><th>SSID</th><th>Band</th><th>Channel</th><th>Radio</th><th>Signal</th><th>Rx/Tx Rate</th></tr>")
@@ -3736,7 +3796,6 @@ if ($networkHealth.WifiDetails.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Outdated packages
 if ($enrichment.Upgradeable.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Outdated packages (from winget)</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Name</th><th>Id</th><th>Installed</th><th>Available</th><th>Source</th></tr>")
@@ -3746,7 +3805,6 @@ if ($enrichment.Upgradeable.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Battery health
 if ($sys.Battery -and $sys.Battery.HealthPercent -ne $null) {
     [void]$sb.AppendLine("<h3>Battery Health</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th style='width:220px'>Design capacity</th><td>$($sys.Battery.DesignCapacity) mWh</td></tr>")
@@ -3758,11 +3816,10 @@ if ($sys.Battery -and $sys.Battery.HealthPercent -ne $null) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Event logs
 if ($eventLogs) {
     [void]$sb.AppendLine("<h3>Recent Hardware / System Events (7 days)</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th style='width:220px'>WHEA errors</th><td>$(if ($eventLogs.WheaCount -gt 0) { "<span class='chip red'>$($eventLogs.WheaCount)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
-    [void]$sb.AppendLine("<tr><th>Disk errors</th><td>$(if ($eventLogs.DiskErrors -gt 0) { "<span class='chip yellow'>$($eventLogs.DiskErrors)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Disk errors</th><td>$(if ($eventLogs.DiskErrors -gt 0) { "<span class='chip yellow'>$($eventLogs.DiskErrors)</span> $(if ($eventLogs.DiskErrorDevices.Count -gt 0) { "(Harddisk" + ($eventLogs.DiskErrorDevices -join ', Harddisk') + ")" })" } else { "<span class='chip green'>0</span>" })</td></tr>")
     [void]$sb.AppendLine("<tr><th>Thermal events</th><td>$(if ($eventLogs.ThermalEvents -gt 0) { "<span class='chip yellow'>$($eventLogs.ThermalEvents)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
     [void]$sb.AppendLine("<tr><th>Unexpected shutdowns</th><td>$(if ($eventLogs.UnexpectedShutdown -gt 0) { "<span class='chip red'>$($eventLogs.UnexpectedShutdown)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
     [void]$sb.AppendLine("<tr><th>Application crashes (Event 1000)</th><td>$(if ($eventLogs.AppCrashes -gt 0) { "<span class='chip yellow'>$($eventLogs.AppCrashes)</span>" } else { "<span class='chip green'>0</span>" })</td></tr>")
@@ -3778,7 +3835,6 @@ if ($eventLogs) {
     [void]$sb.AppendLine("</div>")
 }
 
-# Defender exclusions
 if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
     [void]$sb.AppendLine("<h3>Defender Exclusions</h3><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th style='width:220px'>Paths</th><td>$($defenderExcl.Paths -join '<br>')</td></tr>")
@@ -3788,7 +3844,6 @@ if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Legend
 [void]$sb.AppendLine("<h2>Legend</h2>")
 [void]$sb.AppendLine("<div class='legend'>")
 [void]$sb.AppendLine("<span class='chip green'>Healthy</span>")
@@ -3799,7 +3854,6 @@ if ($defenderExcl -and $defenderExcl.Paths.Count -gt 0) {
 [void]$sb.AppendLine("<span class='chip blue'>Unknown</span>")
 [void]$sb.AppendLine("</div>")
 
-# Findings
 $topFindings = @()
 foreach ($r in $allResults) {
     foreach ($f in $r.Findings) { $topFindings += $f }
@@ -3828,7 +3882,6 @@ if ($topFindings.Count -eq 0) {
     }
 }
 
-# Machine
 [void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
 foreach ($kv in @(
     @('OS', $sys.OS), @('Display version', $sys.OSDisplayVersion),
@@ -3846,14 +3899,12 @@ foreach ($kv in @(
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Graphics
 [void]$sb.AppendLine("<h2>Graphics</h2><div class='card'><table><tr><th>GPU</th><th>Kind</th><th>Driver</th><th>Date</th><th>VRAM (GB)</th><th>Source</th><th>Resolution</th><th>Refresh</th></tr>")
 foreach ($g in $sys.GPUs) {
     [void]$sb.AppendLine("<tr><td>$($g.Name)</td><td>$($g.Kind)</td><td>$($g.DriverVersion)</td><td>$($g.DriverDate)</td><td><b>$($g.VRAM_GB)</b></td><td class='small'>$($g.VRAM_Source)</td><td>$($g.Resolution)</td><td>$($g.RefreshHz)</td></tr>")
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Live GPU sample
 if ($LiveGpu -and $LiveGpu.Count -gt 0) {
     [void]$sb.AppendLine("<h2>Live GPU Sample</h2><div class='card'><table><tr><th>PID</th><th>Process</th><th>GPU %</th></tr>")
     foreach ($g in $LiveGpu) {
@@ -3862,7 +3913,6 @@ if ($LiveGpu -and $LiveGpu.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Disks
 [void]$sb.AppendLine("<h2>Disks</h2><div class='card'><table><tr><th>Drive</th><th>Label</th><th>FS</th><th>Size GB</th><th>Free GB</th><th>Free %</th></tr>")
 foreach ($d in $sys.Disks) {
     $cls = if ($d.FreePct -lt 10) { 'red' } elseif ($d.FreePct -lt 20) { 'yellow' } else { 'green' }
@@ -3870,11 +3920,11 @@ foreach ($d in $sys.Disks) {
 }
 [void]$sb.AppendLine("</table></div>")
 
-# Windows Health
 [void]$sb.AppendLine("<h2>Windows Health</h2><div class='card'><table>")
 $rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($windowsHealth.RebootReason)" } else { "<span class='chip green'>No</span>" }
 [void]$sb.AppendLine("<tr><th style='width:220px'>Pending reboot</th><td>$rb</td></tr>")
-[void]$sb.AppendLine("<tr><th>Windows Update service</th><td>$($windowsHealth.UpdateService)</td></tr>")
+$wuCls = if ($windowsHealth.UpdateService -eq 'Disabled') { 'red' } elseif ($windowsHealth.UpdateService -eq 'Running') { 'green' } else { 'gray' }
+[void]$sb.AppendLine("<tr><th>Windows Update service</th><td><span class='chip $wuCls'>$($windowsHealth.UpdateService)</span></td></tr>")
 [void]$sb.AppendLine("<tr><th>Defender</th><td>$($windowsHealth.Defender)</td></tr>")
 [void]$sb.AppendLine("<tr><th>Defender signature</th><td>$($windowsHealth.DefenderSig) ($($windowsHealth.DefenderSigDate))</td></tr>")
 [void]$sb.AppendLine("<tr><th>Firewall</th><td>$($windowsHealth.Firewall)</td></tr>")
@@ -3883,7 +3933,6 @@ $rb = if ($windowsHealth.PendingReboot) { "<span class='chip red'>YES</span> $($
 [void]$sb.AppendLine("<tr><th>Category score</th><td><b>$($windowsHealth.Score)/100</b></td></tr>")
 [void]$sb.AppendLine("</table></div>")
 
-# Power
 [void]$sb.AppendLine("<h2>Power</h2><div class='card'><table>")
 [void]$sb.AppendLine("<tr><th style='width:220px'>Has battery</th><td>$($sys.Power.HasBattery)</td></tr>")
 $acChip = if ($sys.Power.OnAC) { 'Yes' } else { "<span class='chip yellow'>No</span>" }
@@ -3894,7 +3943,6 @@ if ($sys.Power.Percent -ne $null) {
 [void]$sb.AppendLine("<tr><th>Status</th><td>$($sys.Power.StatusText)</td></tr>")
 [void]$sb.AppendLine("</table></div>")
 
-# Thermals
 if ($sys.ThermalZones.Count -gt 0) {
     [void]$sb.AppendLine("<h2>Thermals</h2><div class='card'><table><tr><th>Zone</th><th>Temperature</th><th>Source</th></tr>")
     foreach ($z in $sys.ThermalZones) {
@@ -3904,7 +3952,6 @@ if ($sys.ThermalZones.Count -gt 0) {
     [void]$sb.AppendLine("</table></div>")
 }
 
-# Network
 [void]$sb.AppendLine("<h2>Network</h2><div class='card'><table>")
 [void]$sb.AppendLine("<tr><th style='width:220px'>Link speed</th><td>$($networkHealth.LinkSpeedText)</td></tr>")
 $dnsChip = if ($networkHealth.DNS -eq 'OK') { "<span class='chip green'>OK ($($networkHealth.DNSms) ms)</span>" } else { "<span class='chip red'>$($networkHealth.DNS)</span>" }
@@ -3922,7 +3969,6 @@ if ($networkHealth.Adapters.Count -gt 0) {
 }
 [void]$sb.AppendLine("</div>")
 
-# License Center
 if ($networkHealth.License.Count -gt 0) {
     [void]$sb.AppendLine("<h2>License Center</h2><div class='card'><table>")
     [void]$sb.AppendLine("<tr><th>Product</th><th>Ports</th><th>Local</th></tr>")
@@ -3933,7 +3979,6 @@ if ($networkHealth.License.Count -gt 0) {
     [void]$sb.AppendLine("</table><p class='small'>Ports closed locally is normal for node-locked or remote license servers.</p></div>")
 }
 
-# Guardian
 if ($guardian) {
     [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'>")
     [void]$sb.AppendLine("<p><b>$($guardian.Root)</b></p>")
@@ -3959,12 +4004,10 @@ if ($guardian) {
     [void]$sb.AppendLine("</div>")
 }
 
-# Overall
 [void]$sb.AppendLine("<h2>Overall</h2><div class='card'>")
 [void]$sb.AppendLine("<p><span class='chip green'>$gCount healthy</span> &nbsp; <span class='chip yellow'>$yCount attention</span> &nbsp; <span class='chip red'>$rCount critical</span> &nbsp; <span class='chip gray'>$nCount not installed</span> &nbsp; <span class='chip darkgray'>$aCount not applicable</span></p>")
 [void]$sb.AppendLine("</div>")
 
-# Disciplines
 [void]$sb.AppendLine("<h2>Disciplines</h2>")
 foreach ($d in $byDisc.Keys | Sort-Object) {
     $rs = $byDisc[$d] | Sort-Object State, Name
