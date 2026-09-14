@@ -3,10 +3,11 @@
 .SYNOPSIS
     Sigma Engineer Toolkit - requirement-driven installability scanner + installer.
 .DESCRIPTION
-    Pick disciplines or apps. The PC is measured against every requirement each
-    app declares and online-verified where possible. You can install ANY app,
-    whether or not it meets requirements (a warning is shown). Scan and install
-    are both looped so you can chain actions without restarting.
+    You pick disciplines or specific apps. The toolkit measures this PC against
+    every requirement each app declares and online-verifies where possible.
+    You can install ANY app, whether or not it meets requirements (a warning
+    is shown). The final menu loops so you can scan again and install without
+    restarting the script.
 #>
 [CmdletBinding()]
 param(
@@ -26,15 +27,17 @@ param(
 Write-Host "`n========== SIGMA ENGINEER TOOLKIT ==========" -ForegroundColor Green
 Write-Host ""
 Write-Host "[INFO] Requirement-driven installability scanner." -ForegroundColor Cyan
-Write-Host "[INFO] You can install ANY app - verdict is advisory." -ForegroundColor Cyan
-Write-Host "[INFO] Scan and install both loop back to the menu." -ForegroundColor Cyan
+Write-Host "[INFO] Pick what to check - the PC is tested against each app's requirements." -ForegroundColor Cyan
+Write-Host "[INFO] The installer works from scan results or interactively." -ForegroundColor Cyan
+Write-Host "[INFO] Online: PassMark, winget, vendor feeds." -ForegroundColor Cyan
+Write-Host "[WARNING] This scanning tool isn't 100% accurate." -ForegroundColor Yellow
 if ($Offline) { Write-Host "[INFO] Offline mode: online enrichment disabled." -ForegroundColor Cyan }
 if ($Disciplines.Count -gt 0) { Write-Host "[INFO] Discipline filter: $($Disciplines -join ', ')" -ForegroundColor Cyan }
 if ($CheckApps.Count -gt 0)   { Write-Host "[INFO] App filter: $($CheckApps -join ', ')" -ForegroundColor Cyan }
 Write-Host ""
 
 # =============================================================================
-# HELPERS
+# HELPER FUNCTIONS
 # =============================================================================
 $errorLog   = "$env:TEMP\sigma_engineer_toolkit_errors.log"
 $exportPath = Join-Path $env:USERPROFILE 'Documents\SigmaEngineerToolkit'
@@ -53,7 +56,9 @@ function Write-Head  { param([string]$T)
 function Add-Diagnostic { param([string]$Category,[string]$Message)
     "[$(Get-Date -Format 'HH:mm:ss')]  $Category  ::  $Message" | Out-File $errorLog -Append
 }
-function Ensure-Folder { param([string]$P) if (-not (Test-Path $P)) { New-Item -ItemType Directory -Path $P -Force | Out-Null } }
+function Ensure-Folder { param([string]$P)
+    if (-not (Test-Path $P)) { New-Item -ItemType Directory -Path $P -Force | Out-Null }
+}
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -68,7 +73,8 @@ function Test-TcpPort {
         $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
         if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
         $client.EndConnect($iar); return $true
-    } catch { return $false } finally { try { $client.Close() } catch { } }
+    } catch { return $false }
+    finally { try { $client.Close() } catch { } }
 }
 
 function Get-GpuKind {
@@ -136,6 +142,22 @@ function Get-PowerState {
     }
 }
 
+function Get-BatteryHealth {
+    $r = [ordered]@{ DesignCapacity=$null; FullCharge=$null; HealthPercent=$null; CycleCount=$null; Manufacture=$null; Chemistry=$null }
+    try {
+        $static = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryStaticData -ErrorAction SilentlyContinue | Select-Object -First 1
+        $full   = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryFullChargedCapacity -ErrorAction SilentlyContinue | Select-Object -First 1
+        $cycle  = Get-CimInstance -Namespace 'root\wmi' -ClassName BatteryCycleCount -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($static) { $r.DesignCapacity = $static.DesignedCapacity; $r.Manufacture = $static.ManufactureName; $r.Chemistry = $static.Chemistry }
+        if ($full)   { $r.FullCharge = $full.FullChargedCapacity }
+        if ($cycle)  { $r.CycleCount = $cycle.CycleCount }
+        if ($r.DesignCapacity -and $r.FullCharge -and $r.DesignCapacity -gt 0) {
+            $r.HealthPercent = [math]::Round(($r.FullCharge / $r.DesignCapacity) * 100, 1)
+        }
+    } catch { }
+    return [pscustomobject]$r
+}
+
 function Get-InstalledSoftware {
     $paths = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -179,8 +201,52 @@ function Get-VCRedist {
         Select-Object DisplayName, DisplayVersion
 }
 
+function New-Finding {
+    param([string]$Id,[string]$Software,[string]$Problem,[string]$Detected,
+          [string]$WhyItMatters,[string]$Recommendation,[string]$Optional='',
+          [string]$Severity='warn',[double]$RecoverableGB=0)
+    [pscustomobject]@{
+        Id=$Id; Software=$Software; Problem=$Problem; Detected=$Detected
+        WhyItMatters=$WhyItMatters; Recommendation=$Recommendation
+        Optional=$Optional; Severity=$Severity; RecoverableGB=$RecoverableGB
+    }
+}
+
+function Get-LiveGpuSample {
+    param([int]$DurationSeconds = 2)
+    try {
+        $samples = Get-Counter '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples $DurationSeconds -ErrorAction Stop
+        $perInstance = @{}
+        foreach ($s in $samples.CounterSamples) {
+            $key = $s.InstanceName
+            if (-not $perInstance.ContainsKey($key)) { $perInstance[$key] = @() }
+            $perInstance[$key] += $s.CookedValue
+        }
+        $perProc = @{}
+        foreach ($k in $perInstance.Keys) {
+            if ($k -match 'pid_(\d+)') {
+                $pid2 = [int]$Matches[1]
+                $avg = ($perInstance[$k] | Measure-Object -Average).Average
+                if (-not $perProc.ContainsKey($pid2)) { $perProc[$pid2] = 0 }
+                if ($avg -gt $perProc[$pid2]) { $perProc[$pid2] = $avg }
+            }
+        }
+        $top = $perProc.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
+        $out = foreach ($t in $top) {
+            $pname = try { (Get-Process -Id $t.Key -ErrorAction Stop).ProcessName } catch { "pid $($t.Key)" }
+            [pscustomobject]@{ Pid=$t.Key; Process=$pname; GPU=[math]::Round($t.Value,1) }
+        }
+        return @($out)
+    } catch { Add-Diagnostic 'GPU' "Live GPU sample failed: $_"; return @() }
+}
+
 # =============================================================================
-# CATALOG
+# BASELINE
+# =============================================================================
+Write-Host "[INFO] Baseline: $(Get-Date) on $env:COMPUTERNAME as $env:USERDOMAIN\$env:USERNAME" -ForegroundColor DarkGray
+
+# =============================================================================
+# MASTER CATALOG
 # =============================================================================
 Write-Stage "Loading master catalog..."
 $Script:RawCatalog = @(
@@ -243,12 +309,47 @@ $Script:RawCatalog = @(
     @{N='KiCad';                D=@('Electronics','PCB');                P=@('KiCad*');                                             K='PCB';        RAM=8;  Disk=10;  Lic='None'}
     @{N='Cadence Allegro';      D=@('Electronics','PCB');                P=@('Cadence Allegro*','Allegro*');                        K='PCB';        RAM=16; Disk=30;  Lic='FlexLM'; Lsvc=@('*Cadence*','*lmgrd*'); Lport=@(5280)}
     @{N='OrCAD';                D=@('Electronics','PCB');                P=@('OrCAD*');                                             K='PCB';        RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='Siemens Xpedition';    D=@('Electronics','PCB');                P=@('Xpedition*');                                         K='PCB';        RAM=16; Disk=25;  Lic='FlexLM'}
+    @{N='PADS Professional';    D=@('Electronics','PCB');                P=@('PADS Professional*','Mentor PADS*');                  K='PCB';        RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='LTspice';              D=@('Electronics','Electrical');         P=@('LTspice*','ADI LTspice*');                            K='Circuit';    RAM=4;  Disk=2;   Lic='None'}
+    @{N='PSpice';               D=@('Electronics');                      P=@('PSpice*','OrCAD PSpice*');                            K='Circuit';    RAM=8;  Disk=10;  Lic='FlexLM'}
     @{N='NI Multisim';          D=@('Electronics');                      P=@('NI Multisim*','Multisim*');                           K='Circuit';    RAM=8;  Disk=10;  Net='4.8'; Lic='FlexLM'}
+    @{N='Proteus';              D=@('Electronics','Embedded');           P=@('Proteus*');                                           K='Circuit+MCU';RAM=8;  Disk=10;  Lic='Node'}
+    @{N='EasyEDA';              D=@('Electronics','PCB');                P=@('EasyEDA*');                                           K='PCB';        RAM=4;  Disk=3}
+    @{N='DipTrace';             D=@('Electronics','PCB');                P=@('DipTrace*');                                          K='PCB';        RAM=4;  Disk=3}
+    @{N='DesignSpark PCB';      D=@('Electronics','PCB');                P=@('DesignSpark*');                                       K='PCB';        RAM=4;  Disk=3}
+    @{N='ETAP';                 D=@('Electrical Power');                 P=@('ETAP*');                                              K='Power';      RAM=16; Disk=25;  Net='4.8'; Lic='Sentinel'; Lsvc=@('*ETAP*','Sentinel*'); Lport=@(1947)}
+    @{N='SKM PowerTools';       D=@('Electrical Power');                 P=@('SKM Power*','PowerTools*');                           K='Power';      RAM=8;  Disk=15;  Lic='Sentinel'}
+    @{N='EasyPower';            D=@('Electrical Power');                 P=@('EasyPower*');                                         K='Power';      RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='DIgSILENT PowerFactory';D=@('Electrical Power');                P=@('PowerFactory*','DIgSILENT*');                         K='Power';      RAM=16; Disk=20;  Lic='FlexLM'; Lsvc=@('*DIgSILENT*')}
+    @{N='PSS/E';                D=@('Electrical Power');                 P=@('PSS*E*','PSSE*');                                     K='Power';      RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='PSCAD';                D=@('Electrical Power');                 P=@('PSCAD*');                                             K='Power';      RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='EPLAN Electric P8';    D=@('Electrical','Automation');          P=@('EPLAN*');                                             K='ECAD';       RAM=16; Disk=25;  Net='4.8'; Lic='FlexLM'; Lsvc=@('*EPLAN*','*lmgrd*')}
+    @{N='AutoCAD Electrical';   D=@('Electrical','Automation');          P=@('AutoCAD Electrical*');                                K='ECAD';       RAM=8;  Disk=20;  GPU=$true;  Net='4.8'; Lic='Node'}
+    @{N='SOLIDWORKS Electrical';D=@('Electrical','Mechanical');          P=@('SOLIDWORKS Electrical*');                             K='ECAD';       RAM=16; Disk=25;  Net='4.8'; Lic='FlexLM'}
+    @{N='Siemens TIA Portal';   D=@('Automation','Industrial','Electrical'); P=@('TIA Portal*','SIMATIC*TIA*'); K='PLC'; RAM=16; Disk=40; Net='4.8'; Lic='FlexLM'; Lsvc=@('*Automation License*','*Siemens*','*lmgrd*'); Lport=@(27000)}
+    @{N='STEP 7';               D=@('Automation');                       P=@('STEP 7*','SIMATIC STEP 7*');                          K='PLC';        RAM=8;  Disk=25;  Lic='FlexLM'}
+    @{N='WinCC';                D=@('Automation','SCADA');               P=@('SIMATIC WinCC*','WinCC*');                            K='SCADA';      RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Rockwell Studio 5000'; D=@('Automation','Industrial');          P=@('Studio 5000*','RSLogix*');                            K='PLC';        RAM=16; Disk=30;  Net='4.8'; Lic='Rockwell'; Lsvc=@('*Rockwell*','*FactoryTalk*')}
+    @{N='FactoryTalk View';     D=@('Automation','SCADA');               P=@('FactoryTalk*');                                       K='SCADA';      RAM=8;  Disk=20;  Lic='Rockwell'}
+    @{N='CODESYS';              D=@('Automation');                       P=@('CODESYS*');                                           K='PLC';        RAM=8;  Disk=15;  Lic='None'}
+    @{N='Beckhoff TwinCAT 3';   D=@('Automation');                       P=@('TwinCAT*');                                           K='PLC';        RAM=8;  Disk=20;  Lic='Node'}
+    @{N='Schneider EcoStruxure';D=@('Automation');                       P=@('EcoStruxure*','Schneider*');                          K='PLC';        RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='Mitsubishi GX Works';  D=@('Automation');                       P=@('GX Works*');                                          K='PLC';        RAM=8;  Disk=15;  Lic='Node'}
+    @{N='Omron Sysmac Studio';  D=@('Automation');                       P=@('Sysmac Studio*');                                     K='PLC';        RAM=8;  Disk=15;  Lic='Node'}
+    @{N='AVEVA System Platform';D=@('Automation','SCADA');               P=@('AVEVA*','Wonderware*');                               K='SCADA';      RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Ignition';             D=@('Automation','SCADA');               P=@('Ignition*','Inductive Automation*');                  K='SCADA';      RAM=8;  Disk=10;  Lic='Cloud/Node'}
+    @{N='NI LabVIEW';           D=@('Automation','Instrumentation','Electrical','Telecom','Bio'); P=@('LabVIEW*','NI LabVIEW*'); K='Instrument'; RAM=8; Disk=20; Net='4.8'; Lic='FlexLM'; Lsvc=@('*NI*','*National Instruments*')}
+    @{N='Factory I/O';          D=@('Automation');                       P=@('Factory IO*','Factory I/O*');                         K='Sim';        RAM=8;  Disk=5;   GPU=$true}
     @{N='Xilinx Vivado';        D=@('Embedded','Electronics','Computer'); P=@('Xilinx Vivado*','Vivado*');                          K='FPGA';       RAM=16; Disk=60;  Lic='FlexLM'}
     @{N='Intel Quartus Prime';  D=@('Embedded','Electronics','Computer'); P=@('Quartus*');                                          K='FPGA';       RAM=16; Disk=50;  Lic='FlexLM'}
+    @{N='ModelSim';             D=@('Embedded','Computer');              P=@('ModelSim*','Questa*');                                K='HDL Sim';    RAM=8;  Disk=20;  Lic='FlexLM'}
     @{N='STM32CubeIDE';         D=@('Embedded','Robotics');              P=@('STM32CubeIDE*','STM32Cube*');                         K='Embedded';   RAM=8;  Disk=15;  Lic='None'}
+    @{N='MPLAB X';              D=@('Embedded');                         P=@('MPLAB X*');                                           K='Embedded';   RAM=4;  Disk=10;  Lic='None'}
+    @{N='Keil uVision';         D=@('Embedded');                         P=@('Keil*','uVision*');                                   K='Embedded';   RAM=4;  Disk=10;  Lic='Node'}
+    @{N='IAR Embedded Workbench';D=@('Embedded');                        P=@('IAR Embedded*');                                      K='Embedded';   RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='Arduino IDE';          D=@('Embedded','Robotics');              P=@('Arduino IDE*','Arduino*');                            K='Embedded';   RAM=2;  Disk=5;   Lic='None'}
+    @{N='PlatformIO';           D=@('Embedded');                         P=@('PlatformIO*');                                        K='Embedded';   RAM=4;  Disk=5;   Lic='None'}
     @{N='Visual Studio';        D=@('Computer','Data');                  P=@('Microsoft Visual Studio*20*');                        K='IDE';        RAM=8;  Disk=30;  Net='4.8'; Lic='Node'}
     @{N='Visual Studio Code';   D=@('Computer','Data');                  P=@('Microsoft Visual Studio Code*');                      K='IDE';        RAM=4;  Disk=5;   Lic='None'}
     @{N='Docker Desktop';       D=@('Computer');                         P=@('Docker Desktop*');                                    K='Containers'; RAM=8;  Disk=20;  Lic='Node'}
@@ -257,52 +358,193 @@ $Script:RawCatalog = @(
     @{N='Keysight ADS';         D=@('RF','Telecom','Electronics');       P=@('Keysight ADS*','ADS 20*','Advanced Design System*');  K='RF Sim';     RAM=16; Disk=40;  Lic='FlexLM'; Lsvc=@('*Keysight*','*Agilent*','*lmgrd*'); Lport=@(27000)}
     @{N='ANSYS HFSS';           D=@('RF','Telecom','Aerospace');         P=@('ANSYS HFSS*','HFSS*');                                K='EM';         RAM=32; Disk=50;  Lic='FlexLM'}
     @{N='CST Studio Suite';     D=@('RF','Telecom');                     P=@('CST Studio*','CST*');                                 K='EM';         RAM=32; Disk=40;  Lic='FlexLM'}
+    @{N='AWR Microwave Office'; D=@('RF');                               P=@('AWR*','Microwave Office*');                           K='RF Sim';     RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='FEKO';                 D=@('RF','Aerospace');                   P=@('FEKO*','Altair FEKO*');                               K='EM';         RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Sonnet Suites';        D=@('RF');                               P=@('Sonnet*');                                            K='EM';         RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='GNU Radio';            D=@('Telecom','RF');                     P=@('GNU Radio*');                                         K='SDR';        RAM=4;  Disk=5;   Lic='None'}
+    @{N='Cisco Packet Tracer';  D=@('Telecom','Computer');               P=@('Cisco Packet Tracer*');                               K='Net sim';    RAM=4;  Disk=5;   Lic='Node'}
+    @{N='Atoll';                D=@('Telecom');                          P=@('Atoll*');                                             K='RAN';        RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='NS-3';                 D=@('Telecom','Computer');               P=@('ns-3*');                                              K='Net sim';    RAM=4;  Disk=5;   Lic='None'}
     @{N='Aspen Plus';           D=@('Chemical','Process');               P=@('Aspen Plus*');                                        K='Process';    RAM=16; Disk=30;  Net='4.8'; Lic='FlexLM'; Lsvc=@('*Aspen*','*lmgrd*','*SLM*'); Lport=@(27000)}
+    @{N='Aspen HYSYS';          D=@('Chemical','Petroleum');             P=@('Aspen HYSYS*');                                       K='Process';    RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='CHEMCAD';              D=@('Chemical');                         P=@('CHEMCAD*');                                           K='Process';    RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='ProMax';               D=@('Chemical','Petroleum');             P=@('ProMax*','BR&E ProMax*');                             K='Process';    RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='DWSIM';                D=@('Chemical');                         P=@('DWSIM*');                                             K='Process';    RAM=4;  Disk=5;   Lic='None'}
+    @{N='gPROMS';               D=@('Chemical','Process');               P=@('gPROMS*');                                            K='Process';    RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='OLGA';                 D=@('Petroleum','Chemical');             P=@('OLGA*');                                              K='Flow';       RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='Pipesim';              D=@('Petroleum','Chemical');             P=@('Pipesim*','PIPESIM*');                                K='Flow';       RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='HTRI Xchanger Suite';  D=@('Chemical','Process');               P=@('HTRI*');                                              K='HX design';  RAM=8;  Disk=15;  Lic='FlexLM'}
     @{N='Petrel';               D=@('Petroleum','Geology');              P=@('Petrel*','Schlumberger Petrel*');                     K='Reservoir';  RAM=32; Disk=50;  GPU=$true;  Lic='FlexLM'; Lsvc=@('*SLB*','*Schlumberger*','*lmgrd*')}
+    @{N='Eclipse';              D=@('Petroleum');                        P=@('Eclipse*','Schlumberger Eclipse*');                   K='Reservoir';  RAM=16; Disk=40;  Lic='FlexLM'}
+    @{N='CMG GEM';              D=@('Petroleum');                        P=@('CMG*','GEM*');                                        K='Reservoir';  RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Techlog';              D=@('Petroleum','Geology');              P=@('Techlog*');                                           K='Well log';   RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Kingdom';              D=@('Petroleum','Geology');              P=@('Kingdom*','SMT Kingdom*');                            K='Seismic';    RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Deswik';               D=@('Mining');                           P=@('Deswik*');                                            K='Mine plan';  RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Maptek Vulcan';        D=@('Mining','Geology');                 P=@('Maptek Vulcan*','Vulcan*');                           K='Mine';       RAM=16; Disk=30;  Lic='FlexLM'; Lsvc=@('*Maptek*')}
+    @{N='Surpac';               D=@('Mining','Geology');                 P=@('Surpac*','Geovia Surpac*');                           K='Mine';       RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Datamine Studio';      D=@('Mining');                           P=@('Datamine*');                                          K='Mine';       RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Micromine';            D=@('Mining','Geology');                 P=@('Micromine*');                                         K='Mine';       RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Leapfrog Geo';         D=@('Mining','Geology','Geotech');       P=@('Leapfrog*');                                          K='Geo model';  RAM=16; Disk=30;  GPU=$true;  Lic='FlexLM'}
     @{N='PLAXIS 2D';            D=@('Geotech','Civil');                  P=@('PLAXIS 2D*');                                         K='Geo FEA';    RAM=8;  Disk=20;  Lic='FlexLM'; Lsvc=@('*Bentley*','*PLAXIS*')}
     @{N='PLAXIS 3D';            D=@('Geotech','Civil');                  P=@('PLAXIS 3D*');                                         K='Geo FEA';    RAM=16; Disk=25;  Lic='FlexLM'}
     @{N='GeoStudio';            D=@('Geotech','Civil','Mining');         P=@('GeoStudio*','GEO-SLOPE*');                            K='Geo';        RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='Rocscience RS2';       D=@('Geotech','Mining');                 P=@('RS2*','Rocscience RS2*');                             K='Geo FEA';    RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='Rocscience RS3';       D=@('Geotech','Mining');                 P=@('RS3*','Rocscience RS3*');                             K='Geo FEA';    RAM=16; Disk=20;  Lic='FlexLM'}
+    @{N='Slide2';               D=@('Geotech','Mining');                 P=@('Slide2*','Slide 2*');                                 K='Slope';      RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='FLAC3D';               D=@('Geotech','Mining');                 P=@('FLAC3D*');                                            K='Geo FEA';    RAM=16; Disk=25;  Lic='FlexLM'}
+    @{N='GEO5';                 D=@('Geotech','Civil');                  P=@('GEO5*');                                              K='Geo';        RAM=4;  Disk=10;  Lic='Node'}
+    @{N='gINT';                 D=@('Geotech');                          P=@('gINT*');                                              K='Boring log'; RAM=4;  Disk=10;  Lic='FlexLM'}
     @{N='HEC-RAS';              D=@('Water','Civil','Environmental');    P=@('HEC-RAS*');                                           K='Hydraulics'; RAM=8;  Disk=15;  Lic='None'}
     @{N='HEC-HMS';              D=@('Water','Civil','Environmental');    P=@('HEC-HMS*');                                           K='Hydrology';  RAM=8;  Disk=10;  Lic='None'}
     @{N='EPA SWMM';             D=@('Water','Environmental');            P=@('EPA SWMM*','SWMM*');                                  K='Stormwater'; RAM=4;  Disk=5;   Lic='None'}
     @{N='EPANET';               D=@('Water','Environmental');            P=@('EPANET*');                                            K='Water net';  RAM=4;  Disk=5;   Lic='None'}
     @{N='WaterGEMS';            D=@('Water','Civil');                    P=@('WaterGEMS*');                                         K='Water net';  RAM=8;  Disk=20;  Lic='Bentley'; Lsvc=@('*Bentley*','*SelectServer*')}
-    @{N='ArcGIS Pro';           D=@('GIS','Geomatics','Environmental','Civil'); P=@('ArcGIS Pro*');                                 K='GIS';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*ArcGIS*','*ESRI*','*lmgrd*'); Lport=@(27000)}
-    @{N='QGIS';                 D=@('GIS','Geomatics','Environmental');  P=@('QGIS*');                                              K='GIS';        RAM=8;  Disk=10;  Lic='None'}
-    @{N='Pix4Dmapper';          D=@('Geomatics','Survey','GIS');         P=@('Pix4D*');                                             K='Photogram';  RAM=16; Disk=25;  GPU=$true;  Lic='FlexLM'; Lsvc=@('*Pix4D*')}
-    @{N='Agisoft Metashape';    D=@('Geomatics','Survey');               P=@('Agisoft Metashape*','Agisoft PhotoScan*');            K='Photogram';  RAM=16; Disk=25;  GPU=$true;  Lic='Node'}
-    @{N='Leica Cyclone';        D=@('Geomatics','Survey');               P=@('Leica Cyclone*');                                     K='PointCloud'; RAM=16; Disk=30;  GPU=$true;  Lic='FlexLM'}
-    @{N='CloudCompare';         D=@('Geomatics','Survey');               P=@('CloudCompare*');                                      K='PointCloud'; RAM=8;  Disk=10;  Lic='None'}
-    @{N='Bentley OpenRail';     D=@('Railway','Civil');                  P=@('OpenRail*');                                          K='Rail CAD';   RAM=16; Disk=30;  GPU=$true;  Lic='Bentley'; Lsvc=@('*Bentley*','*SelectServer*')}
-    @{N='Revit MEP';            D=@('MEP','HVAC','Fire');                P=@('Autodesk Revit*');                                    K='MEP';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; Lic='Node'}
-    @{N='EnergyPlus';           D=@('HVAC','Building');                  P=@('EnergyPlus*');                                        K='BEM';        RAM=8;  Disk=15;  Lic='None'}
-    @{N='DIALux evo';           D=@('Lighting','MEP');                   P=@('DIALux*');                                            K='Lighting';   RAM=8;  Disk=15;  GPU=$true;  Lic='None'}
-    @{N='PyroSim';              D=@('Fire');                             P=@('PyroSim*');                                           K='Fire sim';   RAM=16; Disk=20;  GPU=$true;  Lic='Node'}
-    @{N='FDS';                  D=@('Fire');                             P=@('FDS*','NIST FDS*');                                   K='Fire sim';   RAM=16; Disk=20;  Lic='None'}
-    @{N='MCNP';                 D=@('Nuclear');                          P=@('MCNP*');                                              K='Neutronics'; RAM=8;  Disk=20;  Lic='Node'}
-    @{N='OpenMC';               D=@('Nuclear');                          P=@('OpenMC*');                                            K='Neutronics'; RAM=8;  Disk=20;  Lic='None'}
-    @{N='Mimics Innovation Suite';D=@('Biomedical');                     P=@('Mimics*','Materialise Mimics*');                      K='Bio model';  RAM=16; Disk=25;  GPU=$true;  Lic='FlexLM'}
-    @{N='ImageJ';               D=@('Biomedical','Materials');           P=@('ImageJ*','Fiji*');                                    K='Imaging';    RAM=4;  Disk=5;   Lic='None'}
-    @{N='3D Slicer';            D=@('Biomedical');                       P=@('3D Slicer*');                                         K='Imaging';    RAM=8;  Disk=10;  Lic='None'}
-    @{N='Thermo-Calc';          D=@('Materials');                        P=@('Thermo-Calc*');                                       K='Thermo';     RAM=8;  Disk=20;  Lic='FlexLM'}
-    @{N='Materials Studio';     D=@('Materials');                        P=@('Materials Studio*','BIOVIA*');                        K='MD';         RAM=16; Disk=25;  Lic='FlexLM'}
-    @{N='PVsyst';               D=@('Renewable','Solar');                P=@('PVsyst*');                                            K='Solar';      RAM=4;  Disk=10;  Lic='Node'}
-    @{N='WindPRO';              D=@('Renewable','Wind');                 P=@('WindPRO*');                                           K='Wind';       RAM=8;  Disk=15;  Lic='FlexLM'}
-    @{N='Microsoft Project';    D=@('Project Mgmt');                     P=@('Microsoft Project*','Microsoft 365*Project*');        K='PM';         RAM=4;  Disk=10;  Net='4.8'; Lic='Node'}
-    @{N='Primavera P6';         D=@('Project Mgmt');                     P=@('Primavera P6*','Oracle Primavera*');                  K='PM';         RAM=8;  Disk=20;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*Primavera*','*Oracle*')}
-    @{N='Mastercam';            D=@('Manufacturing','CAM');              P=@('Mastercam*');                                         K='CAM';        RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='FlexLM/Node'; Lsvc=@('*Mastercam*','*Sentinel*')}
-    @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
-    @{N='Carlson Survey';       D=@('Survey','Civil');                   P=@('Carlson Survey*');                                    K='Survey';     RAM=8;  Disk=15;  Lic='Node'}
     @{N='SewerGEMS';            D=@('Water','Civil');                    P=@('SewerGEMS*');                                         K='Sewer';      RAM=8;  Disk=20;  Lic='Bentley'}
     @{N='InfoWorks ICM';        D=@('Water','Civil');                    P=@('InfoWorks*');                                         K='Hydraulic';  RAM=16; Disk=30;  Lic='FlexLM'}
     @{N='MIKE+';                D=@('Water','Civil');                    P=@('MIKE+*','DHI MIKE*');                                 K='Hydraulic';  RAM=16; Disk=30;  Lic='FlexLM'}
-    @{N='GEO5';                 D=@('Geotech','Civil');                  P=@('GEO5*');                                              K='Geo';        RAM=4;  Disk=10;  Lic='Node'}
+    @{N='MODFLOW';              D=@('Water','Geology');                  P=@('MODFLOW*','Visual MODFLOW*');                         K='GW';         RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='AERMOD';               D=@('Environmental');                    P=@('AERMOD*','AERMOD View*');                             K='Air';        RAM=4;  Disk=10;  Lic='None'}
+    @{N='CALPUFF';              D=@('Environmental');                    P=@('CALPUFF*');                                           K='Air';        RAM=4;  Disk=10;  Lic='None'}
+    @{N='ArcGIS Pro';           D=@('GIS','Geomatics','Environmental','Civil'); P=@('ArcGIS Pro*');                                 K='GIS';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*ArcGIS*','*ESRI*','*lmgrd*'); Lport=@(27000)}
+    @{N='ArcGIS Desktop';       D=@('GIS');                              P=@('ArcGIS Desktop*','ArcMap*','ArcGIS 10*');             K='GIS';        RAM=8;  Disk=25;  Net='4.8'; Lic='FlexLM'}
+    @{N='QGIS';                 D=@('GIS','Geomatics','Environmental');  P=@('QGIS*');                                              K='GIS';        RAM=8;  Disk=10;  Lic='None'}
+    @{N='Global Mapper';        D=@('GIS','Geomatics');                  P=@('Global Mapper*');                                     K='GIS';        RAM=8;  Disk=15;  Lic='Node'}
+    @{N='ENVI';                 D=@('GIS','Remote Sensing');             P=@('ENVI*','NV5 ENVI*');                                  K='RS';         RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='ERDAS Imagine';        D=@('GIS','Remote Sensing');             P=@('ERDAS*','Hexagon ERDAS*');                            K='RS';         RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='Pix4Dmapper';          D=@('Geomatics','Survey','GIS');         P=@('Pix4D*');                                             K='Photogram';  RAM=16; Disk=25;  GPU=$true;  Lic='FlexLM'; Lsvc=@('*Pix4D*')}
+    @{N='Agisoft Metashape';    D=@('Geomatics','Survey');               P=@('Agisoft Metashape*','Agisoft PhotoScan*');            K='Photogram';  RAM=16; Disk=25;  GPU=$true;  Lic='Node'}
+    @{N='Trimble Business Center';D=@('Geomatics','Survey');             P=@('Trimble Business Center*');                           K='Survey';     RAM=8;  Disk=20;  Lic='FlexLM'; Lsvc=@('*Trimble*')}
+    @{N='Leica Infinity';       D=@('Geomatics','Survey');               P=@('Leica Infinity*');                                    K='Survey';     RAM=8;  Disk=20;  Lic='Node'}
+    @{N='Leica Cyclone';        D=@('Geomatics','Survey');               P=@('Leica Cyclone*');                                     K='PointCloud'; RAM=16; Disk=30;  GPU=$true;  Lic='FlexLM'}
+    @{N='CloudCompare';         D=@('Geomatics','Survey');               P=@('CloudCompare*');                                      K='PointCloud'; RAM=8;  Disk=10;  Lic='None'}
+    @{N='Autodesk ReCap';       D=@('Geomatics','AEC');                  P=@('Autodesk ReCap*');                                    K='PointCloud'; RAM=8;  Disk=15;  Lic='Node'}
+    @{N='Carlson Survey';       D=@('Survey','Civil');                   P=@('Carlson Survey*');                                    K='Survey';     RAM=8;  Disk=15;  Lic='Node'}
+    @{N='AVEVA Marine';         D=@('Marine','Naval');                   P=@('AVEVA Marine*','AVEVA*');                             K='Ship CAD';   RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='ShipConstructor';      D=@('Marine','Naval');                   P=@('ShipConstructor*');                                   K='Ship CAD';   RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='Maxsurf';              D=@('Marine','Naval');                   P=@('Maxsurf*');                                           K='Naval arch'; RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='NAPA';                 D=@('Marine','Naval');                   P=@('NAPA*');                                              K='Naval arch'; RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='ANSYS AQWA';           D=@('Marine','Naval','Offshore');        P=@('ANSYS AQWA*','AQWA*');                                K='Hydro';      RAM=16; Disk=30;  Lic='FlexLM'}
+    @{N='MOSES';                D=@('Marine','Offshore');                P=@('MOSES*','Bentley MOSES*');                            K='Hydro';      RAM=8;  Disk=20;  Lic='Bentley'}
+    @{N='Bentley OpenRail';     D=@('Railway','Civil');                  P=@('OpenRail*');                                          K='Rail CAD';   RAM=16; Disk=30;  GPU=$true;  Lic='Bentley'; Lsvc=@('*Bentley*','*SelectServer*')}
+    @{N='OpenTrack';            D=@('Railway');                          P=@('OpenTrack*');                                         K='Rail sim';   RAM=8;  Disk=15;  Lic='None'}
+    @{N='RailSys';              D=@('Railway');                          P=@('RailSys*');                                           K='Rail sim';   RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='AutoSPRINK';           D=@('Fire','MEP');                       P=@('AutoSPRINK*');                                        K='Fire';       RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='HydraCALC';            D=@('Fire','MEP');                       P=@('HydraCALC*');                                         K='Fire';       RAM=4;  Disk=10;  Lic='Node'}
+    @{N='PyroSim';              D=@('Fire');                             P=@('PyroSim*');                                           K='Fire sim';   RAM=16; Disk=20;  GPU=$true;  Lic='Node'}
+    @{N='FDS';                  D=@('Fire');                             P=@('FDS*','NIST FDS*');                                   K='Fire sim';   RAM=16; Disk=20;  Lic='None'}
+    @{N='Pathfinder';           D=@('Fire');                             P=@('Pathfinder*');                                        K='Egress';     RAM=8;  Disk=15;  Lic='Node'}
+    @{N='CONTAM';               D=@('Fire','HVAC');                      P=@('CONTAM*','NIST CONTAM*');                             K='Airflow';    RAM=4;  Disk=10;  Lic='None'}
+    @{N='Revit MEP';            D=@('MEP','HVAC','Fire');                P=@('Autodesk Revit*');                                    K='MEP';        RAM=16; Disk=30;  GPU=$true;  Net='4.8'; Lic='Node'}
+    @{N='AutoCAD MEP';          D=@('MEP','HVAC');                       P=@('AutoCAD MEP*','AutoCAD Architecture*');               K='MEP';        RAM=8;  Disk=20;  GPU=$true;  Net='4.8'; Lic='Node'}
+    @{N='Carrier HAP';          D=@('HVAC');                             P=@('Carrier HAP*','HAP*');                                K='HVAC load';  RAM=4;  Disk=10;  Lic='Node'}
+    @{N='TRACE 3D Plus';        D=@('HVAC');                             P=@('TRACE 700*','TRACE 3D*','Trane TRACE*');              K='HVAC load';  RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='EnergyPlus';           D=@('HVAC','Building');                  P=@('EnergyPlus*');                                        K='BEM';        RAM=8;  Disk=15;  Lic='None'}
+    @{N='OpenStudio';           D=@('HVAC','Building');                  P=@('OpenStudio*');                                        K='BEM';        RAM=8;  Disk=15;  Lic='None'}
+    @{N='IES VE';               D=@('HVAC','Building');                  P=@('IES*','IESVE*');                                      K='BEM';        RAM=16; Disk=25;  Lic='FlexLM'}
+    @{N='DesignBuilder';        D=@('HVAC','Building');                  P=@('DesignBuilder*');                                     K='BEM';        RAM=8;  Disk=20;  GPU=$true;  Lic='FlexLM'}
+    @{N='eQUEST';               D=@('HVAC','Building');                  P=@('eQUEST*');                                            K='BEM';        RAM=4;  Disk=10;  Lic='None'}
+    @{N='DIALux evo';           D=@('Lighting','MEP');                   P=@('DIALux*');                                            K='Lighting';   RAM=8;  Disk=15;  GPU=$true;  Lic='None'}
+    @{N='AGi32';                D=@('Lighting','MEP');                   P=@('AGi32*');                                             K='Lighting';   RAM=8;  Disk=15;  Lic='Node'}
+    @{N='MCNP';                 D=@('Nuclear');                          P=@('MCNP*');                                              K='Neutronics'; RAM=8;  Disk=20;  Lic='Node'}
+    @{N='SCALE';                D=@('Nuclear');                          P=@('SCALE*','ORNL SCALE*');                               K='Neutronics'; RAM=8;  Disk=20;  Lic='Node'}
+    @{N='SERPENT';              D=@('Nuclear');                          P=@('Serpent*','SERPENT*');                                K='Neutronics'; RAM=8;  Disk=20;  Lic='None'}
+    @{N='RELAP5';               D=@('Nuclear');                          P=@('RELAP5*');                                            K='Thermal';    RAM=8;  Disk=20;  Lic='Node'}
+    @{N='TRACE';                D=@('Nuclear');                          P=@('TRACE*','NRC TRACE*');                                K='Thermal';    RAM=8;  Disk=20;  Lic='None'}
+    @{N='OpenMC';               D=@('Nuclear');                          P=@('OpenMC*');                                            K='Neutronics'; RAM=8;  Disk=20;  Lic='None'}
+    @{N='Mimics Innovation Suite';D=@('Biomedical');                     P=@('Mimics*','Materialise Mimics*');                      K='Bio model';  RAM=16; Disk=25;  GPU=$true;  Lic='FlexLM'}
+    @{N='Simpleware';           D=@('Biomedical');                       P=@('Simpleware*','Synopsys Simpleware*');                 K='Bio model';  RAM=16; Disk=25;  Lic='FlexLM'}
+    @{N='ImageJ';               D=@('Biomedical','Materials');           P=@('ImageJ*','Fiji*');                                    K='Imaging';    RAM=4;  Disk=5;   Lic='None'}
+    @{N='3D Slicer';            D=@('Biomedical');                       P=@('3D Slicer*');                                         K='Imaging';    RAM=8;  Disk=10;  Lic='None'}
+    @{N='Thermo-Calc';          D=@('Materials');                        P=@('Thermo-Calc*');                                       K='Thermo';     RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='JMatPro';              D=@('Materials');                        P=@('JMatPro*');                                           K='Materials';  RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='FactSage';             D=@('Materials');                        P=@('FactSage*');                                          K='Thermo';     RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='Materials Studio';     D=@('Materials');                        P=@('Materials Studio*','BIOVIA*');                        K='MD';         RAM=16; Disk=25;  Lic='FlexLM'}
+    @{N='PVsyst';               D=@('Renewable','Solar');                P=@('PVsyst*');                                            K='Solar';      RAM=4;  Disk=10;  Lic='Node'}
+    @{N='HOMER Pro';            D=@('Renewable');                        P=@('HOMER*');                                             K='Microgrid';  RAM=4;  Disk=10;  Lic='Node'}
+    @{N='SAM';                  D=@('Renewable');                        P=@('SAM 20*','System Advisor Model*');                    K='Renewable';  RAM=4;  Disk=10;  Lic='None'}
+    @{N='RETScreen Expert';     D=@('Renewable');                        P=@('RETScreen*');                                         K='Feasibility';RAM=4;  Disk=5;   Lic='Node'}
+    @{N='HelioScope';           D=@('Renewable','Solar');                P=@('HelioScope*');                                        K='Solar';      RAM=4;  Disk=5;   Lic='Cloud'}
+    @{N='WindPRO';              D=@('Renewable','Wind');                 P=@('WindPRO*');                                           K='Wind';       RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='WAsP';                 D=@('Renewable','Wind');                 P=@('WAsP*');                                              K='Wind';       RAM=4;  Disk=10;  Lic='FlexLM'}
+    @{N='GT-AutoLion';          D=@('Battery');                          P=@('GT-AutoLion*','AutoLion*');                           K='Battery';    RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='Battery Design Studio';D=@('Battery');                          P=@('Battery Design Studio*','CD-adapco BDS*');            K='Battery';    RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='Microsoft Project';    D=@('Project Mgmt');                     P=@('Microsoft Project*','Microsoft 365*Project*');        K='PM';         RAM=4;  Disk=10;  Net='4.8'; Lic='Node'}
+    @{N='Primavera P6';         D=@('Project Mgmt');                     P=@('Primavera P6*','Oracle Primavera*');                  K='PM';         RAM=8;  Disk=20;  Net='4.8'; Lic='FlexLM/Cloud'; Lsvc=@('*Primavera*','*Oracle*')}
+    @{N='Procore';              D=@('Project Mgmt','Construction');      P=@('Procore*');                                           K='PM';         RAM=4;  Disk=5;   Lic='Cloud'}
+    @{N='Autodesk Construction Cloud'; D=@('Project Mgmt','Construction'); P=@('Autodesk Construction Cloud*','BIM 360*','ACC*');   K='PM';         RAM=4;  Disk=5;   Lic='Cloud'}
+    @{N='Oracle Aconex';        D=@('Project Mgmt');                     P=@('Aconex*');                                            K='PM';         RAM=4;  Disk=5;   Lic='Cloud'}
+    @{N='CostX';                D=@('Project Mgmt','Estimation');        P=@('CostX*');                                             K='Estimation'; RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='PlanSwift';            D=@('Estimation');                       P=@('PlanSwift*');                                         K='Estimation'; RAM=4;  Disk=10;  Lic='Node'}
+    @{N='Mastercam';            D=@('Manufacturing','CAM');              P=@('Mastercam*');                                         K='CAM';        RAM=16; Disk=25;  GPU=$true;  Net='4.8'; Lic='FlexLM/Node'; Lsvc=@('*Mastercam*','*Sentinel*')}
+    @{N='SolidCAM';             D=@('Manufacturing','CAM');              P=@('SolidCAM*');                                          K='CAM';        RAM=8;  Disk=20;  Net='4.8'; Lic='FlexLM'}
+    @{N='PowerMill';            D=@('Manufacturing','CAM');              P=@('PowerMill*','Autodesk PowerMill*');                   K='CAM';        RAM=16; Disk=20;  Net='4.8'; Lic='Node'}
+    @{N='VERICUT';              D=@('Manufacturing','CAM');              P=@('VERICUT*');                                           K='CAM verify'; RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='ESPRIT';               D=@('Manufacturing','CAM');              P=@('ESPRIT*');                                            K='CAM';        RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='PC-DMIS';              D=@('Metrology','Manufacturing');        P=@('PC-DMIS*');                                           K='Metrology';  RAM=8;  Disk=15;  Lic='FlexLM'}
+    @{N='PolyWorks';            D=@('Metrology','Manufacturing');        P=@('PolyWorks*');                                         K='Metrology';  RAM=16; Disk=20;  GPU=$true;  Lic='FlexLM'}
+    @{N='IBM Engineering DOORS';D=@('Systems');                          P=@('DOORS*','IBM Engineering Requirements*');             K='Req mgmt';   RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='Cameo Systems Modeler';D=@('Systems');                          P=@('Cameo*','No Magic*');                                 K='MBSE';       RAM=8;  Disk=20;  Lic='FlexLM'}
+    @{N='Capella';              D=@('Systems');                          P=@('Capella*');                                           K='MBSE';       RAM=8;  Disk=15;  Lic='None'}
+    @{N='Enterprise Architect'; D=@('Systems','Computer');               P=@('Enterprise Architect*','Sparx*');                     K='MBSE';       RAM=8;  Disk=15;  Lic='Node'}
 )
 $Script:RawCatalog = @($Script:RawCatalog | ForEach-Object { [pscustomobject]$_ })
+$Script:CatalogCount = $Script:RawCatalog.Count
 Write-Ok
 
 # =============================================================================
-# REQUIREMENTS TABLE
+# DISCIPLINE PROFILES
+# =============================================================================
+Write-Stage "Loading discipline profiles..."
+$Script:Profiles = @{
+    'Civil'           = @('AutoCAD','Civil 3D','BricsCAD','Revit','Navisworks','HEC-RAS','HEC-HMS','WaterGEMS','SewerGEMS','InfoWorks ICM','Bentley OpenRail','Carlson Survey','Trimble Business Center')
+    'Structural'      = @('SAP2000','ETABS','SAFE','CSiBridge','STAAD.Pro','Tekla Structures','Tekla Tedds','RFEM','RISA-3D','MIDAS Civil','MIDAS Gen','Robot Structural','IDEA StatiCa','SCIA Engineer','Advance Steel')
+    'Geotech'         = @('PLAXIS 2D','PLAXIS 3D','GeoStudio','Rocscience RS2','Rocscience RS3','Slide2','FLAC3D','GEO5','gINT','Leapfrog Geo')
+    'Mining'          = @('Deswik','Maptek Vulcan','Surpac','Datamine Studio','Micromine','Leapfrog Geo','Rocscience RS2','Rocscience RS3','Slide2','FLAC3D')
+    'BIM'             = @('Revit','Archicad','Navisworks','Tekla Structures','Grasshopper','Dynamo','Autodesk Construction Cloud','Bluebeam Revu')
+    'Mechanical'      = @('SOLIDWORKS','Autodesk Inventor','CATIA','Siemens NX','PTC Creo','Solid Edge','Fusion 360','ANSYS','Abaqus','COMSOL Multiphysics')
+    'Aerospace'       = @('CATIA','Siemens NX','PTC Creo','ANSYS','Abaqus','MSC Nastran','Patran','HyperMesh','LS-DYNA','Simcenter STAR-CCM+','MATLAB','Simulink','ANSYS HFSS')
+    'Automotive'      = @('CATIA','Siemens NX','Altair HyperWorks','HyperMesh','LS-DYNA','Simcenter STAR-CCM+','MATLAB','Simulink','MSC Adams','GT-AutoLion')
+    'Marine'          = @('AVEVA Marine','ShipConstructor','Maxsurf','NAPA','ANSYS AQWA','MOSES','Rhino','Simcenter STAR-CCM+','OpenFOAM')
+    'Railway'         = @('Bentley OpenRail','OpenTrack','RailSys','Civil 3D','Revit','AutoCAD','MATLAB','Simulink','PLAXIS 2D','PLAXIS 3D')
+    'Electrical'      = @('AutoCAD Electrical','EPLAN Electric P8','SOLIDWORKS Electrical','ETAP','SKM PowerTools','EasyPower','DIgSILENT PowerFactory','PSS/E','PSCAD','NI LabVIEW')
+    'Electronics'     = @('Altium Designer','KiCad','Cadence Allegro','OrCAD','Siemens Xpedition','PADS Professional','LTspice','PSpice','NI Multisim','Proteus','Xilinx Vivado','Intel Quartus Prime','ModelSim')
+    'Automation'      = @('Siemens TIA Portal','STEP 7','WinCC','Rockwell Studio 5000','FactoryTalk View','CODESYS','Beckhoff TwinCAT 3','Schneider EcoStruxure','Mitsubishi GX Works','Omron Sysmac Studio','AVEVA System Platform','Ignition','NI LabVIEW','Factory I/O','EPLAN Electric P8')
+    'Robotics'        = @('MATLAB','Simulink','SOLIDWORKS','Fusion 360','ANSYS','Python','STM32CubeIDE','Arduino IDE')
+    'Embedded'        = @('Xilinx Vivado','Intel Quartus Prime','ModelSim','STM32CubeIDE','MPLAB X','Keil uVision','IAR Embedded Workbench','Arduino IDE','PlatformIO','Proteus','Visual Studio Code')
+    'Chemical'        = @('Aspen Plus','Aspen HYSYS','CHEMCAD','ProMax','DWSIM','gPROMS','OLGA','Pipesim','HTRI Xchanger Suite','ANSYS Fluent','COMSOL Multiphysics','MATLAB','Simulink')
+    'Petroleum'       = @('Petrel','Eclipse','CMG GEM','Techlog','Kingdom','OLGA','Pipesim','Aspen HYSYS','MATLAB')
+    'Geology'         = @('Leapfrog Geo','Petrel','Kingdom','Techlog','Maptek Vulcan','Surpac','Micromine','ArcGIS Pro','QGIS')
+    'Water'           = @('HEC-RAS','HEC-HMS','EPA SWMM','EPANET','WaterGEMS','SewerGEMS','InfoWorks ICM','MIKE+','MODFLOW')
+    'Environmental'   = @('AERMOD','CALPUFF','HEC-RAS','EPA SWMM','EPANET','MODFLOW','ArcGIS Pro','QGIS','MATLAB')
+    'GIS'             = @('ArcGIS Pro','ArcGIS Desktop','QGIS','Global Mapper','ENVI','ERDAS Imagine','Autodesk ReCap','Pix4Dmapper','Agisoft Metashape','CloudCompare','Leica Cyclone')
+    'Survey'          = @('Trimble Business Center','Leica Infinity','Carlson Survey','Civil 3D','Pix4Dmapper','Agisoft Metashape','ArcGIS Pro','QGIS','Autodesk ReCap','CloudCompare','Leica Cyclone')
+    'Fire'            = @('AutoSPRINK','HydraCALC','PyroSim','FDS','Pathfinder','CONTAM','Revit MEP','AutoCAD MEP')
+    'MEP'             = @('Revit MEP','AutoCAD MEP','Carrier HAP','TRACE 3D Plus','EnergyPlus','OpenStudio','IES VE','DesignBuilder','eQUEST','DIALux evo','AGi32')
+    'HVAC'            = @('Carrier HAP','TRACE 3D Plus','EnergyPlus','OpenStudio','IES VE','DesignBuilder','eQUEST','Revit MEP','AutoCAD MEP','CONTAM','DIALux evo','AGi32')
+    'Nuclear'         = @('MCNP','SCALE','SERPENT','RELAP5','TRACE','OpenMC','ANSYS','Abaqus','COMSOL Multiphysics','MATLAB')
+    'Biomedical'      = @('MATLAB','Simulink','NI LabVIEW','COMSOL Multiphysics','ANSYS','Abaqus','Mimics Innovation Suite','Simpleware','ImageJ','3D Slicer','SOLIDWORKS','Python')
+    'Materials'       = @('ANSYS','Abaqus','COMSOL Multiphysics','Thermo-Calc','JMatPro','FactSage','Materials Studio','ImageJ','MATLAB','OriginPro')
+    'Simulation'      = @('ANSYS','Abaqus','COMSOL Multiphysics','MSC Nastran','LS-DYNA','Altair HyperWorks','HyperMesh','Simcenter STAR-CCM+','OpenFOAM','ANSYS Fluent','MSC Adams','Simulink','MATLAB')
+    'Math'            = @('MATLAB','Simulink','Wolfram Mathematica','Maple','Mathcad Prime','Python','Anaconda','Jupyter','R','OriginPro')
+    'Computer'        = @('Visual Studio','Visual Studio Code','Git','Docker Desktop','Wireshark','Xilinx Vivado','Intel Quartus Prime','ModelSim','Python','MATLAB','Simulink')
+    'Telecom'         = @('MATLAB','Simulink','Keysight ADS','ANSYS HFSS','CST Studio Suite','NI LabVIEW','GNU Radio','Atoll','NS-3','Wireshark','Cisco Packet Tracer')
+    'RF'              = @('Keysight ADS','ANSYS HFSS','CST Studio Suite','AWR Microwave Office','FEKO','Sonnet Suites','COMSOL Multiphysics','MATLAB')
+    'Renewable'       = @('PVsyst','HOMER Pro','SAM','RETScreen Expert','HelioScope','WindPRO','WAsP','ETAP','DIgSILENT PowerFactory','MATLAB','Simulink')
+    'Battery'         = @('GT-AutoLion','Battery Design Studio','ANSYS','COMSOL Multiphysics','MATLAB','Simulink')
+    'Project Mgmt'    = @('Microsoft Project','Primavera P6','Procore','Autodesk Construction Cloud','Oracle Aconex','Bluebeam Revu','CostX','PlanSwift','Navisworks')
+    'Manufacturing'   = @('Mastercam','SolidCAM','PowerMill','VERICUT','ESPRIT','PC-DMIS','PolyWorks','Fusion 360','Siemens NX','Autodesk Inventor')
+    'Metrology'       = @('PC-DMIS','PolyWorks','ImageJ')
+    'Systems'         = @('IBM Engineering DOORS','Cameo Systems Modeler','Capella','Enterprise Architect','MATLAB','Simulink','Siemens Teamcenter')
+    'Surveying'       = @('Trimble Business Center','Leica Infinity','Carlson Survey','Civil 3D','Autodesk ReCap')
+    'PLM'             = @('Siemens Teamcenter','SOLIDWORKS','CATIA','Siemens NX','PTC Creo')
+    'CFD'             = @('ANSYS Fluent','Simcenter STAR-CCM+','OpenFOAM','COMSOL Multiphysics','ANSYS')
+    'FEA'             = @('ANSYS','Abaqus','MSC Nastran','LS-DYNA','Altair HyperWorks','COMSOL Multiphysics')
+    'CAD'             = @('AutoCAD','SOLIDWORKS','Autodesk Inventor','CATIA','Siemens NX','PTC Creo','Solid Edge','BricsCAD','Fusion 360','Rhino')
+}
+Write-Ok
+
+# =============================================================================
+# REQUIREMENTS TABLE (curated per-app)
 # =============================================================================
 Write-Stage "Loading requirement grids..."
 $Script:Requirements = @{
@@ -821,68 +1063,11 @@ $Script:Requirements = @{
         @{ Type='NetFx';    Min='4.8' }
         @{ Type='LicenseSvc'; Pattern='*Tekla*'; Ports=@(27000) }
     )
-    'PLAXIS 2D' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=10; Rec=20 }
-        @{ Type='LicenseSvc'; Pattern='*Bentley*'; Ports=@() }
-        @{ Type='LicenseSvc'; Pattern='*PLAXIS*'; Ports=@() }
-    )
-    'PLAXIS 3D' = @(
-        @{ Type='RAM'; Min=8; Rec=16 }
-        @{ Type='Disk'; Min=13; Rec=25 }
-        @{ Type='LicenseSvc'; Pattern='*Bentley*'; Ports=@() }
-    )
-    'WaterGEMS' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=10; Rec=20 }
-        @{ Type='LicenseSvc'; Pattern='*Bentley*'; Ports=@() }
-        @{ Type='LicenseSvc'; Pattern='*SelectServer*'; Ports=@() }
-    )
-    'SewerGEMS' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=10; Rec=20 }
-        @{ Type='LicenseSvc'; Pattern='*Bentley*'; Ports=@() }
-    )
-    'Bentley OpenRail' = @(
-        @{ Type='RAM'; Min=8; Rec=16 }
-        @{ Type='Disk'; Min=15; Rec=30 }
-        @{ Type='GPU'; MinVRAM=1; RecVRAM=2; MinDirectX='11' }
-        @{ Type='LicenseSvc'; Pattern='*Bentley*'; Ports=@() }
-        @{ Type='LicenseSvc'; Pattern='*SelectServer*'; Ports=@() }
-    )
-    'InfoWorks ICM' = @(
-        @{ Type='RAM'; Min=8; Rec=16 }
-        @{ Type='Disk'; Min=15; Rec=30 }
-    )
-    'MIKE+' = @(
-        @{ Type='RAM'; Min=8; Rec=16 }
-        @{ Type='Disk'; Min=15; Rec=30 }
-    )
-    'GEO5' = @(
-        @{ Type='RAM'; Min=2; Rec=4 }
-        @{ Type='Disk'; Min=5; Rec=10 }
-    )
-    'GeoStudio' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=8; Rec=15 }
-    )
-    'HEC-RAS' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=8; Rec=15 }
-    )
-    'HEC-HMS' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=5; Rec=10 }
-    )
-    'Carlson Survey' = @(
-        @{ Type='RAM'; Min=4; Rec=8 }
-        @{ Type='Disk'; Min=8; Rec=15 }
-    )
 }
 Write-Ok
 
 # =============================================================================
-# SYSTEM INVENTORY
+# INSTALLED SOFTWARE + SYSTEM INVENTORY
 # =============================================================================
 Write-Stage "Scanning installed software..."
 $installed = Get-InstalledSoftware
@@ -920,7 +1105,18 @@ $sys = & {
                 FreePct = if ($v.Size -gt 0) { [math]::Round(($v.SizeRemaining / $v.Size) * 100, 1) } else { 0 }
             }
         }
-    } catch { }
+    } catch {
+        foreach ($d in Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue) {
+            if ($d.Used -ne $null) {
+                $size = $d.Used + $d.Free
+                $disks += [pscustomobject]@{
+                    Drive = "$($d.Name):"; Label = ''; FS = ''
+                    SizeGB = [math]::Round($size / 1GB, 1); FreeGB = [math]::Round($d.Free / 1GB, 1)
+                    FreePct = if ($size -gt 0) { [math]::Round(($d.Free / $size) * 100, 1) } else { 0 }
+                }
+            }
+        }
+    }
     [pscustomobject]@{
         ComputerName = $env:COMPUTERNAME
         User = "$env:USERDOMAIN\$env:USERNAME"
@@ -955,15 +1151,18 @@ Write-Ok
 $Script:OnlineCache     = @{}
 $Script:OnlineCachePath = Join-Path $env:TEMP 'sigma_online_cache.json'
 $Script:OnlineEnabled   = -not $Offline
+
 try {
     if (Test-Path $Script:OnlineCachePath) {
         $cached = Get-Content $Script:OnlineCachePath -Raw | ConvertFrom-Json
         foreach ($p in $cached.PSObject.Properties) { $Script:OnlineCache[$p.Name] = $p.Value }
     }
 } catch { }
+
 function Save-OnlineCache {
     try { $Script:OnlineCache | ConvertTo-Json -Depth 6 | Set-Content $Script:OnlineCachePath -Encoding UTF8 } catch { }
 }
+
 function Get-Cached {
     param([string]$Key,[scriptblock]$Fetch,[int]$TtlHours=24)
     if (-not $Script:OnlineEnabled) { return $null }
@@ -980,14 +1179,17 @@ function Get-Cached {
     Save-OnlineCache
     return $val
 }
+
 function Invoke-SafeWebRequest {
     param([string]$Url,[int]$TimeoutSec=8,[hashtable]$Headers=@{})
     if (-not $Headers.ContainsKey('User-Agent')) {
-        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/3.0'
+        $Headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) SigmaEngineerToolkit/2.0'
     }
-    try { return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -Headers $Headers -ErrorAction Stop }
-    catch { Add-Diagnostic 'Online' "GET $Url failed: $_"; return $null }
+    try {
+        return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -Headers $Headers -ErrorAction Stop
+    } catch { Add-Diagnostic 'Online' "GET $Url failed: $_"; return $null }
 }
+
 function Get-CpuPassMarkScore {
     param([string]$CpuName)
     if (-not $CpuName) { return $null }
@@ -1005,6 +1207,7 @@ function Get-CpuPassMarkScore {
         return $null
     }
 }
+
 function Get-GpuPassMarkScore {
     param([string]$GpuName)
     if (-not $GpuName) { return $null }
@@ -1020,6 +1223,7 @@ function Get-GpuPassMarkScore {
         return $null
     }
 }
+
 function Get-LatestComponentVersion {
     param([string]$Component)
     Get-Cached -Key "latest_comp_$Component" -TtlHours 168 -Fetch {
@@ -1048,6 +1252,7 @@ function Get-LatestComponentVersion {
         return $null
     }
 }
+
 function Get-DiskMediaTypes {
     try {
         $out = @()
@@ -1060,6 +1265,7 @@ function Get-DiskMediaTypes {
         return $out
     } catch { return @() }
 }
+
 function Invoke-OnlineEnrichment {
     param([pscustomobject]$System)
     $enrich = [ordered]@{
@@ -1071,7 +1277,7 @@ function Invoke-OnlineEnrichment {
     }
     $enrich.DiskMediaTypes = @(Get-DiskMediaTypes)
     if (-not $Script:OnlineEnabled) { $enrich.OnlineAvailable = $false; return [pscustomobject]$enrich }
-    Write-Stage "Fetching online data (PassMark, vendor feeds)..."
+    Write-Stage "Fetching live online data (PassMark, vendor feeds)..."
     $enrich.CpuScore = Get-CpuPassMarkScore -CpuName $System.CPU
     foreach ($g in $System.GPUs) {
         if ($g.Kind -eq 'Integrated') { continue }
@@ -1082,27 +1288,75 @@ function Invoke-OnlineEnrichment {
     $enrich.LatestVCRedist = Get-LatestComponentVersion -Component 'VC++ Redistributable'
     $enrich.LatestPython   = Get-LatestComponentVersion -Component 'Python'
     $enrich.LatestJava     = Get-LatestComponentVersion -Component 'Java JRE'
+    if (-not $enrich.CpuScore -and $enrich.GpuScores.Count -eq 0) { $enrich.OnlineAvailable = $false }
     Write-Ok
     return [pscustomobject]$enrich
 }
 
 # =============================================================================
-# INSTALLER (WINGET + VENDOR URLS)
+# PREFLIGHT / WHY-SLOW DISPATCH
 # =============================================================================
-$Script:WingetMap = @{
-    'Python'='Python.Python.3.12'; 'Anaconda'='Anaconda.Anaconda3'; 'Git'='Git.Git'
-    'Visual Studio Code'='Microsoft.VisualStudioCode'; 'Visual Studio'='Microsoft.VisualStudio.2022.Community'
-    'Docker Desktop'='Docker.DockerDesktop'; 'Wireshark'='WiresharkFoundation.Wireshark'
-    'KiCad'='KiCad.KiCad'; 'QGIS'='QGIS.QGIS'; 'CloudCompare'='CloudCompare.CloudCompare'
-    'Arduino IDE'='ArduinoSA.IDE.stable'; 'R'='RProject.R'; 'LTspice'='AnalogDevices.LTspice'
-    'ImageJ'='ImageJ.ImageJ'; 'DWSIM'='DWSIM.DWSIM'; '3D Slicer'='Slicer.Slicer'
-    'PlatformIO'='PlatformIO.PlatformIO'; 'FreeCAD'='FreeCAD.FreeCAD'; 'OpenSCAD'='OpenSCAD.OpenSCAD'
-    'Blender'='BlenderFoundation.Blender'; 'ParaView'='Kitware.ParaView'; 'GNU Octave'='GNU.Octave'
-    'CMake'='Kitware.CMake'; 'Notepad++'='Notepad++.Notepad++'; 'GIMP'='GIMP.GIMP'
-    'Inkscape'='Inkscape.Inkscape'; '7-Zip'='7zip.7zip'
+function Invoke-Preflight {
+    param([string]$ProductName,[array]$Catalog,[pscustomobject]$System,[string]$NetFx,[array]$VC,[array]$Installed,[pscustomobject]$Enrichment)
+    Write-Head "PREFLIGHT: $ProductName"
+    $entry = $Catalog | Where-Object { $_.N -eq $ProductName } | Select-Object -First 1
+    if (-not $entry) { $entry = $Catalog | Where-Object { $_.N -like "*$ProductName*" } | Select-Object -First 1 }
+    if (-not $entry) { Write-Host "[ERROR] Product not found: $ProductName" -ForegroundColor Red; return }
+
+    $specs = if ($Script:Requirements.ContainsKey($entry.N)) { @($Script:Requirements[$entry.N]) } else { @() }
+    if ($specs.Count -eq 0) { Write-Host "[WARN] No curated requirements; running derived check." -ForegroundColor Yellow }
+    foreach ($c in ($specs | ForEach-Object { Test-Requirement -Spec $_ -System $System -Enrichment $Enrichment })) {
+        $col = switch ($c.Status) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'Gray' } }
+        Write-Host ("    [{0,-7}] {1,-24} need: {2,-30} have: {3}" -f $c.Status, $c.Component, $c.Required, $c.Actual) -ForegroundColor $col
+    }
+    Write-Host ""
 }
 
-# Only ONE entry per key. 'Advance Steel' appears exactly once.
+function Invoke-WhySlow {
+    param([pscustomobject]$System)
+    Write-Head "WHY IS MY PC SLOW?"
+    $ramPctFree = [math]::Round(($System.FreeRAM_GB / $System.RAM_GB) * 100, 1)
+    $critDisk = $System.Disks | Sort-Object FreePct | Select-Object -First 1
+    Write-Host "  RAM free            $($System.FreeRAM_GB) GB / $($System.RAM_GB) GB ($ramPctFree%)"
+    if ($critDisk) { Write-Host "  Worst disk free     $($critDisk.FreeGB) GB ($($critDisk.FreePct)% on $($critDisk.Drive))" }
+    $topMem = Get-Process -ErrorAction SilentlyContinue | Sort-Object WorkingSet64 -Descending | Select-Object -First 5
+    Write-Host "  Top memory consumers:"
+    foreach ($p in $topMem) { Write-Host ("    {0,-22} {1,6} GB" -f $p.ProcessName, [math]::Round($p.WorkingSet64/1GB,2)) }
+    Write-Host ""
+}
+
+# =============================================================================
+# SOFTWARE INSTALLER
+# =============================================================================
+$Script:WingetMap = @{
+    'Python'             = 'Python.Python.3.12'
+    'Anaconda'           = 'Anaconda.Anaconda3'
+    'Git'                = 'Git.Git'
+    'Visual Studio Code' = 'Microsoft.VisualStudioCode'
+    'Visual Studio'      = 'Microsoft.VisualStudio.2022.Community'
+    'Docker Desktop'     = 'Docker.DockerDesktop'
+    'Wireshark'          = 'WiresharkFoundation.Wireshark'
+    'KiCad'              = 'KiCad.KiCad'
+    'QGIS'               = 'QGIS.QGIS'
+    'CloudCompare'       = 'CloudCompare.CloudCompare'
+    'Arduino IDE'        = 'ArduinoSA.IDE.stable'
+    'R'                  = 'RProject.R'
+    'LTspice'            = 'AnalogDevices.LTspice'
+    'ImageJ'             = 'ImageJ.ImageJ'
+    'DWSIM'              = 'DWSIM.DWSIM'
+    '3D Slicer'          = 'Slicer.Slicer'
+    'PlatformIO'         = 'PlatformIO.PlatformIO'
+    'FreeCAD'            = 'FreeCAD.FreeCAD'
+    'OpenSCAD'           = 'OpenSCAD.OpenSCAD'
+    'Blender'            = 'BlenderFoundation.Blender'
+    'ParaView'           = 'Kitware.ParaView'
+    'GNU Octave'         = 'GNU.Octave'
+    'CMake'              = 'Kitware.CMake'
+    'Notepad++'          = 'Notepad++.Notepad++'
+    'GIMP'               = 'GIMP.GIMP'
+    'Inkscape'           = 'Inkscape.Inkscape'
+    '7-Zip'              = '7zip.7zip'
+}
 $Script:ManualUrls = @{
     'AutoCAD'             = 'https://www.autodesk.com/products/autocad/free-trial'
     'Revit'               = 'https://www.autodesk.com/products/revit/free-trial'
@@ -1122,6 +1376,7 @@ $Script:ManualUrls = @{
     'ANSYS'               = 'https://www.ansys.com/products'
     'ANSYS HFSS'          = 'https://www.ansys.com/products/electronics/ansys-hfss'
     'ANSYS Fluent'        = 'https://www.ansys.com/products/fluids/ansys-fluent'
+    'ANSYS AQWA'          = 'https://www.ansys.com/products/structures/ansys-aqwa'
     'LS-DYNA'             = 'https://www.ansys.com/products/structures/ansys-ls-dyna'
     'COMSOL Multiphysics' = 'https://www.comsol.com/'
     'MATLAB'              = 'https://www.mathworks.com/products/matlab.html'
@@ -1129,7 +1384,6 @@ $Script:ManualUrls = @{
     'MSC Nastran'         = 'https://www.mscsoftware.com/product/msc-nastran'
     'MSC Adams'           = 'https://www.mscsoftware.com/product/adams'
     'Altair HyperWorks'   = 'https://altair.com/hyperworks'
-    'HyperMesh'           = 'https://altair.com/hypermesh'
     'OpenFOAM'            = 'https://openfoam.org/download/'
     'Thermo-Calc'         = 'https://thermocalc.com/'
     'Altium Designer'     = 'https://www.altium.com/'
@@ -1146,7 +1400,6 @@ $Script:ManualUrls = @{
     'Tekla Structures'    = 'https://www.tekla.com/products/tekla-structures'
     'SAP2000'             = 'https://www.csiamerica.com/products/sap2000'
     'ETABS'               = 'https://www.csiamerica.com/products/etabs'
-    'SAFE'                = 'https://www.csiamerica.com/products/safe'
     'PLAXIS 2D'           = 'https://www.bentley.com/software/plaxis-2d/'
     'PLAXIS 3D'           = 'https://www.bentley.com/software/plaxis-3d/'
     'GeoStudio'           = 'https://www.geoslope.com/'
@@ -1155,13 +1408,13 @@ $Script:ManualUrls = @{
     'EPA SWMM'            = 'https://www.epa.gov/water-research/storm-water-management-model-swmm'
     'EPANET'              = 'https://www.epa.gov/water-research/epanet'
     'WaterGEMS'           = 'https://www.bentley.com/software/watergems/'
-    'SewerGEMS'           = 'https://www.bentley.com/software/sewergems/'
     'ArcGIS Pro'          = 'https://www.esri.com/en-us/arcgis/products/arcgis-pro/overview'
     'Agisoft Metashape'   = 'https://www.agisoft.com/downloads/installer/'
     'Pix4Dmapper'         = 'https://www.pix4d.com/product/pix4dmapper-photogrammetry-software'
     'Leica Cyclone'       = 'https://leica-geosystems.com/products/laser-scanners/software/leica-cyclone'
     'Aspen Plus'          = 'https://www.aspentech.com/en/products/engineering/aspen-plus'
     'Petrel'              = 'https://www.software.slb.com/products/petrel'
+    'AVEVA Marine'        = 'https://www.aveva.com/en/products/'
     'PyroSim'             = 'https://www.thunderheadeng.com/pyrosim/'
     'FDS'                 = 'https://pages.nist.gov/fds-smv/downloads.html'
     'EnergyPlus'          = 'https://energyplus.net/downloads'
@@ -1183,14 +1436,10 @@ $Script:ManualUrls = @{
     'Rhino'               = 'https://www.rhino3d.com/download/'
     'BricsCAD'            = 'https://www.bricsys.com/en-intl/bricscad/'
     'Enterprise Architect'= 'https://sparxsystems.com/products/ea/'
-    'Bentley OpenRail'    = 'https://www.bentley.com/software/openrail-designer/'
-    'InfoWorks ICM'       = 'https://www.autodesk.com/products/infoworks-icm'
-    'MIKE+'               = 'https://www.dhigroup.com/technologies/mikepoweredbydhi'
-    'GEO5'                = 'https://www.finesoftware.eu/geotechnical-software/'
-    'Carlson Survey'      = 'https://www.carlsonsw.com/'
 }
 
 function Test-WingetAvailable { [bool](Get-Command winget -ErrorAction SilentlyContinue) }
+
 function Get-InstallTag {
     param([string]$Name)
     if ($Script:WingetMap.ContainsKey($Name))  { return 'winget' }
@@ -1240,6 +1489,82 @@ function Invoke-Installer {
     Write-Host ("  Summary: $ok installed, $fail failed, $manual manual, $skipped skipped.") -ForegroundColor Cyan
 }
 
+# -----------------------------------------------------------------------------
+# Install from scan - lists EVERY app, verdict is advisory
+# -----------------------------------------------------------------------------
+function Show-InstallableFromScan {
+    param([array]$ScanResults)
+    if ($ScanResults.Count -eq 0) {
+        Write-Host "  Nothing was scanned yet." -ForegroundColor Yellow
+        return
+    }
+    Write-Head "Install from scan"
+    Write-Host "  Any app can be installed. Verdict is shown for information only." -ForegroundColor DarkGray
+    Write-Host ""
+    for ($i=0; $i -lt $ScanResults.Count; $i++) {
+        $r = $ScanResults[$i]
+        $tag = Get-InstallTag -Name $r.Product
+        $vcol = switch ($r.Verdict) {
+            'MEETS'              { 'Green' }
+            'MEETS (unverified)' { 'Green' }
+            'PARTIALLY MEETS'    { 'Yellow' }
+            'DOES NOT MEET'      { 'Red' }
+            default              { 'Gray' }
+        }
+        $tagCol = switch ($tag) { 'winget' { 'Green' } 'manual' { 'Yellow' } default { 'DarkGray' } }
+        Write-Host ("    {0,2}. " -f ($i+1)) -NoNewline
+        Write-Host ("[{0}]" -f $tag).PadRight(10) -ForegroundColor $tagCol -NoNewline
+        Write-Host ("{0,-32}" -f $r.Product) -NoNewline
+        Write-Host (" {0}" -f $r.Verdict) -ForegroundColor $vcol -NoNewline
+        if ($r.Installed) { Write-Host "  (installed)" -ForegroundColor DarkGray } else { Write-Host "" }
+    }
+    Write-Host ""
+    Write-Host "  0. Cancel"
+    $sel = Read-Host "  Numbers (e.g. 1,3,5) or 'all' or 'all-meets'"
+    if (-not $sel -or $sel -eq '0') { return }
+    $picked = @()
+    if ($sel -match '^all$') {
+        $picked = $ScanResults | ForEach-Object { $_.Product }
+    } elseif ($sel -match '^all-meets$') {
+        $picked = $ScanResults | Where-Object { $_.Verdict -in @('MEETS','MEETS (unverified)') } | ForEach-Object { $_.Product }
+    } else {
+        foreach ($tok in ($sel -split ',')) {
+            $n = 0
+            if ([int]::TryParse($tok.Trim(),[ref]$n) -and $n -ge 1 -and $n -le $ScanResults.Count) {
+                $picked += $ScanResults[$n-1].Product
+            }
+        }
+    }
+    if ($picked.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; return }
+
+    Write-Host ""
+    Write-Host "  Install plan:" -ForegroundColor Cyan
+    $anyProblem = $false
+    foreach ($name in $picked) {
+        $r = $ScanResults | Where-Object Product -eq $name | Select-Object -First 1
+        $tag = Get-InstallTag -Name $name
+        $verdict = if ($r) { $r.Verdict } else { 'not scanned' }
+        if ($verdict -notin @('MEETS','MEETS (unverified)')) { $anyProblem = $true }
+        $vcol = switch ($verdict) {
+            'MEETS'              { 'Green' }
+            'MEETS (unverified)' { 'Green' }
+            'PARTIALLY MEETS'    { 'Yellow' }
+            'DOES NOT MEET'      { 'Red' }
+            default              { 'Gray' }
+        }
+        Write-Host ("    - {0,-32} [{1}] " -f $name, $tag) -NoNewline
+        Write-Host $verdict -ForegroundColor $vcol
+    }
+    if ($anyProblem) {
+        Write-Host ""
+        Write-Host "  [WARNING] One or more selected apps do not fully meet this PC's requirements." -ForegroundColor Yellow
+        Write-Host "            You can still install them; they may run slowly or fail." -ForegroundColor Yellow
+    }
+    $confirm = Read-Host "  Proceed? (Y/N)"
+    if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
+    Invoke-Installer -Names $picked -HasWinget (Test-WingetAvailable)
+}
+
 # =============================================================================
 # REQUIREMENT DETECTORS
 # =============================================================================
@@ -1248,14 +1573,14 @@ function New-ReqResult {
     [pscustomobject]@{ Type=$Type; Component=$Component; Required=$Required; Actual=$Actual; Status=$Status; Note=$Note }
 }
 
-# DirectX from OS build number.
+# CORRECT DirectX detection: OS build number is the source of truth.
 function Get-DirectXVersion {
     try {
         $build = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber
-        if ($build -ge 10240) { return 12 }
-        if ($build -ge 9200)  { return 11 }
-        if ($build -ge 7601)  { return 11 }
-        if ($build -ge 7600)  { return 10 }
+        if ($build -ge 10240) { return 12 }   # Windows 10 / 11
+        if ($build -ge 9200)  { return 11 }   # Windows 8 / 8.1
+        if ($build -ge 7601)  { return 11 }   # Windows 7 SP1
+        if ($build -ge 7600)  { return 10 }   # Windows 7 RTM
     } catch { }
     if (Test-Path "$env:SystemRoot\System32\d3d12.dll") { return 12 }
     if (Test-Path "$env:SystemRoot\System32\d3d11.dll") { return 11 }
@@ -1263,6 +1588,7 @@ function Get-DirectXVersion {
     if (Test-Path "$env:SystemRoot\System32\d3d9.dll")  { return 9 }
     return $null
 }
+
 function Get-CpuInstructionSets {
     $out = @{}
     try { if ([System.Runtime.Intrinsics.X86.Sse42]::IsSupported)   { $out['SSE4.2']  = $true } } catch { }
@@ -1276,7 +1602,7 @@ function Test-ReqOS {
     param([hashtable]$Spec,[pscustomobject]$System)
     $os = Get-CimInstance Win32_OperatingSystem
     $ver = "$($os.Version)"; $arch = $os.OSArchitecture; $ed = $os.Caption
-    $req=@(); $fail=$false
+    $req=@(); $fail=$false; $warn=$false
     if ($Spec.MinVersion) { $req += ">= $($Spec.MinVersion)"; try { if ([version]$ver -lt [version]$Spec.MinVersion) { $fail=$true } } catch { $fail=$true } }
     if ($Spec.Arch) {
         $req += $Spec.Arch
@@ -1284,10 +1610,11 @@ function Test-ReqOS {
         $want = $map[$Spec.Arch]
         if ($want -and $arch -ne $want) { $fail=$true }
     }
-    $s = if ($fail) { 'FAIL' } else { 'PASS' }
+    $s = if ($fail) { 'FAIL' } elseif ($warn) { 'WARN' } else { 'PASS' }
     $n = if ($fail) { 'OS below minimum' } else { 'Meets OS requirement' }
     New-ReqResult 'OS' 'Operating System' ($req -join ', ') "$ed ($ver, $arch)" $s $n
 }
+
 function Test-ReqCPU {
     param([hashtable]$Spec,[pscustomobject]$System,[pscustomobject]$Enrichment)
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
@@ -1300,30 +1627,33 @@ function Test-ReqCPU {
     }
     if ($Spec.InstructionSets) {
         $have = Get-CpuInstructionSets
-        $missing = @(); foreach ($set in $Spec.InstructionSets) { if (-not $have.ContainsKey($set)) { $missing += $set } }
+        $missing = @()
+        foreach ($set in $Spec.InstructionSets) { if (-not $have.ContainsKey($set)) { $missing += $set } }
         $req += "ISA: $($Spec.InstructionSets -join ',')"
         if ($missing.Count -gt 0) { if ($have.Count -eq 0) { $unk=$true } else { $fail=$true } }
     }
     $actual = @("$($cpu.NumberOfCores)C/$($cpu.NumberOfLogicalProcessors)T")
     if ($Enrichment -and $Enrichment.CpuScore) { $actual += "PassMark $($Enrichment.CpuScore)" }
     $s = if ($fail) { 'FAIL' } elseif ($unk) { 'UNKNOWN' } else { 'PASS' }
-    $n = if ($fail) { 'CPU below minimum' } elseif ($unk) { 'Cannot verify' } else { 'Meets requirement' }
+    $n = if ($fail) { 'CPU below minimum' } elseif ($unk) { 'Cannot verify (PassMark or ISA unavailable)' } else { 'Meets CPU requirement' }
     New-ReqResult 'CPU' 'Processor' ($req -join ', ') ($actual -join ', ') $s $n
 }
+
 function Test-ReqRAM {
     param([hashtable]$Spec,[pscustomobject]$System)
     $have = $System.RAM_GB; $min = [int]$Spec.Min
     $rec = if ($Spec.Rec) { [int]$Spec.Rec } else { $min }
     $s = if ($have -ge $rec) { 'PASS' } elseif ($have -ge $min) { 'WARN' } else { 'FAIL' }
-    $r = if ($rec -ne $min) { "$min GB min / $rec GB rec" } else { "$min GB" }
     $n = switch ($s) {
         'PASS' { 'Meets recommended' }
         'WARN' { 'Meets minimum only' }
         'FAIL' { 'Below minimum' }
         default { '' }
     }
+    $r = if ($rec -ne $min) { "$min GB min / $rec GB rec" } else { "$min GB" }
     New-ReqResult 'RAM' 'Memory' $r "$have GB" $s $n
 }
+
 function Test-ReqDisk {
     param([hashtable]$Spec,[pscustomobject]$System,[pscustomobject]$Enrichment)
     $sysd = $System.Disks | Where-Object Drive -eq "$($env:SystemDrive)" | Select-Object -First 1
@@ -1345,20 +1675,26 @@ function Test-ReqDisk {
     if ($Spec.SSD) { $r += ' (SSD)' }
     New-ReqResult 'Disk' 'Free disk space' $r "$have GB" $s $n
 }
+
 function Test-ReqGPU {
     param([hashtable]$Spec,[pscustomobject]$System,[pscustomobject]$Enrichment)
     $best=0; $bestGPU=$null
-    foreach ($g in $System.GPUs) { if ($g.VRAM_GB -and $g.VRAM_GB -gt $best) { $best = $g.VRAM_GB; $bestGPU = $g } }
+    foreach ($g in $System.GPUs) {
+        if ($g.VRAM_GB -and $g.VRAM_GB -gt $best) { $best = $g.VRAM_GB; $bestGPU = $g }
+    }
     $req=@(); $fail=$false; $warn=$false; $unk=$false
     if ($Spec.MinVRAM) {
         $min = [int]$Spec.MinVRAM
         $rec = if ($Spec.RecVRAM) { [int]$Spec.RecVRAM } else { $min }
         $req += if ($rec -ne $min) { "$min GB VRAM min / $rec GB rec" } else { "$min GB VRAM min" }
-        if ($best -ge $rec) { } elseif ($best -ge $min) { $warn = $true } else { $fail = $true }
+        if ($best -ge $rec)     { }
+        elseif ($best -ge $min) { $warn = $true }
+        else                    { $fail = $true }
     }
     if ($Spec.Vendor) {
         $req += "vendor: $($Spec.Vendor)"
-        $hit=$false; foreach ($g in $System.GPUs) { if ($g.Name -match $Spec.Vendor) { $hit=$true } }
+        $hit=$false
+        foreach ($g in $System.GPUs) { if ($g.Name -match $Spec.Vendor) { $hit=$true } }
         if (-not $hit) { $fail=$true }
     }
     if ($Spec.MinDirectX) {
@@ -1373,7 +1709,10 @@ function Test-ReqGPU {
             if ($top) { if ($top.Score -lt $Spec.MinPassMark) { $fail=$true } } else { $unk=$true }
         } else { $unk=$true }
     }
-    if ($Spec.RequiresCUDA) { $req += 'CUDA'; if (-not (Test-Path "$env:SystemRoot\System32\nvcuda.dll")) { $fail=$true } }
+    if ($Spec.RequiresCUDA) {
+        $req += 'CUDA'
+        if (-not (Test-Path "$env:SystemRoot\System32\nvcuda.dll")) { $fail=$true }
+    }
     $s = if ($fail) { 'FAIL' } elseif ($unk) { 'UNKNOWN' } elseif ($warn) { 'WARN' } else { 'PASS' }
     $actual = if ($bestGPU) { "$($bestGPU.Name) · $best GB" } else { 'no GPU detected' }
     $n = switch ($s) {
@@ -1381,10 +1720,10 @@ function Test-ReqGPU {
         'WARN' { 'Meets minimum VRAM only' }
         'FAIL' { 'GPU below requirement' }
         'UNKNOWN' { 'Cannot verify API locally' }
-        default { '' }
     }
     New-ReqResult 'GPU' 'Graphics' ($req -join ', ') $actual $s $n
 }
+
 function Test-ReqDisplay {
     param([hashtable]$Spec,[pscustomobject]$System)
     $g = $System.GPUs | Where-Object { $_.Resolution } | Select-Object -First 1
@@ -1395,12 +1734,14 @@ function Test-ReqDisplay {
     $ok = ($w -ge $Spec.MinWidth) -and ($h -ge $Spec.MinHeight)
     New-ReqResult 'Display' 'Display resolution' "$($Spec.MinWidth)x$($Spec.MinHeight)" "$w x $h" $(if ($ok) {'PASS'} else {'FAIL'}) $(if ($ok) {'Meets minimum'} else {'Resolution too low'})
 }
+
 function Test-ReqNetFx {
     param([hashtable]$Spec)
     $have = Get-DotNetFrameworkVersion
     $ok = Compare-NetVersion -Have $have -Need $Spec.Min
     New-ReqResult 'NetFx' '.NET Framework' ".NET $($Spec.Min)+" $have $(if ($ok){'PASS'}else{'FAIL'}) $(if ($ok){'Installed'}else{'Must be installed'})
 }
+
 function Test-ReqVCRedist {
     param([hashtable]$Spec)
     $vc = @(Get-VCRedist)
@@ -1409,6 +1750,7 @@ function Test-ReqVCRedist {
     $ok = if ($best) { $best -ge [version]$Spec.Min } else { $false }
     New-ReqResult 'VCRedist' 'VC++ Redistributable' "$($Spec.Min)+" $(if($best){$best.ToString()}else{$vc[0].DisplayVersion}) $(if ($ok){'PASS'}else{'FAIL'}) $(if ($ok){'Installed'}else{'Version too old'})
 }
+
 function Test-ReqJava {
     param([hashtable]$Spec)
     $have = $null
@@ -1426,6 +1768,7 @@ function Test-ReqJava {
     $label = if ($Spec.Kind) { "Java $($Spec.Kind)" } else { 'Java' }
     New-ReqResult 'Java' $label "$($Spec.Min)+" $(if($have){$have}else{'not found'}) $(if($ok){'PASS'}else{'FAIL'}) $(if($ok){'Installed'}else{'Must be installed'})
 }
+
 function Test-ReqPython {
     param([hashtable]$Spec)
     $have = $null
@@ -1441,10 +1784,12 @@ function Test-ReqPython {
     if ($have) { try { $ok = [version]$have -ge [version]$Spec.Min } catch { } }
     New-ReqResult 'Python' 'Python' "$($Spec.Min)+" $(if($have){$have}else{'not found'}) $(if($ok){'PASS'}else{'FAIL'}) $(if($ok){'Installed'}else{'Must be installed'})
 }
+
 function Test-ReqWebView2 {
     $hit = Get-InstalledSoftware | Where-Object { $_.DisplayName -match 'WebView2 Runtime' } | Select-Object -First 1
     New-ReqResult 'WebView2' 'WebView2 Runtime' 'Evergreen' $(if($hit){$hit.DisplayVersion}else{'not found'}) $(if($hit){'PASS'}else{'FAIL'}) $(if($hit){'Installed'}else{'Must be installed'})
 }
+
 function Test-ReqWinFeature {
     param([hashtable]$Spec)
     try {
@@ -1455,6 +1800,7 @@ function Test-ReqWinFeature {
         New-ReqResult 'WinFeature' "Windows feature: $($Spec.Name)" 'Enabled' 'unknown' 'UNKNOWN' 'Cannot query feature'
     }
 }
+
 function Test-ReqLicenseSvc {
     param([hashtable]$Spec)
     $svc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { ($_.Name + ' ' + $_.DisplayName) -like $Spec.Pattern })
@@ -1466,6 +1812,7 @@ function Test-ReqLicenseSvc {
     if ($Spec.Ports -and $Spec.Ports.Count -gt 0) { $actual += " · ports $($Spec.Ports -join ',') $(if($portOpen){'open'}else{'closed'})" }
     New-ReqResult 'LicenseSvc' "License service ($($Spec.Pattern))" 'Service running OR port reachable' $actual $(if($ok){'PASS'}else{'FAIL'}) $(if($ok){'License path available'}else{'Cannot acquire license'})
 }
+
 function Test-ReqAdmin {
     param([hashtable]$Spec)
     $isAdmin = Test-IsAdmin
@@ -1533,295 +1880,242 @@ function Check-App {
     }
 }
 
-# =============================================================================
-# MENUS
-# =============================================================================
-function Get-VerdictColor {
-    param([string]$Verdict)
-    switch ($Verdict) {
-        'MEETS'              { return 'Green' }
-        'MEETS (unverified)' { return 'Green' }
-        'PARTIALLY MEETS'    { return 'Yellow' }
-        'DOES NOT MEET'      { return 'Red' }
-        default              { return 'Gray' }
-    }
-}
-function Get-VerdictChip {
-    param([string]$Verdict)
-    switch ($Verdict) {
-        'MEETS'              { return 'green' }
-        'MEETS (unverified)' { return 'blue' }
-        'PARTIALLY MEETS'    { return 'yellow' }
-        'DOES NOT MEET'      { return 'red' }
-        default              { return 'gray' }
-    }
-}
-
 function Select-ScanTargets {
     param([array]$Catalog)
     $byDisc = @{}
-    foreach ($e in $Catalog) {
-        foreach ($d in $e.D) {
-            if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
-            $byDisc[$d] += $e
-        }
-    }
+    foreach ($e in $Catalog) { foreach ($d in $e.D) { if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }; $byDisc[$d] += $e } }
     $disc = @($byDisc.Keys | Sort-Object)
-    if ($disc.Count -eq 0) { return @() }
-
-    while ($true) {
-        Write-Head "Choose disciplines to scan"
-        Write-Host "  Picking a discipline checks every app in it against this PC." -ForegroundColor DarkGray
-        Write-Host "  You can pick several (comma-separated) or 'all'." -ForegroundColor DarkGray
-        Write-Host ""
-        for ($i = 0; $i -lt $disc.Count; $i++) {
-            Write-Host ("    {0,3}. {1,-24} ({2} apps)" -f ($i+1), $disc[$i], $byDisc[$disc[$i]].Count)
-        }
-        Write-Host ""
-        Write-Host "  0. Cancel"
-        $sel = Read-Host "  Numbers (e.g. 14 or 1,4,7 or 'all')"
-        if ($sel -eq '0') { return @() }
-        if (-not $sel) { Write-Host "  No input. Try again." -ForegroundColor Yellow; continue }
-        if ($sel -match '^all$') { return $disc }
-        $picked = @()
-        $bad = $false
-        foreach ($tok in ($sel -split ',')) {
-            $n = 0
-            if ([int]::TryParse($tok.Trim(),[ref]$n) -and $n -ge 1 -and $n -le $disc.Count) {
-                $picked += $disc[$n-1]
-            } else {
-                Write-Host "  Invalid: '$($tok.Trim())'. Try again." -ForegroundColor Yellow
-                $bad = $true; break
-            }
-        }
-        if (-not $bad) {
-            if ($picked.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; continue }
-            return $picked
-        }
-    }
-}
-
-# Install menu lists EVERY scanned app, any verdict can be picked.
-function Show-InstallMenu {
-    param([array]$ScanResults)
-    if ($ScanResults.Count -eq 0) {
-        Write-Host "  Nothing was scanned yet. Run a scan first." -ForegroundColor Yellow
-        return
-    }
-    Write-Head "Install from scanned apps"
-    Write-Host "  Any app can be installed. Verdict is shown for information only." -ForegroundColor DarkGray
+    Write-Head "Choose what to scan"
+    Write-Host "  Picking a discipline checks every app in it against this PC's requirements." -ForegroundColor DarkGray
     Write-Host ""
-    for ($i = 0; $i -lt $ScanResults.Count; $i++) {
-        $r = $ScanResults[$i]
-        $tag = Get-InstallTag -Name $r.Product
-        $vcol = Get-VerdictColor -Verdict $r.Verdict
-        $tagCol = switch ($tag) { 'winget' { 'Green' } 'manual' { 'Yellow' } default { 'DarkGray' } }
-        Write-Host ("    {0,2}. " -f ($i+1)) -NoNewline
-        Write-Host ("[{0}]" -f $tag).PadRight(10) -ForegroundColor $tagCol -NoNewline
-        Write-Host ("{0,-32}" -f $r.Product) -NoNewline
-        Write-Host (" {0}" -f $r.Verdict) -ForegroundColor $vcol -NoNewline
-        if ($r.Installed) { Write-Host "  (installed)" -ForegroundColor DarkGray } else { Write-Host "" }
+    for ($i = 0; $i -lt $disc.Count; $i++) {
+        Write-Host ("    {0,3}. {1,-24} ({2} apps)" -f ($i+1), $disc[$i], $byDisc[$disc[$i]].Count)
     }
     Write-Host ""
-    Write-Host "  0. Cancel"
-    $sel = Read-Host "  Numbers (e.g. 1,3,5) or 'all' or 'all-meets'"
-    if (-not $sel -or $sel -eq '0') { return }
-
+    $sel = Read-Host "  Numbers to scan (e.g. 1,4,7) or 'all'"
+    if (-not $sel) { return @() }
+    if ($sel -match '^all$') { return $disc }
     $picked = @()
-    if ($sel -match '^all$') {
-        $picked = $ScanResults | ForEach-Object { $_.Product }
-    } elseif ($sel -match '^all-meets$') {
-        $picked = $ScanResults | Where-Object { $_.Verdict -in @('MEETS','MEETS (unverified)') } | ForEach-Object { $_.Product }
-    } else {
-        foreach ($tok in ($sel -split ',')) {
-            $n = 0
-            if ([int]::TryParse($tok.Trim(),[ref]$n) -and $n -ge 1 -and $n -le $ScanResults.Count) {
-                $picked += $ScanResults[$n-1].Product
-            }
-        }
-    }
-    if ($picked.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; return }
-
-    Write-Host ""
-    Write-Host "  Install plan:" -ForegroundColor Cyan
-    $anyProblem = $false
-    foreach ($name in $picked) {
-        $r = $ScanResults | Where-Object Product -eq $name | Select-Object -First 1
-        $tag = Get-InstallTag -Name $name
-        $verdict = if ($r) { $r.Verdict } else { 'not scanned' }
-        if ($verdict -notin @('MEETS','MEETS (unverified)')) { $anyProblem = $true }
-        $vcol = Get-VerdictColor -Verdict $verdict
-        Write-Host ("    - {0,-32} [{1}] " -f $name, $tag) -NoNewline
-        Write-Host $verdict -ForegroundColor $vcol
-    }
-    if ($anyProblem) {
-        Write-Host ""
-        Write-Host "  [WARNING] One or more selected apps do not fully meet this PC's requirements." -ForegroundColor Yellow
-        Write-Host "            You can still install them; they may run slowly or fail." -ForegroundColor Yellow
-    }
-    $confirm = Read-Host "  Proceed? (Y/N)"
-    if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; return }
-    Invoke-Installer -Names $picked -HasWinget (Test-WingetAvailable)
-}
-
-function Show-CatalogInstaller {
-    $byDisc = @{}
-    foreach ($e in $Script:RawCatalog) {
-        foreach ($d in $e.D) {
-            if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
-            $byDisc[$d] += $e
-        }
-    }
-    $disc = @($byDisc.Keys | Sort-Object)
-    if ($disc.Count -eq 0) { return }
-
-    while ($true) {
-        Write-Head "Browse catalog by discipline"
-        for ($i = 0; $i -lt $disc.Count; $i++) {
-            $d = $disc[$i]
-            $products = @($byDisc[$d] | Sort-Object N -Unique)
-            $auto = @($products | Where-Object { (Get-InstallTag -Name $_.N) -eq 'winget' }).Count
-            $man  = @($products | Where-Object { (Get-InstallTag -Name $_.N) -eq 'manual' }).Count
-            Write-Host ("    {0,3}. {1,-24} {2} apps  ({3} winget, {4} manual)" -f ($i+1), $d, $products.Count, $auto, $man)
-        }
-        Write-Host ""
-        Write-Host "  0. Back"
-        $sel = Read-Host "  Discipline number"
-        if (-not $sel -or $sel -eq '0') { return }
+    foreach ($tok in ($sel -split ',')) {
         $n = 0
-        if (-not [int]::TryParse($sel, [ref]$n) -or $n -lt 1 -or $n -gt $disc.Count) {
-            Write-Host "  Invalid." -ForegroundColor Yellow; continue
-        }
-        $pickedDisc = $disc[$n-1]
-        $products = @($byDisc[$pickedDisc] | Sort-Object N -Unique)
-
-        Write-Host ""
-        Write-Host "  Products in $pickedDisc ($($products.Count)):" -ForegroundColor Cyan
-        for ($j = 0; $j -lt $products.Count; $j++) {
-            $p = $products[$j]
-            $tag = Get-InstallTag -Name $p.N
-            $tagCol = switch ($tag) { 'winget' { 'Green' } 'manual' { 'Yellow' } default { 'DarkGray' } }
-            Write-Host ("    {0,2}. " -f ($j+1)) -NoNewline
-            Write-Host ("[{0}]" -f $tag).PadRight(10) -ForegroundColor $tagCol -NoNewline
-            Write-Host $p.N
-        }
-        Write-Host ""
-        Write-Host "  0. Back"
-        $pick = Read-Host "  Numbers (e.g. 1,3,5) or 'all' or 'all-winget'"
-        if (-not $pick -or $pick -eq '0') { continue }
-
-        $indices = @()
-        if ($pick -match '^all$') {
-            $indices = 1..$products.Count
-        } elseif ($pick -match '^all-winget$') {
-            $indices = 1..$products.Count | Where-Object { (Get-InstallTag -Name $products[$_-1].N) -eq 'winget' }
-        } else {
-            foreach ($tok in ($pick -split ',')) {
-                $k = 0
-                if ([int]::TryParse($tok.Trim(),[ref]$k) -and $k -ge 1 -and $k -le $products.Count) { $indices += $k }
-            }
-        }
-        if ($indices.Count -eq 0) { Write-Host "  Nothing selected." -ForegroundColor Yellow; continue }
-
-        $names = @()
-        foreach ($ix in $indices) { $names += $products[$ix-1].N }
-
-        Write-Host ""
-        Write-Host "  Install plan ($($names.Count) app(s)):" -ForegroundColor Cyan
-        foreach ($nm in $names) {
-            $tag = Get-InstallTag -Name $nm
-            Write-Host ("    - {0,-32} [{1}]" -f $nm, $tag)
-        }
-        $confirm = Read-Host "  Proceed? (Y/N)"
-        if ($confirm -notmatch '^[Yy]') { Write-Host "  Cancelled." -ForegroundColor Yellow; continue }
-
-        Invoke-Installer -Names $names -HasWinget (Test-WingetAvailable)
-        return
+        if ([int]::TryParse($tok.Trim(),[ref]$n) -and $n -ge 1 -and $n -le $disc.Count) { $picked += $disc[$n-1] }
     }
+    return $picked
+}
+
+function Get-ScanTargets {
+    param([array]$Catalog,[string[]]$Disciplines,[string[]]$Apps)
+    $out = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($e in $Catalog) {
+        $match = $false
+        if ($Disciplines.Count -gt 0) { foreach ($d in $e.D) { if ($Disciplines -contains $d) { $match = $true; break } } }
+        if (-not $match -and $Apps.Count -gt 0) {
+            foreach ($a in $Apps) { if ($e.N -eq $a -or $e.N -like "*$a*" -or $a -like "*$e.N*") { $match = $true; break } }
+        }
+        if ($match -and -not $seen.ContainsKey($e.N)) { $seen[$e.N] = $true; $out.Add($e) }
+    }
+    return $out
 }
 
 # =============================================================================
-# PREFLIGHT / WHYSLOW
+# DISPATCH: Preflight / WhySlow
 # =============================================================================
-function Invoke-Preflight {
-    param([string]$ProductName,[array]$Catalog,[pscustomobject]$System,[pscustomobject]$Enrichment)
-    Write-Head "PREFLIGHT: $ProductName"
-    $entry = $Catalog | Where-Object { $_.N -eq $ProductName } | Select-Object -First 1
-    if (-not $entry) { $entry = $Catalog | Where-Object { $_.N -like "*$ProductName*" } | Select-Object -First 1 }
-    if (-not $entry) { Write-Host "[ERROR] Product not found: $ProductName" -ForegroundColor Red; return }
-
-    $reqSet = Get-RequirementsForApp -Entry $entry
-    Write-Host "  Source: $($reqSet.Source)" -ForegroundColor DarkGray
-    Write-Host ""
-    foreach ($c in ($reqSet.Specs | ForEach-Object { Test-Requirement -Spec $_ -System $System -Enrichment $Enrichment })) {
-        $col = switch ($c.Status) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'Gray' } }
-        Write-Host ("    [{0,-7}] {1,-24} need: {2,-30} have: {3}" -f $c.Status, $c.Component, $c.Required, $c.Actual) -ForegroundColor $col
+$motherboard = $null
+try {
+    $bb = Get-CimInstance Win32_BaseBoard -ErrorAction Stop
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
+    $motherboard = [pscustomobject]@{
+        Manufacturer=$bb.Manufacturer; Product=$bb.Product; Version=$bb.Version
+        BiosVendor=$bios.Manufacturer; BiosVersion=$bios.SMBIOSBIOSVersion
+        BiosReleaseDate=if ($bios.ReleaseDate) { ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } else { '' }
     }
-    Write-Host ""
-}
-
-function Invoke-WhySlow {
-    param([pscustomobject]$System)
-    Write-Head "WHY IS MY PC SLOW?"
-    $ramPctFree = [math]::Round(($System.FreeRAM_GB / $System.RAM_GB) * 100, 1)
-    $critDisk = $System.Disks | Sort-Object FreePct | Select-Object -First 1
-    Write-Host "  RAM free         $($System.FreeRAM_GB) GB / $($System.RAM_GB) GB ($ramPctFree%)"
-    if ($critDisk) { Write-Host "  Worst disk free  $($critDisk.FreeGB) GB ($($critDisk.FreePct)% on $($critDisk.Drive))" }
-    $topMem = Get-Process -ErrorAction SilentlyContinue | Sort-Object WorkingSet64 -Descending | Select-Object -First 5
-    Write-Host "  Top memory consumers:"
-    foreach ($p in $topMem) { Write-Host ("    {0,-22} {1,6} GB" -f $p.ProcessName, [math]::Round($p.WorkingSet64/1GB,2)) }
-    Write-Host ""
-}
+} catch { }
 
 if ($Preflight) {
     $enrich = Invoke-OnlineEnrichment -System $sys
-    Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog -System $sys -Enrichment $enrich
+    Invoke-Preflight -ProductName $Preflight -Catalog $Script:RawCatalog -System $sys -NetFx $netFx -VC $vc -Installed $installed -Enrichment $enrich
     exit 0
 }
 if ($WhySlow) { Invoke-WhySlow -System $sys; exit 0 }
 
 # =============================================================================
-# ONLINE ENRICHMENT (shared by scan / install loops)
+# ONLINE ENRICHMENT + REQUIREMENT SCAN
 # =============================================================================
 $enrichment = Invoke-OnlineEnrichment -System $sys
 
-# =============================================================================
-# REPORT WRITER
-# =============================================================================
-function Write-Report {
-    param([array]$ScanResults,[array]$DisciplineFilter,[array]$AppFilter,[string]$ReportBase)
+if (-not $Disciplines -and -not $CheckApps -and -not $NonInteractive) {
+    $Disciplines = Select-ScanTargets -Catalog $Script:RawCatalog
+    if ($Disciplines.Count -eq 0) { Write-Host "  No selection. Exiting." -ForegroundColor Yellow; exit 0 }
+}
 
-    Ensure-Folder $exportPath
+$targets = Get-ScanTargets -Catalog $Script:RawCatalog -Disciplines $Disciplines -Apps $CheckApps
 
-    [pscustomobject]@{
-        GeneratedAt         = (Get-Date).ToString('s')
-        System              = $sys
-        NetFx               = $netFx
-        VCRedist            = $vc
-        Enrichment          = $enrichment
-        SelectedDisciplines = $DisciplineFilter
-        SelectedApps        = $AppFilter
-        Results             = $ScanResults
-    } | ConvertTo-Json -Depth 12 | Set-Content "$ReportBase.json" -Encoding UTF8
+$scanResults = @()
+if ($targets.Count -gt 0) {
+    Write-Head "Requirement check - $($targets.Count) app(s)"
+    Write-Host ""
+    foreach ($entry in $targets) {
+        $scanResults += Check-App -Entry $entry -System $sys -Enrichment $enrichment -Installed $installed
+    }
+    $scanResults = @($scanResults | Sort-Object Failures, Warnings, Product)
 
-    $rows = foreach ($r in $ScanResults) {
+    foreach ($r in $scanResults) {
+        $col = switch ($r.Verdict) {
+            'MEETS'              { 'Green' }
+            'MEETS (unverified)' { 'Green' }
+            'PARTIALLY MEETS'    { 'Yellow' }
+            'DOES NOT MEET'      { 'Red' }
+            default              { 'Gray' }
+        }
+        $instTag = if ($r.Installed) { ' [installed]' } else { '' }
+        Write-Host ("  {0,-32} {1}{2}" -f $r.Product, $r.Verdict, $instTag) -ForegroundColor $col
         foreach ($c in $r.Checks) {
-            [pscustomobject]@{
-                Product   = $r.Product; Verdict = $r.Verdict; Component = $c.Component
-                Type      = $c.Type; Required = $c.Required; Actual = $c.Actual
-                Status    = $c.Status; Note = $c.Note
-                LatestOnline = if ($c.PSObject.Properties.Match('LatestOnline').Count) { $c.LatestOnline } else { '' }
-            }
+            $mark = switch ($c.Status) { 'PASS' { '  +' } 'WARN' { '  ~' } 'FAIL' { '  !' } 'UNKNOWN' { '  ?' } }
+            $line = "{0} [{1,-7}] {2,-24} need: {3,-32} have: {4}" -f $mark, $c.Status, $c.Component, $c.Required, $c.Actual
+            if ($c.PSObject.Properties.Match('LatestOnline').Count -and $c.LatestOnline) { $line += "  (latest: $($c.LatestOnline))" }
+            $lineCol = switch ($c.Status) { 'PASS' { 'DarkGray' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'DarkGray' } }
+            Write-Host $line -ForegroundColor $lineCol
+        }
+        Write-Host ""
+    }
+    $meets   = @($scanResults | Where-Object Verdict -eq 'MEETS').Count
+    $partial = @($scanResults | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
+    $fails   = @($scanResults | Where-Object Verdict -eq 'DOES NOT MEET').Count
+    $unver   = @($scanResults | Where-Object Verdict -eq 'MEETS (unverified)').Count
+    Write-Host ("  SUMMARY: $meets MEETS · $partial PARTIAL · $fails FAILS · $unver UNVERIFIED") -ForegroundColor Cyan
+    Write-Host ""
+} else {
+    Write-Host "  No apps matched the selection." -ForegroundColor Yellow
+}
+
+# =============================================================================
+# DISCIPLINE ROLLUP
+# =============================================================================
+if ($scanResults.Count -gt 0) {
+    Write-Head "Discipline rollup"
+    $byDisc = @{}
+    foreach ($r in $scanResults) {
+        foreach ($d in ($r.Disciplines -split ',\s*')) {
+            if (-not $byDisc.ContainsKey($d)) { $byDisc[$d] = @() }
+            $byDisc[$d] += $r
         }
     }
-    $rows | Export-Csv "$ReportBase.csv" -NoTypeInformation -Encoding UTF8
+    foreach ($d in $byDisc.Keys | Sort-Object) {
+        $rs = $byDisc[$d]
+        $g  = @($rs | Where-Object Verdict -eq 'MEETS').Count
+        $y  = @($rs | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
+        $rr = @($rs | Where-Object Verdict -eq 'DOES NOT MEET').Count
+        $u  = @($rs | Where-Object Verdict -eq 'MEETS (unverified)').Count
+        Write-Host ("  {0,-18} {1,2} meets  {2,2} partial  {3,2} fails  {4,2} unverified (of {5})" `
+            -f $d, $g, $y, $rr, $u, $rs.Count) -ForegroundColor Cyan
+    }
+    Write-Host ""
+}
 
-    $style = @'
+# =============================================================================
+# PROJECT GUARDIAN
+# =============================================================================
+function Get-DwgReferences {
+    param([string]$FilePath)
+    $refs = New-Object System.Collections.Generic.List[object]
+    $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+    try {
+        if ($ext -eq '.dxf') {
+            if ((Get-Item -LiteralPath $FilePath).Length -gt 200MB) { return $refs }
+            $text = Get-Content -LiteralPath $FilePath -Raw -ErrorAction Stop
+            foreach ($m in [regex]::Matches($text, '\(0\s*\.\s*"BLOCK"\)[\s\S]{0,4000}?\(2\s*\.\s*"\*X[^"]*"\)[\s\S]{0,4000}?\(1\s*\.\s*"([^"]+)"\)')) {
+                $refs.Add([pscustomobject]@{ Type='XREF'; Path=$m.Groups[1].Value })
+            }
+        } elseif ($ext -eq '.dwg') {
+            $fi = Get-Item -LiteralPath $FilePath
+            if ($fi.Length -gt 250MB) { return $refs }
+            $bytes = [System.IO.File]::ReadAllBytes($FilePath)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            foreach ($m in [regex]::Matches($ascii, "[A-Za-z]:\\\\[^\x00-\x1F`"<>|]{0,250}\.(dwg|dxf|pdf|jpg|png|tif|shx|ttf|shp|dgn|dwf)", 'IgnoreCase')) {
+                $refs.Add([pscustomobject]@{ Type='REF'; Path=$m.Value })
+            }
+        }
+    } catch { Add-Diagnostic 'XREF' "Failed to parse ${FilePath}: $_" }
+    return $refs
+}
+
+function Invoke-ProjectGuardian {
+    param([string]$Root)
+    if (-not (Test-Path $Root)) { Write-Host "[ERROR] Path not found: $Root" -ForegroundColor Red; return $null }
+    Write-Head "Project Guardian: $Root"
+    $scan = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction SilentlyContinue)
+    $totalBytes = ($scan | Measure-Object -Property Length -Sum).Sum
+    $longPaths = @($scan | Where-Object { $_.FullName.Length -gt 240 }).Count
+    $backupExt = @('.bak','.tmp','.sv$','.dwl','.dwl2')
+    $backupFiles = @($scan | Where-Object { $backupExt -contains $_.Extension.ToLower() }).Count
+    $dwgFiles = @($scan | Where-Object { $_.Extension -in @('.dwg','.dxf') })
+    $refTotal = 0; $refMissing = 0
+    foreach ($dwg in ($dwgFiles | Select-Object -First 200)) {
+        foreach ($r in (Get-DwgReferences -FilePath $dwg.FullName)) {
+            $refTotal++
+            $p = $r.Path -replace '/', '\'
+            if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path $dwg.DirectoryName $p }
+            if (-not (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) { $refMissing++ }
+        }
+    }
+    Write-Host ("  Total files: {0}" -f $scan.Count)
+    Write-Host ("  Total size:  {0} GB" -f [math]::Round($totalBytes/1GB, 2))
+    Write-Host ("  Long paths:  {0}" -f $longPaths)
+    Write-Host ("  Backup files:{0}" -f $backupFiles)
+    Write-Host ("  References:  {0} found, {1} missing" -f $refTotal, $refMissing)
+    $penalty = 0
+    if ($longPaths -gt 0) { $penalty += [math]::Min(25, $longPaths) }
+    if ($refTotal -gt 0) { $penalty += [math]::Min(30, [int](($refMissing/$refTotal)*100)) }
+    $health = [math]::Max(0, 100 - $penalty)
+    Write-Host ("  Project Health: $health%") -ForegroundColor Cyan
+    Write-Host ""
+    return [pscustomobject]@{
+        Root=$Root; TotalFiles=$scan.Count; TotalGB=[math]::Round($totalBytes/1GB,2)
+        LongPaths=$longPaths; BackupFiles=$backupFiles
+        RefTotal=$refTotal; RefMissing=$refMissing; Health=$health
+    }
+}
+$guardian = $null
+if ($ProjectGuardian) { $guardian = Invoke-ProjectGuardian -Root $ProjectGuardian }
+
+# =============================================================================
+# WRITE REPORT
+# =============================================================================
+Write-Stage "Writing report (HTML / JSON / CSV)..."
+Ensure-Folder $exportPath
+
+[pscustomobject]@{
+    GeneratedAt         = (Get-Date).ToString('s')
+    System              = $sys
+    Motherboard         = $motherboard
+    NetFx               = $netFx
+    VCRedist            = $vc
+    Enrichment          = $enrichment
+    SelectedDisciplines = $Disciplines
+    SelectedApps        = $CheckApps
+    Guardian            = $guardian
+    Results             = $scanResults
+} | ConvertTo-Json -Depth 12 | Set-Content "$reportBase.json" -Encoding UTF8
+
+$rows = foreach ($r in $scanResults) {
+    foreach ($c in $r.Checks) {
+        [pscustomobject]@{
+            Product   = $r.Product; Verdict = $r.Verdict; Component = $c.Component
+            Type      = $c.Type; Required = $c.Required; Actual = $c.Actual
+            Status    = $c.Status; Note = $c.Note
+            LatestOnline = if ($c.PSObject.Properties.Match('LatestOnline').Count) { $c.LatestOnline } else { '' }
+        }
+    }
+}
+$rows | Export-Csv "$reportBase.csv" -NoTypeInformation -Encoding UTF8
+
+$style = @'
 <style>
  body{font-family:'Segoe UI',Arial,sans-serif;margin:24px;color:#1a1a1a;background:#f7f8fa}
  h1{color:#0b5394;margin-bottom:4px}
  h2{color:#0b5394;margin-top:32px;border-bottom:2px solid #dde3ec;padding-bottom:4px}
- .sub{color:#555;font-size:12px}
+ .sub{color:#555;font-size:12px;margin-top:0}
  .card{background:#fff;border:1px solid #e0e4ea;border-radius:8px;padding:14px 18px;margin:10px 0}
  table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px;background:#fff}
  th,td{border:1px solid #e0e4ea;padding:6px 8px;text-align:left;vertical-align:top}
@@ -1840,138 +2134,127 @@ function Write-Report {
 </style>
 '@
 
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Report</title>$style</head><body>")
-    [void]$sb.AppendLine("<h1>Sigma Engineer Toolkit - Requirement Report</h1>")
-    [void]$sb.AppendLine("<p class='sub'>Generated $(Get-Date) on $($sys.ComputerName) by $($sys.User)</p>")
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine("<!doctype html><html><head><meta charset='utf-8'><title>Sigma Requirement Report</title>$style</head><body>")
+[void]$sb.AppendLine("<h1>Sigma Engineer Toolkit - Requirement Report</h1>")
+[void]$sb.AppendLine("<p class='sub'>Generated $(Get-Date) on $($sys.ComputerName) by $($sys.User)</p>")
 
-    [void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
-    [void]$sb.AppendLine("<tr><th style='width:220px'>OS</th><td>$($sys.OS)</td></tr>")
-    [void]$sb.AppendLine("<tr><th>CPU</th><td>$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T @ $($sys.ClockMHz) MHz)</td></tr>")
-    $cpuMark = if ($enrichment.CpuScore) { $enrichment.CpuScore } else { 'unavailable' }
-    [void]$sb.AppendLine("<tr><th>PassMark CPU Mark</th><td>$cpuMark</td></tr>")
-    [void]$sb.AppendLine("<tr><th>RAM</th><td>$($sys.RAM_GB) GB</td></tr>")
-    foreach ($g in $sys.GPUs) {
-        [void]$sb.AppendLine("<tr><th>GPU ($($g.Kind))</th><td>$($g.Name) - $($g.VRAM_GB) GB VRAM</td></tr>")
+[void]$sb.AppendLine("<h2>Machine</h2><div class='card'><table>")
+[void]$sb.AppendLine("<tr><th style='width:220px'>OS</th><td>$($sys.OS)</td></tr>")
+[void]$sb.AppendLine("<tr><th>CPU</th><td>$($sys.CPU) ($($sys.Cores)C/$($sys.LogicalCPUs)T @ $($sys.ClockMHz) MHz)</td></tr>")
+$cpuMark = if ($enrichment.CpuScore) { $enrichment.CpuScore } else { 'unavailable' }
+[void]$sb.AppendLine("<tr><th>PassMark CPU Mark</th><td>$cpuMark</td></tr>")
+[void]$sb.AppendLine("<tr><th>RAM</th><td>$($sys.RAM_GB) GB</td></tr>")
+foreach ($g in $sys.GPUs) {
+    [void]$sb.AppendLine("<tr><th>GPU ($($g.Kind))</th><td>$($g.Name) - $($g.VRAM_GB) GB VRAM</td></tr>")
+}
+[void]$sb.AppendLine("<tr><th>.NET Framework</th><td>$netFx</td></tr>")
+[void]$sb.AppendLine("<tr><th>VC++ Redistributables</th><td>$($vc.Count) installed</td></tr>")
+[void]$sb.AppendLine("</table></div>")
+
+[void]$sb.AppendLine("<h2>Requirement Scan</h2>")
+[void]$sb.AppendLine("<p class='small'>Disciplines: $($Disciplines -join ', ')  ·  Apps: $($CheckApps -join ', ')</p>")
+
+foreach ($r in $scanResults) {
+    $cls = switch ($r.Verdict) {
+        'MEETS'              { 'meets' }
+        'MEETS (unverified)' { 'unverified' }
+        'PARTIALLY MEETS'    { 'partial' }
+        'DOES NOT MEET'      { 'fails' }
+        default              { '' }
     }
-    [void]$sb.AppendLine("<tr><th>.NET Framework</th><td>$netFx</td></tr>")
-    [void]$sb.AppendLine("<tr><th>VC++ Redistributables</th><td>$($vc.Count) installed</td></tr>")
+    $chipCls = switch ($r.Verdict) {
+        'MEETS'              { 'green' }
+        'MEETS (unverified)' { 'blue' }
+        'PARTIALLY MEETS'    { 'yellow' }
+        'DOES NOT MEET'      { 'red' }
+        default              { 'gray' }
+    }
+    [void]$sb.AppendLine("<div class='product $cls'>")
+    [void]$sb.AppendLine("<div class='product-head'>")
+    [void]$sb.AppendLine("<div><div class='product-name'>$($r.Product)</div><div class='small'>$($r.Disciplines) · $($r.Kind) · source: $($r.RequirementSource)$(if ($r.Installed) { ' · installed' })</div></div>")
+    [void]$sb.AppendLine("<span class='chip $chipCls'>$($r.Verdict)</span>")
+    [void]$sb.AppendLine("</div>")
+    [void]$sb.AppendLine("<table>")
+    [void]$sb.AppendLine("<tr><th style='width:170px'>Requirement</th><th style='width:240px'>Required</th><th style='width:240px'>Actual</th><th style='width:90px'>Status</th><th>Note</th></tr>")
+    foreach ($c in $r.Checks) {
+        $sc = switch ($c.Status) { 'PASS'{'green'} 'WARN'{'yellow'} 'FAIL'{'red'} default{'gray'} }
+        $latest = ''
+        if ($c.PSObject.Properties.Match('LatestOnline').Count -and $c.LatestOnline) {
+            $latest = " <span class='small'>(latest online: $($c.LatestOnline))</span>"
+        }
+        [void]$sb.AppendLine("<tr><td><b>$($c.Component)</b></td><td>$($c.Required)$latest</td><td>$($c.Actual)</td><td><span class='chip $sc'>$($c.Status)</span></td><td class='small'>$($c.Note)</td></tr>")
+    }
     [void]$sb.AppendLine("</table></div>")
-
-    [void]$sb.AppendLine("<h2>Requirement Scan</h2>")
-    [void]$sb.AppendLine("<p class='small'>Disciplines: $($DisciplineFilter -join ', ') · Apps: $($AppFilter -join ', ')</p>")
-
-    foreach ($r in $ScanResults) {
-        $cls = switch ($r.Verdict) {
-            'MEETS'              { 'meets' }
-            'MEETS (unverified)' { 'unverified' }
-            'PARTIALLY MEETS'    { 'partial' }
-            'DOES NOT MEET'      { 'fails' }
-            default              { '' }
-        }
-        $chipCls = Get-VerdictChip -Verdict $r.Verdict
-        [void]$sb.AppendLine("<div class='product $cls'>")
-        [void]$sb.AppendLine("<div class='product-head'>")
-        [void]$sb.AppendLine("<div><div class='product-name'>$($r.Product)</div><div class='small'>$($r.Disciplines) · $($r.Kind) · source: $($r.RequirementSource)$(if ($r.Installed) { ' · installed' })</div></div>")
-        [void]$sb.AppendLine("<span class='chip $chipCls'>$($r.Verdict)</span>")
-        [void]$sb.AppendLine("</div>")
-        [void]$sb.AppendLine("<table>")
-        [void]$sb.AppendLine("<tr><th style='width:170px'>Requirement</th><th style='width:240px'>Required</th><th style='width:240px'>Actual</th><th style='width:90px'>Status</th><th>Note</th></tr>")
-        foreach ($c in $r.Checks) {
-            $sc = switch ($c.Status) { 'PASS'{'green'} 'WARN'{'yellow'} 'FAIL'{'red'} default{'gray'} }
-            $latest = ''
-            if ($c.PSObject.Properties.Match('LatestOnline').Count -and $c.LatestOnline) {
-                $latest = " <span class='small'>(latest online: $($c.LatestOnline))</span>"
-            }
-            [void]$sb.AppendLine("<tr><td><b>$($c.Component)</b></td><td>$($c.Required)$latest</td><td>$($c.Actual)</td><td><span class='chip $sc'>$($c.Status)</span></td><td class='small'>$($c.Note)</td></tr>")
-        }
-        [void]$sb.AppendLine("</table></div>")
-    }
-
-    [void]$sb.AppendLine("<p class='small'>End of report.</p>")
-    [void]$sb.AppendLine("</body></html>")
-    $sb.ToString() | Set-Content "$ReportBase.html" -Encoding UTF8
 }
 
-# =============================================================================
-# MAIN LOOP
-# =============================================================================
-$lastScanResults = @()
-$lastDisciplines = @($Disciplines)
-$lastApps        = @($CheckApps)
-
-# Non-interactive / batch install path
-if ($NonInteractive -or $Install -or $Disciplines.Count -gt 0 -or $CheckApps.Count -gt 0) {
-    if (-not $Disciplines -and -not $CheckApps) {
-        Write-Host "[INFO] Non-interactive with no filters. Skipping scan." -ForegroundColor DarkGray
-    } else {
-        $targets = Get-ScanTargets -Catalog $Script:RawCatalog -Disciplines $Disciplines -Apps $CheckApps
-        Write-Head "Requirement check - $($targets.Count) app(s)"
-        Write-Host ""
-        foreach ($entry in $targets) {
-            $r = Check-App -Entry $entry -System $sys -Enrichment $enrichment -Installed $installed
-            $lastScanResults += $r
-            $col = Get-VerdictColor -Verdict $r.Verdict
-            Write-Host ("  {0,-32} {1}" -f $r.Product, $r.Verdict) -ForegroundColor $col
-            foreach ($c in $r.Checks) {
-                $mark = switch ($c.Status) { 'PASS' { '  +' } 'WARN' { '  ~' } 'FAIL' { '  !' } 'UNKNOWN' { '  ?' } }
-                $line = "{0} [{1,-7}] {2,-24} need: {3,-32} have: {4}" -f $mark, $c.Status, $c.Component, $c.Required, $c.Actual
-                if ($c.PSObject.Properties.Match('LatestOnline').Count -and $c.LatestOnline) { $line += "  (latest: $($c.LatestOnline))" }
-                $lineCol = switch ($c.Status) { 'PASS' { 'DarkGray' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'DarkGray' } }
-                Write-Host $line -ForegroundColor $lineCol
-            }
-            Write-Host ""
-        }
-        $lastScanResults = @($lastScanResults | Sort-Object Failures, Warnings, Product)
-        $meets = @($lastScanResults | Where-Object Verdict -eq 'MEETS').Count
-        $partial = @($lastScanResults | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
-        $fails = @($lastScanResults | Where-Object Verdict -eq 'DOES NOT MEET').Count
-        Write-Host ("  SUMMARY: $meets MEETS · $partial PARTIAL · $fails FAILS") -ForegroundColor Cyan
-        Write-Host ""
-        Write-Report -ScanResults $lastScanResults -DisciplineFilter $Disciplines -AppFilter $CheckApps -ReportBase $reportBase
-    }
-
-    if ($Install) {
-        $names = if ($InstallList.Count -gt 0) { $InstallList }
-                 else { @($lastScanResults | Where-Object { $_.Verdict -in @('MEETS','MEETS (unverified)') -and -not $_.Installed } | ForEach-Object { $_.Product }) }
-        if ($names.Count -eq 0) { Write-Host "  No installable apps (nothing met requirements)." -ForegroundColor Yellow }
-        else {
-            Write-Head "Installing ($($names.Count) app(s))"
-            Invoke-Installer -Names $names -HasWinget (Test-WingetAvailable)
-        }
-        exit 0
-    }
-
-    if ($NonInteractive) { exit 0 }
+if ($guardian) {
+    [void]$sb.AppendLine("<h2>Project Guardian</h2><div class='card'><table>")
+    [void]$sb.AppendLine("<tr><th style='width:220px'>Root</th><td>$($guardian.Root)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Total files</th><td>$($guardian.TotalFiles)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Total size</th><td>$($guardian.TotalGB) GB</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Long paths</th><td>$($guardian.LongPaths)</td></tr>")
+    [void]$sb.AppendLine("<tr><th>References</th><td>$($guardian.RefTotal) found, $($guardian.RefMissing) missing</td></tr>")
+    [void]$sb.AppendLine("<tr><th>Project health</th><td><b>$($guardian.Health)%</b></td></tr>")
+    [void]$sb.AppendLine("</table></div>")
 }
 
-# Interactive main menu loop
+[void]$sb.AppendLine("<p class='small'>End of report. Requirements are curated from vendor docs; verify before critical deployments.</p>")
+[void]$sb.AppendLine("</body></html>")
+$sb.ToString() | Set-Content "$reportBase.html" -Encoding UTF8
+Write-Ok
+
+# =============================================================================
+# FINAL
+# =============================================================================
+if (Test-Path $errorLog) { Remove-Item $errorLog -Force -ErrorAction SilentlyContinue }
+
+Write-Host "[SUCCESS] Requirement scan complete." -ForegroundColor Green
+Write-Host "[INFO] HTML : $reportBase.html" -ForegroundColor Cyan
+Write-Host "[INFO] JSON : $reportBase.json" -ForegroundColor Cyan
+Write-Host "[INFO] CSV  : $reportBase.csv"  -ForegroundColor Cyan
+Write-Host ""
+
+# Batch install mode
+if ($Install) {
+    $names = if ($InstallList.Count -gt 0) { $InstallList }
+             else { @($scanResults | Where-Object { $_.Verdict -in @('MEETS','MEETS (unverified)') -and -not $_.Installed } | ForEach-Object { $_.Product }) }
+    Write-Head "Installing ($($names.Count) app(s))"
+    Invoke-Installer -Names $names -HasWinget (Test-WingetAvailable)
+    exit 0
+}
+
+if ($NonInteractive) { exit 0 }
+
+# Interactive loop - R = open report folder, I = install, S = scan again, Q = quit
 while ($true) {
-    Write-Head "Sigma Engineer Toolkit - main menu"
-    Write-Host "  1. Scan disciplines (test this PC against app requirements)" -ForegroundColor Cyan
-    Write-Host "  2. Scan specific apps by name" -ForegroundColor Cyan
-    Write-Host "  3. Install from last scan results (any app, verdict shown)" -ForegroundColor Cyan
-    Write-Host "  4. Browse catalog & install (by discipline, no scan needed)" -ForegroundColor Cyan
-    Write-Host "  5. Open report folder" -ForegroundColor Cyan
-    Write-Host "  6. Show last scan results again" -ForegroundColor Cyan
-    Write-Host "  Q. Quit" -ForegroundColor Cyan
-    Write-Host ""
-
-    $choice = Read-Host "  Choice"
-
-    switch -Regex ($choice) {
-        '^1$' {
-            $selDisc = Select-ScanTargets -Catalog $Script:RawCatalog
-            if ($selDisc.Count -eq 0) { continue }
-            $targets = Get-ScanTargets -Catalog $Script:RawCatalog -Disciplines $selDisc -Apps @()
-            Write-Head "Requirement check - $($targets.Count) app(s)"
+    $finalChoice = Read-Host "Press R to open report folder, I to install, S to scan again, Q to quit"
+    switch -Regex ($finalChoice) {
+        '^[Rr]$' {
+            Start-Process $exportPath
+        }
+        '^[Ii]$' {
+            Show-InstallableFromScan -ScanResults $scanResults
+        }
+        '^[Ss]$' {
+            $newDisc = Select-ScanTargets -Catalog $Script:RawCatalog
+            if ($newDisc.Count -eq 0) { continue }
+            $newTargets = Get-ScanTargets -Catalog $Script:RawCatalog -Disciplines $newDisc -Apps @()
+            Write-Head "Requirement check - $($newTargets.Count) app(s)"
             Write-Host ""
-            $lastScanResults = @()
-            foreach ($entry in $targets) {
+            $scanResults = @()
+            foreach ($entry in $newTargets) {
                 $r = Check-App -Entry $entry -System $sys -Enrichment $enrichment -Installed $installed
-                $lastScanResults += $r
-                $col = Get-VerdictColor -Verdict $r.Verdict
-                Write-Host ("  {0,-32} {1}" -f $r.Product, $r.Verdict) -ForegroundColor $col
+                $scanResults += $r
+                $col = switch ($r.Verdict) {
+                    'MEETS'              { 'Green' }
+                    'MEETS (unverified)' { 'Green' }
+                    'PARTIALLY MEETS'    { 'Yellow' }
+                    'DOES NOT MEET'      { 'Red' }
+                    default              { 'Gray' }
+                }
+                $instTag = if ($r.Installed) { ' [installed]' } else { '' }
+                Write-Host ("  {0,-32} {1}{2}" -f $r.Product, $r.Verdict, $instTag) -ForegroundColor $col
                 foreach ($c in $r.Checks) {
                     $mark = switch ($c.Status) { 'PASS' { '  +' } 'WARN' { '  ~' } 'FAIL' { '  !' } 'UNKNOWN' { '  ?' } }
                     $line = "{0} [{1,-7}] {2,-24} need: {3,-32} have: {4}" -f $mark, $c.Status, $c.Component, $c.Required, $c.Actual
@@ -1981,75 +2264,21 @@ while ($true) {
                 }
                 Write-Host ""
             }
-            $lastScanResults = @($lastScanResults | Sort-Object Failures, Warnings, Product)
-            $meets = @($lastScanResults | Where-Object Verdict -eq 'MEETS').Count
-            $partial = @($lastScanResults | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
-            $fails = @($lastScanResults | Where-Object Verdict -eq 'DOES NOT MEET').Count
-            $unver = @($lastScanResults | Where-Object Verdict -eq 'MEETS (unverified)').Count
+            $scanResults = @($scanResults | Sort-Object Failures, Warnings, Product)
+            $meets   = @($scanResults | Where-Object Verdict -eq 'MEETS').Count
+            $partial = @($scanResults | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
+            $fails   = @($scanResults | Where-Object Verdict -eq 'DOES NOT MEET').Count
+            $unver   = @($scanResults | Where-Object Verdict -eq 'MEETS (unverified)').Count
             Write-Host ("  SUMMARY: $meets MEETS · $partial PARTIAL · $fails FAILS · $unver UNVERIFIED") -ForegroundColor Cyan
-            $lastDisciplines = $selDisc
-            $lastApps = @()
             Write-Host ""
-            Write-Stage "Writing report..."
-            Write-Report -ScanResults $lastScanResults -DisciplineFilter $lastDisciplines -AppFilter $lastApps -ReportBase $reportBase
-            Write-Ok
-            Write-Host "  Report written to $reportBase.html" -ForegroundColor DarkGray
-        }
-        '^2$' {
-            $appsInput = Read-Host "  App names (comma-separated, e.g. Revit,ANSYS,QGIS)"
-            if (-not $appsInput) { continue }
-            $appList = @($appsInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            $targets = Get-ScanTargets -Catalog $Script:RawCatalog -Disciplines @() -Apps $appList
-            if ($targets.Count -eq 0) { Write-Host "  No matching apps." -ForegroundColor Yellow; continue }
-            Write-Head "Requirement check - $($targets.Count) app(s)"
-            Write-Host ""
-            $lastScanResults = @()
-            foreach ($entry in $targets) {
-                $r = Check-App -Entry $entry -System $sys -Enrichment $enrichment -Installed $installed
-                $lastScanResults += $r
-                $col = Get-VerdictColor -Verdict $r.Verdict
-                Write-Host ("  {0,-32} {1}" -f $r.Product, $r.Verdict) -ForegroundColor $col
-                foreach ($c in $r.Checks) {
-                    $mark = switch ($c.Status) { 'PASS' { '  +' } 'WARN' { '  ~' } 'FAIL' { '  !' } 'UNKNOWN' { '  ?' } }
-                    $line = "{0} [{1,-7}] {2,-24} need: {3,-32} have: {4}" -f $mark, $c.Status, $c.Component, $c.Required, $c.Actual
-                    if ($c.PSObject.Properties.Match('LatestOnline').Count -and $c.LatestOnline) { $line += "  (latest: $($c.LatestOnline))" }
-                    $lineCol = switch ($c.Status) { 'PASS' { 'DarkGray' } 'WARN' { 'Yellow' } 'FAIL' { 'Red' } default { 'DarkGray' } }
-                    Write-Host $line -ForegroundColor $lineCol
-                }
-                Write-Host ""
-            }
-            $lastScanResults = @($lastScanResults | Sort-Object Failures, Warnings, Product)
-            $meets = @($lastScanResults | Where-Object Verdict -eq 'MEETS').Count
-            $partial = @($lastScanResults | Where-Object Verdict -eq 'PARTIALLY MEETS').Count
-            $fails = @($lastScanResults | Where-Object Verdict -eq 'DOES NOT MEET').Count
-            Write-Host ("  SUMMARY: $meets MEETS · $partial PARTIAL · $fails FAILS") -ForegroundColor Cyan
-            $lastDisciplines = @()
-            $lastApps = $appList
-            Write-Host ""
-        }
-        '^3$' { Show-InstallMenu -ScanResults $lastScanResults }
-        '^4$' { Show-CatalogInstaller }
-        '^5$' {
-            if (-not (Test-Path $exportPath)) { Write-Host "  Report folder doesn't exist yet." -ForegroundColor Yellow }
-            else { Start-Process $exportPath }
-        }
-        '^6$' {
-            if ($lastScanResults.Count -eq 0) { Write-Host "  No scan results yet." -ForegroundColor Yellow }
-            else {
-                Write-Head "Last scan results"
-                foreach ($r in $lastScanResults) {
-                    $col = Get-VerdictColor -Verdict $r.Verdict
-                    $instTag = if ($r.Installed) { ' [installed]' } else { '' }
-                    Write-Host ("  {0,-32} {1}{2}" -f $r.Product, $r.Verdict, $instTag) -ForegroundColor $col
-                }
-                Write-Host ""
-            }
         }
         '^[Qq]$' {
             Write-Host "  Bye." -ForegroundColor Cyan
-            if (Test-Path $errorLog) { Remove-Item $errorLog -Force -ErrorAction SilentlyContinue }
             exit 0
         }
-        default { Write-Host "  Invalid choice." -ForegroundColor Yellow }
+        default {
+            Write-Host "  Bye." -ForegroundColor Cyan
+            exit 0
+        }
     }
 }
